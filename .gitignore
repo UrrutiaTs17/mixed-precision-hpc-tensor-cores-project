@@ -1,0 +1,56 @@
+# Archivos ejecutables
+*.exe
+*.out
+*.app
+
+# Archivos compilados y objetos
+*.o
+*.cu.o
+*.so
+*.a
+*.lib
+*.dll
+
+# Directorios de compilación
+build/
+cmake-build-debug/
+cmake-build-release/
+dist/
+*.egg-info/
+
+# Archivos temporales
+*.tmp
+*.temp
+*.bak
+*~
+*.swp
+*.swo
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+
+# Artefactos de CUDA
+*.cubin
+*.fatbin
+*.ptx
+*.linkinfo
+
+# Resultados de ejecución
+*.log
+output/
+results/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# PyCharm
+*.iml
+out/
+
+# CLion
+cmake-build-*/
