@@ -13,21 +13,21 @@
 #include <cblas.h>
 
 #define CHECK_CUDA(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ \
-                  << " -> " << cudaGetErrorString(err) << std::endl; \
-        std::exit(EXIT_FAILURE); \
-    } \
+cudaError_t err = (call); \
+if (err != cudaSuccess) { \
+    std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ \
+    << " -> " << cudaGetErrorString(err) << std::endl; \
+    std::exit(EXIT_FAILURE); \
+} \
 } while(0)
 
 #define CHECK_CUBLAS(call) do { \
-    cublasStatus_t status = (call); \
-    if (status != CUBLAS_STATUS_SUCCESS) { \
-        std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__ \
-                  << " -> status code " << status << std::endl; \
-        std::exit(EXIT_FAILURE); \
-    } \
+cublasStatus_t status = (call); \
+if (status != CUBLAS_STATUS_SUCCESS) { \
+    std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__ \
+    << " -> status code " << status << std::endl; \
+    std::exit(EXIT_FAILURE); \
+} \
 } while(0)
 
 struct Options {
@@ -51,14 +51,14 @@ struct ErrorMetrics {
 
 static void print_usage(const char* prog) {
     std::cout << "Uso:\n"
-              << "  " << prog << " [--m M] [--n N] [--k K] [--iters I] [--double]\n\n"
-              << "Descripcion:\n"
-              << "  Compara CPU BLAS, GPU cuBLAS clasico y GPU cuBLAS con Tensor Cores\n"
-              << "  para GEMM. El modo Tensor Core usa entradas FP16 y acumulacion/salida FP32.\n\n"
-              << "Ejemplos:\n"
-              << "  " << prog << "\n"
-              << "  " << prog << " --m 4096 --n 4096 --k 4096 --iters 10\n"
-              << "  " << prog << " --double --m 2048 --n 2048 --k 2048 --iters 5\n";
+    << "  " << prog << " [--m M] [--n N] [--k K] [--iters I] [--double]\n\n"
+    << "Descripcion:\n"
+    << "  Compara CPU BLAS, GPU cuBLAS clasico y GPU cuBLAS con Tensor Cores\n"
+    << "  para GEMM. El modo Tensor Core usa entradas FP16 y acumulacion/salida FP32.\n\n"
+    << "Ejemplos:\n"
+    << "  " << prog << "\n"
+    << "  " << prog << " --m 4096 --n 4096 --k 4096 --iters 10\n"
+    << "  " << prog << " --double --m 2048 --n 2048 --k 2048 --iters 5\n";
 }
 
 static Options parse_args(int argc, char** argv) {
@@ -101,9 +101,9 @@ static void print_gpu_info() {
     std::cout << "Nombre                     : " << prop.name << "\n";
     std::cout << "Compute Capability         : " << prop.major << "." << prop.minor << "\n";
     std::cout << "Memoria global             : "
-              << std::fixed << std::setprecision(2)
-              << static_cast<double>(prop.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0)
-              << " GiB\n";
+    << std::fixed << std::setprecision(2)
+    << static_cast<double>(prop.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0)
+    << " GiB\n";
     std::cout << "SMs                        : " << prop.multiProcessorCount << "\n";
     std::cout << "Max hilos por bloque       : " << prop.maxThreadsPerBlock << "\n";
     std::cout << "Warp size                  : " << prop.warpSize << "\n";
@@ -119,14 +119,20 @@ static double gemm_flops_standard(int m, int n, int k) {
 }
 
 static void initialize_matrix_float(std::vector<float>& mat) {
-    for (size_t i = 0; i < mat.size(); ++i) mat[i] = static_cast<float>((i % 101) - 50) / 25.0f;
+    for (size_t i = 0; i < mat.size(); ++i) {
+        int v = static_cast<int>(i % 101) - 50;
+        mat[i] = static_cast<float>(v) / 25.0f;
+    }
 }
 
 static void initialize_matrix_double(std::vector<double>& mat) {
-    for (size_t i = 0; i < mat.size(); ++i) mat[i] = static_cast<double>((i % 101) - 50) / 25.0;
+    for (size_t i = 0; i < mat.size(); ++i) {
+        int v = static_cast<int>(i % 101) - 50;
+        mat[i] = static_cast<double>(v) / 25.0;
+    }
 }
 
-static Metrics run_cpu_blas_float(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int m, int n, int k, int iters) {
+static Metrics benchmark_cpu_float(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int m, int n, int k, int iters) {
     const float alpha = 1.0f, beta = 0.0f;
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iters; ++i) {
@@ -140,7 +146,7 @@ static Metrics run_cpu_blas_float(const std::vector<float>& A, const std::vector
     return out;
 }
 
-static Metrics run_cpu_blas_double(const std::vector<double>& A, const std::vector<double>& B, std::vector<double>& C, int m, int n, int k, int iters) {
+static Metrics benchmark_cpu_double(const std::vector<double>& A, const std::vector<double>& B, std::vector<double>& C, int m, int n, int k, int iters) {
     const double alpha = 1.0, beta = 0.0;
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iters; ++i) {
@@ -154,7 +160,7 @@ static Metrics run_cpu_blas_double(const std::vector<double>& A, const std::vect
     return out;
 }
 
-static Metrics run_gpu_cublas_float(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int m, int n, int k, int iters) {
+static Metrics benchmark_gpu_cublas_float(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int m, int n, int k, int iters) {
     float *dA = nullptr, *dB = nullptr, *dC = nullptr;
     CHECK_CUDA(cudaMalloc(&dA, sizeof(float) * A.size()));
     CHECK_CUDA(cudaMalloc(&dB, sizeof(float) * B.size()));
@@ -197,7 +203,7 @@ static Metrics run_gpu_cublas_float(const std::vector<float>& A, const std::vect
     return out;
 }
 
-static Metrics run_gpu_cublas_double(const std::vector<double>& A, const std::vector<double>& B, std::vector<double>& C, int m, int n, int k, int iters) {
+static Metrics benchmark_gpu_cublas_double(const std::vector<double>& A, const std::vector<double>& B, std::vector<double>& C, int m, int n, int k, int iters) {
     double *dA = nullptr, *dB = nullptr, *dC = nullptr;
     CHECK_CUDA(cudaMalloc(&dA, sizeof(double) * A.size()));
     CHECK_CUDA(cudaMalloc(&dB, sizeof(double) * B.size()));
@@ -245,7 +251,7 @@ __global__ static void convert_float_to_half_kernel(const float* src, __half* ds
     if (idx < size) dst[idx] = __float2half(src[idx]);
 }
 
-static Metrics run_gpu_tensor_cores_fp16_accum_fp32(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int m, int n, int k, int iters) {
+static Metrics benchmark_gpu_tensor_cores(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C, int m, int n, int k, int iters) {
     float *dA_fp32 = nullptr, *dB_fp32 = nullptr, *dC = nullptr;
     __half *dA_fp16 = nullptr, *dB_fp16 = nullptr;
 
@@ -280,7 +286,7 @@ static Metrics run_gpu_tensor_cores_fp16_accum_fp32(const std::vector<float>& A,
                                   dC, CUDA_R_32F, m,
                                   CUBLAS_COMPUTE_32F_FAST_16F,
                                   CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_CUDA(cudaDeviceSynchronize());
 
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
@@ -296,7 +302,7 @@ static Metrics run_gpu_tensor_cores_fp16_accum_fp32(const std::vector<float>& A,
                                   dC, CUDA_R_32F, m,
                                   CUBLAS_COMPUTE_32F_FAST_16F,
                                   CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
     float total_ms = 0.0f;
@@ -345,29 +351,15 @@ static ErrorMetrics compare_double_vectors(const std::vector<double>& ref, const
     return out;
 }
 
-static void print_header(const Options& opt) {
-    std::cout << "================ CONFIGURACION DEL EXPERIMENTO ================\n";
-    std::cout << "M                         : " << opt.m << "\n";
-    std::cout << "N                         : " << opt.n << "\n";
-    std::cout << "K                         : " << opt.k << "\n";
-    std::cout << "Iteraciones               : " << opt.iters << "\n";
-    std::cout << "Precision base            : " << (opt.use_double ? "FP64" : "FP32") << "\n";
-    std::cout << "Tensor Core path          : " << (opt.use_double ? "no ejecutado en modo --double" : "FP16 entradas + acumulacion/salida FP32") << "\n";
-    std::cout << "Conteo FLOPs usado        : " << std::scientific << std::setprecision(6) << gemm_flops_standard(opt.m, opt.n, opt.k) << "\n";
-    std::cout << std::fixed;
-    if ((opt.m % 8 != 0 || opt.n % 8 != 0 || opt.k % 8 != 0) && !opt.use_double)
-        std::cout << "Aviso                     : para FP16 en Tensor Cores conviene usar M,N,K multiplos de 8\n";
-    std::cout << "===============================================================\n\n";
-}
 
 static void run_experiment_float(const Options& opt) {
     std::vector<float> A((size_t)opt.m * opt.k), B((size_t)opt.k * opt.n), C_cpu((size_t)opt.m * opt.n, 0.0f), C_gpu((size_t)opt.m * opt.n, 0.0f), C_tc((size_t)opt.m * opt.n, 0.0f);
     initialize_matrix_float(A);
     initialize_matrix_float(B);
 
-    Metrics cpu = run_cpu_blas_float(A, B, C_cpu, opt.m, opt.n, opt.k, opt.iters);
-    Metrics gpu = run_gpu_cublas_float(A, B, C_gpu, opt.m, opt.n, opt.k, opt.iters);
-    Metrics tc = run_gpu_tensor_cores_fp16_accum_fp32(A, B, C_tc, opt.m, opt.n, opt.k, opt.iters);
+    Metrics cpu = benchmark_cpu_float(A, B, C_cpu, opt.m, opt.n, opt.k, opt.iters);
+    Metrics gpu = benchmark_gpu_cublas_float(A, B, C_gpu, opt.m, opt.n, opt.k, opt.iters);
+    Metrics tc = benchmark_gpu_tensor_cores(A, B, C_tc, opt.m, opt.n, opt.k, opt.iters);
 
     ErrorMetrics err_gpu = compare_float_vectors(C_cpu, C_gpu);
     ErrorMetrics err_tc = compare_float_vectors(C_cpu, C_tc);
@@ -395,8 +387,8 @@ static void run_experiment_double(const Options& opt) {
     initialize_matrix_double(A);
     initialize_matrix_double(B);
 
-    Metrics cpu = run_cpu_blas_double(A, B, C_cpu, opt.m, opt.n, opt.k, opt.iters);
-    Metrics gpu = run_gpu_cublas_double(A, B, C_gpu, opt.m, opt.n, opt.k, opt.iters);
+    Metrics cpu = benchmark_cpu_double(A, B, C_cpu, opt.m, opt.n, opt.k, opt.iters);
+    Metrics gpu = benchmark_gpu_cublas_double(A, B, C_gpu, opt.m, opt.n, opt.k, opt.iters);
     ErrorMetrics err_gpu = compare_double_vectors(C_cpu, C_gpu);
 
     std::cout << std::fixed << std::setprecision(6);
@@ -413,11 +405,23 @@ static void run_experiment_double(const Options& opt) {
     std::cout << "=======================================================\n";
 }
 
+static void run_benchmark(const Options& opt) {
+    std::cout << "================== CONFIGURACION ==================\n";
+    std::cout << "Precision                  : " << (opt.use_double ? "FP64 (double)" : "FP32 (float)") << "\n";
+    std::cout << "Dimensiones (M, N, K)      : " << opt.m << ", " << opt.n << ", " << opt.k << "\n";
+    std::cout << "Iteraciones                : " << opt.iters << "\n";
+    std::cout << "===================================================\n\n";
+
+    if (opt.use_double) {
+        run_experiment_double(opt);
+    } else {
+        run_experiment_float(opt);
+    }
+}
+
 int main(int argc, char** argv) {
     Options opt = parse_args(argc, argv);
     print_gpu_info();
-    print_header(opt);
-    if (opt.use_double) run_experiment_double(opt);
-    else run_experiment_float(opt);
+    run_benchmark(opt);
     return 0;
 }
