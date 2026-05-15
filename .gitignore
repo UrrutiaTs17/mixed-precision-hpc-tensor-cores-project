@@ -2,6 +2,8 @@
 *.exe
 *.out
 *.app
+Fase_2/GEMM/gemm_tc
+Fase_2/Convolution/conv_tc
 
 # Archivos compilados y objetos
 *.o
@@ -26,6 +28,18 @@ dist/
 *.swp
 *.swo
 .DS_Store
+.Rhistory
+.RData
+.Ruserdata
+.codex
+.codex/
+.claude
+.claude/
+
+# Documentacion local: mantener solo README.md
+*.md
+!README.md
+!**/README.md
 
 # IDEs
 .vscode/
@@ -41,6 +55,10 @@ dist/
 
 # Resultados de ejecución
 *.log
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+metricas_*.txt
 output/
 results/
 

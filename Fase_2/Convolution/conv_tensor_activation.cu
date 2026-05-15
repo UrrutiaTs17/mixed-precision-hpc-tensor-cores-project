@@ -2,7 +2,8 @@
 // nvcc -std=c++17 conv_tensor_activation.cu -o conv_tc \
 //      -I/usr/include/openblas \
 //      -lcudnn -lopenblas \
-//      -gencode arch=compute_86,code=sm_86
+//      -gencode arch=compute_86,code=sm_86 \
+//      --allow-unsupported-compiler
 //
 // Este programa compara tres rutas de convolucion 2D hacia adelante:
 // 1. CPU con OpenBLAS (via transformacion im2col + SGEMM/DGEMM).
@@ -28,6 +29,7 @@
 #include <cudnn.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 #include <mma.h>
 
 // Valida llamadas a la API de CUDA y termina si ocurre un error.
@@ -60,11 +62,20 @@ constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
 
-// 2x2 warps por bloque → 4 warps = 128 hilos; tile de salida 32×32.
-constexpr int kBlockWarpsM = 2;
-constexpr int kBlockWarpsN = 2;
-constexpr int kBlockTileM  = kBlockWarpsM * kWmmaM;  // 32
-constexpr int kBlockTileN  = kBlockWarpsN * kWmmaN;  // 32
+// 4×4 warps = 16 warps = 512 hilos; tile de salida 64×64.
+// Con 512 hilos/bloque y ~28.5 KiB shared/bloque el SM aloja 3 bloques
+// simultaneos → 48/48 warps activos → 100 % ocupancia en Ampere (CC 8.6).
+constexpr int kBlockWarpsM = 4;
+constexpr int kBlockWarpsN = 4;
+constexpr int kBlockTileM  = kBlockWarpsM * kWmmaM;  // 64
+constexpr int kBlockTileN  = kBlockWarpsN * kWmmaN;  // 64
+
+// Elementos K cargados por iteracion externa (multiplo de kWmmaK).
+constexpr int kKStep = 32;
+
+// Etapas del pipeline cp.async: mientras se computa tile[i], la DMA
+// ya transfiere tile[i+2] sin pasar por registros (Ampere sm_80+).
+constexpr int kNumStages = 3;
 
 // Padding en shared memory para evitar bank conflicts (16 bytes extra por fila).
 constexpr int kWmmaShmemPad = 8;
@@ -871,9 +882,14 @@ __global__ static void im2col_fp16_kernel(
               : __float2half(0.0f);
 }
 
-// Kernel GEMM con API WMMA: C(M,N) = A(M,K) * B(K,N), todos row-major FP16→FP32.
-// Identico al de la ruta GEMM: bloque 128 hilos = 4 warps en grid 2x2 de fragmentos,
-// shared memory con padding anti-bank-conflict, carga coalescente desde global memory.
+// Kernel GEMM con API WMMA + pipeline cp.async de 3 etapas (Ampere sm_80+).
+// C(M,N) = A(M,K) * B(K,N), todos row-major FP16→FP32.
+// En el contexto de convolucion: A = filtros W [K, C*R*S], B = im2col [C*R*S, outH*outW].
+//
+// 4×4 warps = 512 hilos, tile 64×64, triple buffer cp.async.
+// Requisito: M mult. de 64, N mult. de 64, K mult. de 16 (validado en benchmark).
+// Ocupancia esperada en CC 8.6: 3 bloques/SM × 16 warps = 48/48 = 100 %.
+__launch_bounds__(kBlockWarpsM * kBlockWarpsN * 32, 3)
 __global__ static void wmma_gemm_kernel(
         const __half* __restrict__ A,
         const __half* __restrict__ B,
@@ -881,13 +897,14 @@ __global__ static void wmma_gemm_kernel(
         int M, int N, int K) {
     using namespace nvcuda;
 
-    __shared__ __half sA[kBlockTileM][kWmmaK + kWmmaShmemPad];   // [32][24]
-    __shared__ __half sB[kWmmaK][kBlockTileN + kWmmaShmemPad];   // [16][40]
+    // Triple buffer: sA[etapa][fila][col], sB[etapa][fila][col].
+    // sA[3][64][40]: 15 360 bytes; sB[3][32][72]: 13 824 bytes → 28.5 KiB total.
+    __shared__ __half sA[kNumStages][kBlockTileM][kKStep      + kWmmaShmemPad];
+    __shared__ __half sB[kNumStages][kKStep]     [kBlockTileN + kWmmaShmemPad];
 
-    const int warp_id  = threadIdx.x / 32;
-    const int warp_row = warp_id / kBlockWarpsN;
-    const int warp_col = warp_id % kBlockWarpsN;
-
+    const int warp_id       = threadIdx.x / 32;
+    const int warp_row      = warp_id / kBlockWarpsN;
+    const int warp_col      = warp_id % kBlockWarpsN;
     const int block_row     = blockIdx.x * kBlockTileM;
     const int block_col     = blockIdx.y * kBlockTileN;
     const int warp_row_base = block_row + warp_row * kWmmaM;
@@ -898,33 +915,83 @@ __global__ static void wmma_gemm_kernel(
     wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float>                   c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
-    for (int k_base = 0; k_base < K; k_base += kWmmaK) {
-        // Carga coalescente del tile de A (32 x kWmmaK) a shared memory.
-        for (int i = threadIdx.x; i < kBlockTileM * kWmmaK; i += blockDim.x) {
-            const int row = i / kWmmaK;
-            const int col = i % kWmmaK;
-            sA[row][col] = (block_row + row < M && k_base + col < K)
-                           ? A[(block_row + row) * K + (k_base + col)]
-                           : __float2half(0.0f);
+    const int num_tiles = K / kKStep;
+
+    // Pares uint32_t (2 fp16 = 4 bytes): minimo requerido por cp.async en Ampere.
+    const int n_pairs_A = kBlockTileM * kKStep / 2;   // 64*32/2 = 1024
+    const int n_pairs_B = kKStep      * kBlockTileN / 2; // 32*64/2 = 1024
+
+    // -- Precarga de las primeras kNumStages etapas --
+    for (int s = 0; s < kNumStages && s < num_tiles; ++s) {
+        const int k_off = s * kKStep;
+        for (int i = threadIdx.x; i < n_pairs_A; i += blockDim.x) {
+            const int elem = i * 2;
+            const int row  = elem / kKStep;
+            const int col  = elem % kKStep;
+            __pipeline_memcpy_async(
+                reinterpret_cast<uint32_t*>(&sA[s][row][col]),
+                reinterpret_cast<const uint32_t*>(&A[(block_row + row) * K + k_off + col]),
+                sizeof(uint32_t));
         }
-        // Carga coalescente del tile de B (kWmmaK x 32) a shared memory.
-        for (int i = threadIdx.x; i < kWmmaK * kBlockTileN; i += blockDim.x) {
-            const int row = i / kBlockTileN;
-            const int col = i % kBlockTileN;
-            sB[row][col] = (k_base + row < K && block_col + col < N)
-                           ? B[(k_base + row) * N + (block_col + col)]
-                           : __float2half(0.0f);
+        for (int i = threadIdx.x; i < n_pairs_B; i += blockDim.x) {
+            const int elem = i * 2;
+            const int row  = elem / kBlockTileN;
+            const int col  = elem % kBlockTileN;
+            __pipeline_memcpy_async(
+                reinterpret_cast<uint32_t*>(&sB[s][row][col]),
+                reinterpret_cast<const uint32_t*>(&B[(k_off + row) * N + block_col + col]),
+                sizeof(uint32_t));
         }
+        __pipeline_commit();
+    }
+
+    // -- Bucle principal --
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        // Esperar que el tile actual este listo en shared memory.
+        const int prior = min(kNumStages - 1, num_tiles - tile - 1);
+        __pipeline_wait_prior(prior);
         __syncthreads();
 
-        wmma::load_matrix_sync(a_frag,
-            reinterpret_cast<const __half*>(&sA[warp_row * kWmmaM][0]),
-            kWmmaK + kWmmaShmemPad);
-        wmma::load_matrix_sync(b_frag,
-            reinterpret_cast<const __half*>(&sB[0][warp_col * kWmmaN]),
-            kBlockTileN + kWmmaShmemPad);
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        // Computo WMMA sobre la etapa actual.
+        const int stage_c = tile % kNumStages;
+        for (int k_inner = 0; k_inner < kKStep; k_inner += kWmmaK) {
+            wmma::load_matrix_sync(a_frag,
+                reinterpret_cast<const __half*>(&sA[stage_c][warp_row * kWmmaM][k_inner]),
+                kKStep + kWmmaShmemPad);
+            wmma::load_matrix_sync(b_frag,
+                reinterpret_cast<const __half*>(&sB[stage_c][k_inner][warp_col * kWmmaN]),
+                kBlockTileN + kWmmaShmemPad);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        // Barrera obligatoria: garantiza que todos los warps terminaron de leer
+        // stage_c antes de que cualquier warp empiece a sobreescribirlo con cp.async.
         __syncthreads();
+
+        // Lanzar carga futura en stage_c (ahora libre).
+        const int future = tile + kNumStages;
+        if (future < num_tiles) {
+            const int k_off = future * kKStep;
+            for (int i = threadIdx.x; i < n_pairs_A; i += blockDim.x) {
+                const int elem = i * 2;
+                const int row  = elem / kKStep;
+                const int col  = elem % kKStep;
+                __pipeline_memcpy_async(
+                    reinterpret_cast<uint32_t*>(&sA[stage_c][row][col]),
+                    reinterpret_cast<const uint32_t*>(&A[(block_row + row) * K + k_off + col]),
+                    sizeof(uint32_t));
+            }
+            for (int i = threadIdx.x; i < n_pairs_B; i += blockDim.x) {
+                const int elem = i * 2;
+                const int row  = elem / kBlockTileN;
+                const int col  = elem % kBlockTileN;
+                __pipeline_memcpy_async(
+                    reinterpret_cast<uint32_t*>(&sB[stage_c][row][col]),
+                    reinterpret_cast<const uint32_t*>(&B[(k_off + row) * N + block_col + col]),
+                    sizeof(uint32_t));
+            }
+            __pipeline_commit();
+        }
     }
 
     if (warp_row_base < M && warp_col_base < N) {
@@ -948,10 +1015,10 @@ static Metrics benchmark_gpu_wmma_conv(const std::vector<float>& x,
     const int Ncol = d.outH * d.outW;
     const int Kcol = opt.C * opt.R * opt.S;
 
-    if (M % kBlockTileM != 0 || Ncol % kBlockTileN != 0 || Kcol % kWmmaK != 0) {
+    if (M % kBlockTileM != 0 || Ncol % kBlockTileN != 0 || Kcol % kKStep != 0) {
         std::cerr << "WMMA conv omitida: K=" << M << " (req. mult. de " << kBlockTileM
                   << "), outH*outW=" << Ncol << " (req. mult. de " << kBlockTileN
-                  << "), C*R*S=" << Kcol << " (req. mult. de " << kWmmaK << ").\n";
+                  << "), C*R*S=" << Kcol << " (req. mult. de " << kKStep << ").\n";
         return Metrics{};
     }
 
@@ -992,6 +1059,7 @@ static Metrics benchmark_gpu_wmma_conv(const std::vector<float>& x,
     const int col_elems = Kcol * Ncol;
     const int col_blocks = (col_elems + kConversionThreads - 1) / kConversionThreads;
 
+    // 512 hilos/bloque (16 warps): permite 3 bloques/SM → 100 % ocupancia.
     const dim3 gemm_block(static_cast<unsigned int>(kBlockWarpsM * kBlockWarpsN * 32));
     const dim3 gemm_grid(
         static_cast<unsigned int>((M    + kBlockTileM - 1) / kBlockTileM),

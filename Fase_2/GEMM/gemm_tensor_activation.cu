@@ -1,4 +1,4 @@
-// nvcc -std=c++17 gemm_tensor_activation.cu -o gemm_tc -I/usr/include/openblas -lcublas -lopenblas -gencode arch=compute_86,code=sm_86
+// nvcc -std=c++17 gemm_tensor_activation.cu -o gemm_tc -I/usr/include/openblas -lcublas -lopenblas -gencode arch=compute_86,code=sm_86 --allow-unsupported-compiler
 // ./gemm_tc --m 2048 --n 2048 --k 2048 --iters 20
 // sudo /usr/local/cuda/bin/ncu --set full --export reporte_fase2_rtx3050 --force-overwrite ./gemm_tc
 
@@ -18,6 +18,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 #include <mma.h>
 
 // Valida llamadas a la API de CUDA y termina el programa si ocurre un error.
@@ -44,7 +45,7 @@ if (status != CUBLAS_STATUS_SUCCESS) { \
 namespace {
 
 constexpr int kWarmupIters = 3;
-constexpr int kCpuWarmupIters = 1;
+constexpr int kCpuWarmupIters = 3;
 constexpr int kConversionThreads = 256;
 
 // Dimensiones del fragmento WMMA para FP16: unicas dimensiones soportadas en sm_70+.
@@ -52,13 +53,25 @@ constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
 
-// Numero de warps por dimension dentro de un bloque (2×2 = 4 warps = 128 hilos).
-constexpr int kBlockWarpsM = 2;
-constexpr int kBlockWarpsN = 2;
+// Numero de elementos K cargados a shared memory por iteracion del bucle externo.
+// Debe ser multiplo de kWmmaK. A mayor kKStep, menos sincronizaciones y mayor
+// reuso de datos en shared memory, a costa de mas shared memory usada.
+constexpr int kKStep = 32;
 
-// Tile de salida que maneja un bloque completo: 32×32 elementos FP32.
-constexpr int kBlockTileM = kBlockWarpsM * kWmmaM;  // 32
-constexpr int kBlockTileN = kBlockWarpsN * kWmmaN;  // 32
+// Numero de warps por dimension dentro de un bloque (4×4 = 16 warps = 512 hilos).
+// Con 512 hilos/bloque y ~28.5 KiB shared por bloque, el SM puede alojar 3 bloques
+// simultaneos -> 48/48 warps activos -> 100% ocupancia teorica en Ampere (CC 8.6).
+constexpr int kBlockWarpsM = 4;
+constexpr int kBlockWarpsN = 4;
+
+// Tile de salida que maneja un bloque completo: 64×64 elementos FP32.
+constexpr int kBlockTileM = kBlockWarpsM * kWmmaM;  // 64
+constexpr int kBlockTileN = kBlockWarpsN * kWmmaN;  // 64
+
+// Etapas del pipeline de triple buffer para cp.async.
+// Mientras el warp computa el tile[i], la DMA ya esta cargando tile[i+2],
+// eliminando la espera sincrona de global memory en cada iteracion K.
+constexpr int kNumStages = 3;
 
 // Padding en shared memory para evitar bank conflicts entre warps.
 // Con FP16 (2 bytes) y 32 bancos de 4 bytes, añadir 8 elementos desplaza
@@ -67,9 +80,9 @@ constexpr int kWmmaShmemPad = 8;
 
 // Parametros de entrada configurables desde linea de comandos.
 struct Options {
-    int m = 2048;
-    int n = 2048;
-    int k = 2048;
+    int m = 4096;
+    int n = 4096;
+    int k = 4096;
     int iters = 20;
     bool use_double = false;
 };
@@ -396,40 +409,39 @@ static void copy_double_vector_to_host(const double* src, std::vector<double>& d
     CHECK_CUDA(cudaMemcpy(dst.data(), src, sizeof(double) * dst.size(), cudaMemcpyDeviceToHost));
 }
 
-// Compara dos resultados FP32 usando error maximo absoluto y norma relativa L2.
-static ErrorMetrics compare_float_vectors(const std::vector<float>& ref, const std::vector<float>& test) {
+// Compara una referencia FP64 col-major contra un resultado FP32 col-major.
+static ErrorMetrics compare_fp64_ref_vs_fp32_colmaj(
+        const std::vector<double>& ref_fp64,
+        const std::vector<float>&  test_fp32) {
     ErrorMetrics out;
-    double squared_error_sum = 0.0;
-    double squared_ref_sum = 0.0;
-
-    for (size_t i = 0; i < ref.size(); ++i) {
-        const double diff = static_cast<double>(ref[i]) - static_cast<double>(test[i]);
+    double sq_err = 0.0, sq_ref = 0.0;
+    for (size_t i = 0; i < ref_fp64.size(); ++i) {
+        const double r    = ref_fp64[i];
+        const double t    = static_cast<double>(test_fp32[i]);
+        const double diff = r - t;
         out.max_abs = std::max(out.max_abs, std::abs(diff));
-        squared_error_sum += diff * diff;
-        squared_ref_sum += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+        sq_err += diff * diff;
+        sq_ref += r * r;
     }
-
-    out.rel_l2 = squared_ref_sum > 0.0 ? std::sqrt(squared_error_sum / squared_ref_sum) : 0.0;
+    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
     return out;
 }
 
-// Compara dos matrices M×N con layouts diferentes:
-// ref  en col-major (convencion cuBLAS/BLAS): elemento (i,j) en ref[i + j*m]
-// test en row-major (salida del kernel WMMA): elemento (i,j) en test[i*n + j]
-static ErrorMetrics compare_float_rowmaj_vs_colmaj(
-        const std::vector<float>& ref_colmaj,
-        const std::vector<float>& test_rowmaj,
+// Compara una referencia FP64 col-major contra un resultado FP32 row-major (salida WMMA).
+static ErrorMetrics compare_fp64_ref_colmaj_vs_fp32_rowmaj(
+        const std::vector<double>& ref_fp64_colmaj,
+        const std::vector<float>&  test_fp32_rowmaj,
         int m, int n) {
     ErrorMetrics out;
     double sq_err = 0.0, sq_ref = 0.0;
     for (int i = 0; i < m; ++i) {
         for (int j = 0; j < n; ++j) {
-            const double r = static_cast<double>(ref_colmaj[i + j * m]);
-            const double t = static_cast<double>(test_rowmaj[i * n + j]);
+            const double r    = ref_fp64_colmaj[i + j * m];
+            const double t    = static_cast<double>(test_fp32_rowmaj[i * n + j]);
             const double diff = r - t;
             out.max_abs = std::max(out.max_abs, std::abs(diff));
             sq_err += diff * diff;
-            sq_ref  += r * r;
+            sq_ref += r * r;
         }
     }
     out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
@@ -462,8 +474,8 @@ static void print_reference_comparison(const char* label,
     std::cout << label << " - rendimiento    : " << metrics.gflops << " GFLOP/s ("
               << metrics.tflops << " TFLOP/s)\n";
     std::cout << "Speedup vs CPU             : " << reference_ms / metrics.ms << "x\n";
-    std::cout << "Error max abs vs CPU       : " << error.max_abs << "\n";
-    std::cout << "Error relativo L2 vs CPU   : " << error.rel_l2 << "\n\n";
+    std::cout << "Error max abs vs FP64      : " << error.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64  : " << error.rel_l2 << "\n\n";
 }
 
 // Ejecuta GEMM en CPU usando BLAS.
@@ -822,21 +834,25 @@ __global__ static void float_colmaj_to_half_rowmaj_kernel(
     }
 }
 
-// Kernel GEMM con API WMMA: C(M,N) = A(M,K) * B(K,N), todos row-major FP16→FP32.
+// Kernel GEMM con API WMMA + pipeline cp.async de 3 etapas (Ampere sm_80+).
+// C(M,N) = A(M,K) * B(K,N), todos row-major FP16→FP32.
 //
 // Organizacion de hilos:
-//   Bloque: 128 hilos = 4 warps dispuestos en una cuadricula 2x2 de fragmentos.
-//   Cada warp calcula un fragmento de salida de 16x16 en FP32.
-//   Un bloque cubre un tile de salida de 32x32.
-//   Grid: (ceildiv(M,32), ceildiv(N,32)).
+//   Bloque: 512 hilos = 16 warps en cuadricula 4x4 de fragmentos WMMA.
+//   Cada warp calcula un fragmento de salida 16x16 en FP32.
+//   Un bloque cubre un tile de salida 64x64.
+//   Grid: (ceildiv(M,64), ceildiv(N,64)).
 //
-// Flujo por bloque:
-//   1. Carga coalescente del tile de A (32x16) a shared memory sA.
-//   2. Carga coalescente del tile de B (16x32) a shared memory sB.
-//   3. Cada warp llama wmma::load_matrix_sync sobre su sub-tile en sA/sB.
-//   4. Cada warp acumula con wmma::mma_sync (operacion Tensor Core HMMA).
-//   5. Al finalizar el bucle K, cada warp escribe su fragmento a C con
-//      wmma::store_matrix_sync.
+// Triple buffer con cp.async:
+//   El SM tiene 3 copias de sA/sB (etapas 0,1,2). Mientras el warp ejecuta
+//   instrucciones HMMA sobre la etapa[i], la DMA ya transfiere la etapa[i+2]
+//   desde global memory sin pasar por registros (cp.async). La barrera de cada
+//   iteracion se reemplaza por consumer_wait_prior<kNumStages-1>(), que solo
+//   bloquea si el tile necesario aun no llego, en vez de vaciar todo el pipeline.
+//
+// Requisito: M multiplo de kBlockTileM(64), N de kBlockTileN(64), K de kKStep(32).
+// Ocupancia esperada en CC 8.6: 3 bloques/SM x 16 warps = 48/48 warps = 100%.
+__launch_bounds__(kBlockWarpsM * kBlockWarpsN * 32, 3)
 __global__ static void wmma_gemm_kernel(
         const __half* __restrict__ A,
         const __half* __restrict__ B,
@@ -844,20 +860,17 @@ __global__ static void wmma_gemm_kernel(
         int M, int N, int K) {
     using namespace nvcuda;
 
-    // Shared memory: cada fila incluye padding para evitar bank conflicts.
-    // sA almacena el tile actual de A (32 filas x 16 cols).
-    // sB almacena el tile actual de B (16 filas x 32 cols).
-    __shared__ __half sA[kBlockTileM][kWmmaK + kWmmaShmemPad];
-    __shared__ __half sB[kWmmaK][kBlockTileN + kWmmaShmemPad];
+    // Triple buffer: sA[etapa][fila][col], sB[etapa][fila][col].
+    // El padding por fila evita bank conflicts cuando warps distintos
+    // acceden a columnas separadas por kKStep o kBlockTileN elementos.
+    __shared__ __half sA[kNumStages][kBlockTileM][kKStep      + kWmmaShmemPad];
+    __shared__ __half sB[kNumStages][kKStep]     [kBlockTileN + kWmmaShmemPad];
 
-    const int warp_id  = threadIdx.x / 32;
-    const int warp_row = warp_id / kBlockWarpsN;
-    const int warp_col = warp_id % kBlockWarpsN;
-
-    const int block_row = blockIdx.x * kBlockTileM;
-    const int block_col = blockIdx.y * kBlockTileN;
-
-    // Posicion de inicio del fragmento de salida de este warp en C global.
+    const int warp_id       = threadIdx.x / 32;
+    const int warp_row      = warp_id / kBlockWarpsN;
+    const int warp_col      = warp_id % kBlockWarpsN;
+    const int block_row     = blockIdx.x * kBlockTileM;
+    const int block_col     = blockIdx.y * kBlockTileN;
     const int warp_row_base = block_row + warp_row * kWmmaM;
     const int warp_col_base = block_col + warp_col * kWmmaN;
 
@@ -866,60 +879,107 @@ __global__ static void wmma_gemm_kernel(
     wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float>                   c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
-    for (int k_base = 0; k_base < K; k_base += kWmmaK) {
-        // -- Carga del tile de A (32 x kWmmaK) desde global a shared memory --
-        // Cada hilo carga un elemento usando su indice lineal.
-        // Para el hilo i: row = i/kWmmaK, col = i%kWmmaK.
-        // Todos los hilos de un warp acceden a columnas consecutivas de la
-        // misma fila → direcciones globales contiguas → acceso coalescente.
-        for (int i = threadIdx.x; i < kBlockTileM * kWmmaK; i += blockDim.x) {
-            const int row        = i / kWmmaK;
-            const int col        = i % kWmmaK;
-            const int global_row = block_row + row;
-            const int global_col = k_base    + col;
-            sA[row][col] = (global_row < M && global_col < K)
-                           ? A[global_row * K + global_col]
-                           : __float2half(0.0f);
+    // API primitiva de pipeline (cuda_pipeline_primitives.h):
+    //   __pipeline_memcpy_async(dst, src, size) -> emite cp.async (min 4 bytes en Ampere)
+    //   __pipeline_commit()                     -> cierra el grupo de copias actual
+    //   __pipeline_wait_prior(N)                -> espera hasta que queden <= N grupos pendientes
+    // No requiere acquire/release: el estado del pipeline es implicito por hilo.
+
+    // Numero de tiles K. K es multiplo de kKStep (validado en benchmark_gpu_wmma).
+    const int num_tiles = K / kKStep;
+
+    // Pares uint32_t (2 fp16) por tile: cp.async necesita minimo 4 bytes.
+    // kBlockTileM*kKStep = 64*32 = 2048 fp16 = 1024 uint32_t
+    // kKStep*kBlockTileN = 32*64 = 2048 fp16 = 1024 uint32_t
+    const int n_pairs_A = kBlockTileM * kKStep / 2;
+    const int n_pairs_B = kKStep      * kBlockTileN / 2;
+
+    // -- Precarga de las primeras kNumStages etapas antes del bucle principal --
+    // Emite kNumStages grupos de cp.async sin esperar ninguno todavia.
+    for (int s = 0; s < kNumStages && s < num_tiles; ++s) {
+        const int k_off = s * kKStep;
+
+        for (int i = threadIdx.x; i < n_pairs_A; i += blockDim.x) {
+            const int elem = i * 2;
+            const int row  = elem / kKStep;
+            const int col  = elem % kKStep;   // siempre par -> alineado a 4 bytes
+            __pipeline_memcpy_async(
+                reinterpret_cast<uint32_t*>(&sA[s][row][col]),
+                reinterpret_cast<const uint32_t*>(&A[(block_row + row) * K + k_off + col]),
+                sizeof(uint32_t));
         }
-
-        // -- Carga del tile de B (kWmmaK x 32) desde global a shared memory --
-        // Patron simetrico: hilo i carga row = i/kBlockTileN, col = i%kBlockTileN.
-        // Los kBlockTileN (32) hilos mas bajos de cada warp acceden a 32
-        // columnas consecutivas de la misma fila → coalescente.
-        for (int i = threadIdx.x; i < kWmmaK * kBlockTileN; i += blockDim.x) {
-            const int row        = i / kBlockTileN;
-            const int col        = i % kBlockTileN;
-            const int global_row = k_base    + row;
-            const int global_col = block_col + col;
-            sB[row][col] = (global_row < K && global_col < N)
-                           ? B[global_row * N + global_col]
-                           : __float2half(0.0f);
+        for (int i = threadIdx.x; i < n_pairs_B; i += blockDim.x) {
+            const int elem = i * 2;
+            const int row  = elem / kBlockTileN;
+            const int col  = elem % kBlockTileN;  // siempre par
+            __pipeline_memcpy_async(
+                reinterpret_cast<uint32_t*>(&sB[s][row][col]),
+                reinterpret_cast<const uint32_t*>(&B[(k_off + row) * N + block_col + col]),
+                sizeof(uint32_t));
         }
-
-        // Barrera: todos los hilos del bloque deben haber completado las cargas
-        // antes de que cualquier warp lea los fragmentos desde shared memory.
-        __syncthreads();
-
-        // -- Carga de fragmentos WMMA desde shared memory --
-        // Cada warp lee su sub-tile de 16x16 de sA y sB.
-        // El leading dimension (ldm) incluye el padding para que wmma acceda
-        // correctamente a filas consecutivas sin conflictos de banco.
-        wmma::load_matrix_sync(a_frag,
-            reinterpret_cast<const __half*>(&sA[warp_row * kWmmaM][0]),
-            kWmmaK + kWmmaShmemPad);
-
-        wmma::load_matrix_sync(b_frag,
-            reinterpret_cast<const __half*>(&sB[0][warp_col * kWmmaN]),
-            kBlockTileN + kWmmaShmemPad);
-
-        // -- Multiplicacion Tensor Core: acumula en FP32 --
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-
-        // Barrera: protege sA/sB para la siguiente iteracion del bucle K.
-        __syncthreads();
+        __pipeline_commit();  // cierra el grupo s
     }
 
-    // -- Escritura del fragmento acumulado a la matriz de salida C (row-major) --
+    // -- Bucle principal sobre tiles K --
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        // prior decrece en los ultimos kNumStages-1 tiles porque ya no se emiten
+        // commits nuevos: sin el ajuste, wait_prior(2) dejaria el tile actual pendiente.
+        // Formula: min(kNumStages-1, tiles restantes despues del actual).
+        const int prior = min(kNumStages - 1, num_tiles - tile - 1);
+        __pipeline_wait_prior(prior);
+
+        // Barrera de bloque: sincroniza los cp.async de todos los hilos antes de
+        // que cualquier warp lea sA/sB con wmma::load_matrix_sync.
+        __syncthreads();
+
+        // -- Computo WMMA sobre la etapa actual --
+        const int stage_c = tile % kNumStages;
+        for (int k_inner = 0; k_inner < kKStep; k_inner += kWmmaK) {
+            wmma::load_matrix_sync(a_frag,
+                reinterpret_cast<const __half*>(&sA[stage_c][warp_row * kWmmaM][k_inner]),
+                kKStep + kWmmaShmemPad);
+            wmma::load_matrix_sync(b_frag,
+                reinterpret_cast<const __half*>(&sB[stage_c][k_inner][warp_col * kWmmaN]),
+                kBlockTileN + kWmmaShmemPad);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        // Barrera entre computo y carga futura: garantiza que TODOS los warps
+        // terminaron wmma::load_matrix_sync sobre stage_c antes de que cualquier
+        // warp empiece a sobreescribirlo con cp.async.
+        // Sin esta barrera, un warp adelantado podria escribir stage_c mientras
+        // otro warp aun lo esta leyendo -> race condition en shared memory.
+        __syncthreads();
+
+        // Emitir la carga futura DESPUES del computo: stage_c quedo libre ahora
+        // y puede recibir el tile[tile+kNumStages] sin race condition.
+        // El overlap con el computo de las proximas iteraciones se mantiene.
+        const int future = tile + kNumStages;
+        if (future < num_tiles) {
+            const int k_off = future * kKStep;
+            for (int i = threadIdx.x; i < n_pairs_A; i += blockDim.x) {
+                const int elem = i * 2;
+                const int row  = elem / kKStep;
+                const int col  = elem % kKStep;
+                __pipeline_memcpy_async(
+                    reinterpret_cast<uint32_t*>(&sA[stage_c][row][col]),
+                    reinterpret_cast<const uint32_t*>(&A[(block_row + row) * K + k_off + col]),
+                    sizeof(uint32_t));
+            }
+            for (int i = threadIdx.x; i < n_pairs_B; i += blockDim.x) {
+                const int elem = i * 2;
+                const int row  = elem / kBlockTileN;
+                const int col  = elem % kBlockTileN;
+                __pipeline_memcpy_async(
+                    reinterpret_cast<uint32_t*>(&sB[stage_c][row][col]),
+                    reinterpret_cast<const uint32_t*>(&B[(k_off + row) * N + block_col + col]),
+                    sizeof(uint32_t));
+            }
+            __pipeline_commit();
+        }
+    }
+
+    // -- Escritura del fragmento acumulado a C (row-major) --
     if (warp_row_base < M && warp_col_base < N) {
         wmma::store_matrix_sync(
             C + warp_row_base * N + warp_col_base,
@@ -968,8 +1028,9 @@ static Metrics benchmark_gpu_wmma(const std::vector<float>& A,
     }
 
     DeviceBuffer<float> dC(C.size());
-
+    // 512 hilos/bloque (16 warps): permite 3 bloques simultaneos en el SM -> 100% ocupancia.
     const dim3 block(static_cast<unsigned int>(kBlockWarpsM * kBlockWarpsN * 32));
+    // Grid 2D: un bloque por tile de salida 64x64.
     const dim3 grid(
         static_cast<unsigned int>((m + kBlockTileM - 1) / kBlockTileM),
         static_cast<unsigned int>((n + kBlockTileN - 1) / kBlockTileN));
@@ -999,6 +1060,7 @@ static void print_float_report(const Metrics& cpu,
                                const Metrics& gpu,
                                const Metrics& tc,
                                const Metrics& wmma,
+                               const ErrorMetrics& cpu_error,
                                const ErrorMetrics& gpu_error,
                                const ErrorMetrics& tc_error,
                                const ErrorMetrics& wmma_error) {
@@ -1006,7 +1068,9 @@ static void print_float_report(const Metrics& cpu,
     std::cout << "================ RESULTADOS GEMM FP32 =================\n";
     std::cout << "CPU BLAS - tiempo medio    : " << cpu.ms << " ms\n";
     std::cout << "CPU BLAS - rendimiento     : " << cpu.gflops << " GFLOP/s ("
-              << cpu.tflops << " TFLOP/s)\n\n";
+              << cpu.tflops << " TFLOP/s)\n";
+    std::cout << "Error max abs vs FP64      : " << cpu_error.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64  : " << cpu_error.rel_l2 << "\n\n";
 
     print_reference_comparison("GPU cuBLAS clasico", gpu, cpu.ms, gpu_error);
 
@@ -1015,8 +1079,8 @@ static void print_float_report(const Metrics& cpu,
               << tc.tflops << " TFLOP/s)\n";
     std::cout << "Speedup TC vs CPU          : " << cpu.ms / tc.ms << "x\n";
     std::cout << "Speedup TC vs GPU clasico  : " << gpu.ms / tc.ms << "x\n";
-    std::cout << "Error max abs vs CPU       : " << tc_error.max_abs << "\n";
-    std::cout << "Error relativo L2 vs CPU   : " << tc_error.rel_l2 << "\n\n";
+    std::cout << "Error max abs vs FP64      : " << tc_error.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64  : " << tc_error.rel_l2 << "\n\n";
 
     std::cout << "GPU WMMA custom - tiempo   : " << wmma.ms << " ms\n";
     std::cout << "GPU WMMA custom - rend.    : " << wmma.gflops << " GFLOP/s ("
@@ -1024,8 +1088,8 @@ static void print_float_report(const Metrics& cpu,
     std::cout << "Speedup WMMA vs CPU        : " << cpu.ms / wmma.ms << "x\n";
     std::cout << "Speedup WMMA vs GPU clasico: " << gpu.ms / wmma.ms << "x\n";
     std::cout << "Speedup WMMA vs cuBLAS TC  : " << tc.ms / wmma.ms << "x\n";
-    std::cout << "Error max abs vs CPU       : " << wmma_error.max_abs << "\n";
-    std::cout << "Error relativo L2 vs CPU   : " << wmma_error.rel_l2 << "\n";
+    std::cout << "Error max abs vs FP64      : " << wmma_error.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64  : " << wmma_error.rel_l2 << "\n";
     std::cout << "=======================================================\n";
 }
 
@@ -1067,16 +1131,26 @@ static void run_experiment_float(const Options& opt) {
     initialize_matrix_float(A);
     initialize_matrix_float(B);
 
+    // Referencia FP64: las mismas entradas casteadas a double para un ground truth preciso.
+    std::vector<double> A_d(size_a), B_d(size_b), C_ref(size_c, 0.0);
+    for (size_t i = 0; i < size_a; ++i) A_d[i] = static_cast<double>(A[i]);
+    for (size_t i = 0; i < size_b; ++i) B_d[i] = static_cast<double>(B[i]);
+    cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                opt.m, opt.n, opt.k,
+                1.0, A_d.data(), opt.m, B_d.data(), opt.k,
+                0.0, C_ref.data(), opt.m);
+
     const Metrics cpu  = benchmark_cpu_float(A, B, C_cpu, opt.m, opt.n, opt.k, opt.iters);
     const Metrics gpu  = benchmark_gpu_cublas_float(A, B, C_gpu, opt.m, opt.n, opt.k, opt.iters);
     const Metrics tc   = benchmark_gpu_tensor_cores(A, B, C_tc, opt.m, opt.n, opt.k, opt.iters);
     const Metrics wmma = benchmark_gpu_wmma(A, B, C_wmma, opt.m, opt.n, opt.k, opt.iters);
 
-    const ErrorMetrics gpu_error  = compare_float_vectors(C_cpu, C_gpu);
-    const ErrorMetrics tc_error   = compare_float_vectors(C_cpu, C_tc);
-    const ErrorMetrics wmma_error = compare_float_rowmaj_vs_colmaj(C_cpu, C_wmma, opt.m, opt.n);
+    const ErrorMetrics cpu_error  = compare_fp64_ref_vs_fp32_colmaj(C_ref, C_cpu);
+    const ErrorMetrics gpu_error  = compare_fp64_ref_vs_fp32_colmaj(C_ref, C_gpu);
+    const ErrorMetrics tc_error   = compare_fp64_ref_vs_fp32_colmaj(C_ref, C_tc);
+    const ErrorMetrics wmma_error = compare_fp64_ref_colmaj_vs_fp32_rowmaj(C_ref, C_wmma, opt.m, opt.n);
 
-    print_float_report(cpu, gpu, tc, wmma, gpu_error, tc_error, wmma_error);
+    print_float_report(cpu, gpu, tc, wmma, cpu_error, gpu_error, tc_error, wmma_error);
 }
 
 // Orquesta el experimento FP64 completo.
