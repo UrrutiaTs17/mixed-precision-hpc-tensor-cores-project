@@ -1,0 +1,100 @@
+[latorresn@paccaA100 GEMM]$ ./gemm_tc --m 12288 --n 12288 --k 12288 --iters 20
+================ CARACTERISTICAS DE LA GPU ================
+Dispositivo activo         : 0
+Nombre                     : NVIDIA A100-PCIE-40GB
+Compute Capability         : 8.0
+Memoria global             : 39.49 GiB
+SMs                        : 108
+Max hilos por bloque       : 1024
+Warp size                  : 32
+Reloj GPU                  : 1410.00 MHz
+Reloj memoria              : 1215.00 MHz
+Bus de memoria             : 5120 bits
+Memoria compartida/bloque  : 48.00 KiB
+Tensor Cores FP16 (HMMA)   : si
+Tensor Cores TF32          : si
+===========================================================
+
+================== CONFIGURACION ==================
+Precision                  : FP32 (float)
+Dimensiones (M, N, K)      : 12288, 12288, 12288
+Iteraciones                : 20
+===================================================
+
+================ RESULTADOS GEMM FP32 =================
+CPU BLAS - tiempo medio    : 2087.958020 ms
+CPU BLAS - rendimiento     : 1777.263579 GFLOP/s (1.777264 TFLOP/s)
+Error max abs vs FP64      : 0.003623
+Error relativo L2 vs FP64  : 0.000000
+
+GPU cuBLAS clasico - tiempo         : 212.346222 ms
+GPU cuBLAS clasico - rendimiento    : 17475.478067 GFLOP/s (17.475478 TFLOP/s)
+Speedup vs CPU             : 9.832800x
+Error max abs vs FP64      : 0.013808
+Error relativo L2 vs FP64  : 0.000002
+
+GPU cuBLAS TC - tiempo     : 17.131674 ms
+GPU cuBLAS TC - rend.      : 216607.658089 GFLOP/s (216.607658 TFLOP/s)
+Speedup TC vs CPU          : 121.877059x
+Speedup TC vs GPU clasico  : 12.394949x
+Error max abs vs FP64      : 0.965415
+Error relativo L2 vs FP64  : 0.000225
+
+GPU WMMA custom - tiempo   : 96.062616 ms
+GPU WMMA custom - rend.    : 38629.509580 GFLOP/s (38.629510 TFLOP/s)
+Speedup WMMA vs CPU        : 21.735386x
+Speedup WMMA vs GPU clasico: 2.210498x
+Speedup WMMA vs cuBLAS TC  : 0.178339x
+Error max abs vs FP64      : 0.965415
+Error relativo L2 vs FP64  : 0.000225
+=======================================================
+[latorresn@paccaA100 GEMM]$ ./gemm_tc --m 32768 --n 32768 --k 32768 --iters 30
+================ CARACTERISTICAS DE LA GPU ================
+Dispositivo activo         : 0
+Nombre                     : NVIDIA A100-PCIE-40GB
+Compute Capability         : 8.0
+Memoria global             : 39.49 GiB
+SMs                        : 108
+Max hilos por bloque       : 1024
+Warp size                  : 32
+Reloj GPU                  : 1410.00 MHz
+Reloj memoria              : 1215.00 MHz
+Bus de memoria             : 5120 bits
+Memoria compartida/bloque  : 48.00 KiB
+Tensor Cores FP16 (HMMA)   : si
+Tensor Cores TF32          : si
+===========================================================
+
+================== CONFIGURACION ==================
+Precision                  : FP32 (float)
+Dimensiones (M, N, K)      : 32768, 32768, 32768
+Iteraciones                : 30
+===================================================
+
+================ RESULTADOS GEMM FP32 =================
+CPU BLAS - tiempo medio    : 38930.839478 ms
+CPU BLAS - rendimiento     : 1807.532155 GFLOP/s (1.807532 TFLOP/s)
+Error max abs vs FP64      : 0.002974
+Error relativo L2 vs FP64  : 0.000000
+
+GPU cuBLAS clasico - tiempo         : 4525.724609 ms
+GPU cuBLAS clasico - rendimiento    : 15548.613814 GFLOP/s (15.548614 TFLOP/s)
+Speedup vs CPU             : 8.602123x
+Error max abs vs FP64      : 0.020150
+Error relativo L2 vs FP64  : 0.000005
+
+GPU cuBLAS TC - tiempo     : 372.553192 ms
+GPU cuBLAS TC - rend.      : 188882.408372 GFLOP/s (188.882408 TFLOP/s)
+Speedup TC vs CPU          : 104.497399x
+Speedup TC vs GPU clasico  : 12.147862x
+Error max abs vs FP64      : 1.082245
+Error relativo L2 vs FP64  : 0.000308
+
+GPU WMMA custom - tiempo   : 1906.500260 ms
+GPU WMMA custom - rend.    : 36909.905358 GFLOP/s (36.909905 TFLOP/s)
+Speedup WMMA vs CPU        : 20.420055x
+Speedup WMMA vs GPU clasico: 2.373839x
+Speedup WMMA vs cuBLAS TC  : 0.195412x
+Error max abs vs FP64      : 1.082245
+Error relativo L2 vs FP64  : 0.000308
+=======================================================
