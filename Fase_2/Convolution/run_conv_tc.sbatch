@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=mixed_precision_gemm_tc
-#SBATCH --output=logs/mixed_precision_gemm_tc_%j.out
-#SBATCH --error=logs/mixed_precision_gemm_tc_%j.err
+#SBATCH --job-name=mixed_precision_conv_tc
+#SBATCH --output=logs/mixed_precision_conv_tc_%j.out
+#SBATCH --error=logs/mixed_precision_conv_tc_%j.err
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -21,13 +21,15 @@ fi
 
 # Arquitectura por defecto para A100.
 # Puedes sobrescribirla con:
-#   sbatch --export=ALL,CUDA_ARCH=86 run_gemm_tc.sbatch
+#   sbatch --export=ALL,CUDA_ARCH=86 run_conv_tc.sbatch
 CUDA_ARCH="${CUDA_ARCH:-80}"  # A100=80, RTX 3050=86, V100=70
 
 NVCC="${NVCC:-/opt/ohpc/pub/devtools/nvidia/hpc_sdk/Linux_x86_64/23.1/compilers/bin/nvcc}"
 NCU="${NCU:-${HOME}/fcrojasv/nsight_compute/ncu}"
 OPENBLAS_INC="${OPENBLAS_INC:--I/usr/include/openblas}"
 OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
+CUDNN_INC="${CUDNN_INC:-}"
+CUDNN_LIBS="${CUDNN_LIBS:--lcudnn}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     RUN_NCU="${RUN_NCU:-0}"
@@ -50,35 +52,42 @@ echo "RUN_NCU=${RUN_NCU}"
 
 nvidia-smi || true
 
-echo "Compilando gemm_tc..."
-"${NVCC}" -std=c++17 gemm_tensor_activation.cu -o gemm_tc \
-    ${OPENBLAS_INC} -lcublas ${OPENBLAS_LIBS} \
+echo "Compilando conv_tc..."
+"${NVCC}" -std=c++17 conv_tensor_activation.cu -o conv_tc \
+    ${OPENBLAS_INC} ${CUDNN_INC} ${CUDNN_LIBS} ${OPENBLAS_LIBS} \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     --allow-unsupported-compiler
 
-echo "Ejecutando benchmarks registrados en Primeras_mediciones_rendimiento_PACCA.txt..."
+echo "Ejecutando benchmarks de convolucion 2D con Tensor Cores..."
 
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     declare -a RUNS=(
-        "1024 1024 1024 2"
+        "1 32 32 32 32 3 3 1 1 1 1 1 1 2"
     )
 else
     declare -a RUNS=(
-        "12288 12288 12288 30"
-        "32768 32768 32768 30"
+        "1 32 128 128 64 3 3 1 1 1 1 1 1 20"
+        "1 64 224 224 64 3 3 1 1 1 1 1 1 10"
     )
 fi
 
 for run in "${RUNS[@]}"; do
-    read -r M N K ITERS <<< "${run}"
+    read -r N C H W K R S PAD_H PAD_W STRIDE_H STRIDE_W DILATION_H DILATION_W ITERS <<< "${run}"
     echo
     echo "============================================================"
-    echo "Corrida: M=${M}, N=${N}, K=${K}, ITERS=${ITERS}"
+    echo "Corrida: N=${N}, C=${C}, H=${H}, W=${W}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS}"
+    echo "Padding: (${PAD_H}, ${PAD_W}), stride: (${STRIDE_H}, ${STRIDE_W}), dilation: (${DILATION_H}, ${DILATION_W})"
     echo "============================================================"
-    ./gemm_tc --m "${M}" --n "${N}" --k "${K}" --iters "${ITERS}"
+    ./conv_tc \
+        --N "${N}" --C "${C}" --H "${H}" --W "${W}" \
+        --K "${K}" --R "${R}" --S "${S}" \
+        --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
+        --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
+        --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
+        --iters "${ITERS}"
 
     if [[ "${RUN_NCU}" == "1" ]]; then
-        REPORT="logs/ncu_wmma_m${M}_n${N}_k${K}_job${SLURM_JOB_ID:-manual}"
+        REPORT="logs/ncu_wmma_conv_N${N}_C${C}_H${H}_W${W}_K${K}_R${R}_S${S}_job${SLURM_JOB_ID:-manual}"
         echo
         echo "Perfilando WMMA con Nsight Compute..."
         echo "Reporte: ${REPORT}.ncu-rep"
@@ -89,6 +98,12 @@ for run in "${RUNS[@]}"; do
             --launch-count "${NCU_LAUNCH_COUNT}" \
             --export "${REPORT}" \
             --force-overwrite \
-            ./gemm_tc --m "${M}" --n "${N}" --k "${K}" --iters "${ITERS}"
+            ./conv_tc \
+                --N "${N}" --C "${C}" --H "${H}" --W "${W}" \
+                --K "${K}" --R "${R}" --S "${S}" \
+                --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
+                --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
+                --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
+                --iters "${ITERS}"
     fi
 done
