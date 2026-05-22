@@ -47,8 +47,15 @@ normalize_include_flags() {
     fi
 }
 
-OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
-OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
+# On OpenHPC, OPENBLAS_DIR is reliably set by the module; derive flags from it
+# to avoid getting the raw path passed to nvcc without -I.
+if [[ -n "${OPENBLAS_DIR:-}" ]]; then
+    OPENBLAS_INC="-I${OPENBLAS_DIR}/include"
+    OPENBLAS_LIBS="-L${OPENBLAS_DIR}/lib -lopenblas"
+else
+    OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
+    OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
+fi
 CUDNN_INC="$(normalize_include_flags "${CUDNN_INC:-}")"
 CUDNN_LIBS="${CUDNN_LIBS:--lcudnn}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
@@ -82,13 +89,19 @@ echo "Compilando conv_tc..."
 echo "Ejecutando benchmarks de convolucion 2D con Tensor Cores..."
 
 if [[ "${SMOKE_TEST}" == "1" ]]; then
+    # N=1, C=64, H=W=64, K=64: outH*outW=4096 (mult 64), K=64 (mult 64),
+    # C*R*S=576 (mult 32) -> WMMA path activa.
     declare -a RUNS=(
-        "1 32 32 32 32 3 3 1 1 1 1 1 1 2"
+        "1 64 64 64 64 3 3 1 1 1 1 1 1 2"
     )
 else
+    # N=1 en ambas corridas: con launch-skip=3, NCU salta exactamente los 3
+    # warmups del benchmark (1 llamada wmma_gemm_kernel por iteracion con N=1).
+    # Run 1: M=1024, N=65536, K=9216  -> ~1236 GFLOPs -> ~6.6 ms por kernel en A100
+    # Run 2: M=2048, N=65536, K=18432 -> ~4948 GFLOPs -> ~26.5 ms por kernel en A100
     declare -a RUNS=(
-        "1 32 128 128 64 3 3 1 1 1 1 1 1 20"
-        "1 64 224 224 64 3 3 1 1 1 1 1 1 10"
+        "1 1024 256 256 1024 3 3 1 1 1 1 1 1 10"
+        "1 2048 256 256 2048 3 3 1 1 1 1 1 1 5"
     )
 fi
 
