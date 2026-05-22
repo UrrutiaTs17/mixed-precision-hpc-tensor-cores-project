@@ -47,8 +47,15 @@ normalize_include_flags() {
     fi
 }
 
-OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
-OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
+# On OpenHPC, OPENBLAS_DIR is reliably set by the module; derive flags from it
+# to avoid getting the raw path passed to nvcc without -I.
+if [[ -n "${OPENBLAS_DIR:-}" ]]; then
+    OPENBLAS_INC="-I${OPENBLAS_DIR}/include"
+    OPENBLAS_LIBS="-L${OPENBLAS_DIR}/lib -lopenblas"
+else
+    OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
+    OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
+fi
 SMOKE_TEST="${SMOKE_TEST:-0}"
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     RUN_NCU="${RUN_NCU:-0}"
