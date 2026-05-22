@@ -29,9 +29,27 @@ CUDA_ARCH="${CUDA_ARCH:-80}"  # A100=80, RTX 3050=86, V100=70
 
 NVCC="${NVCC:-/opt/ohpc/pub/devtools/nvidia/hpc_sdk/Linux_x86_64/23.1/compilers/bin/nvcc}"
 NCU="${NCU:-${HOME}/fcrojasv/nsight_compute/ncu}"
-OPENBLAS_INC="${OPENBLAS_INC:--I/usr/include/openblas}"
+normalize_include_flags() {
+    local raw="${1:-}"
+    local item
+    local normalized=()
+
+    for item in ${raw}; do
+        if [[ "${item}" == -I* || "${item}" == -* ]]; then
+            normalized+=("${item}")
+        else
+            normalized+=("-I${item}")
+        fi
+    done
+
+    if [[ "${#normalized[@]}" -gt 0 ]]; then
+        printf '%s ' "${normalized[@]}"
+    fi
+}
+
+OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
 OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
-CUDNN_INC="${CUDNN_INC:-}"
+CUDNN_INC="$(normalize_include_flags "${CUDNN_INC:-}")"
 CUDNN_LIBS="${CUDNN_LIBS:--lcudnn}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 if [[ "${SMOKE_TEST}" == "1" ]]; then
