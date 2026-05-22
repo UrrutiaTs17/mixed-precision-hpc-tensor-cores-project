@@ -2,7 +2,7 @@
 #SBATCH --job-name=mixed_precision_conv_tc
 #SBATCH --output=logs/mixed_precision_conv_tc_%j.out
 #SBATCH --error=logs/mixed_precision_conv_tc_%j.err
-#SBATCH --partition=a100
+#SBATCH --partition=GPU
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
@@ -11,7 +11,10 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+if [[ ! -f conv_tensor_activation.cu && -f Convolution/conv_tensor_activation.cu ]]; then
+    cd Convolution
+fi
 mkdir -p logs
 
 # Carga de modulos: en PACCA no hay modulo "cuda"; nvcc/ncu se toman por ruta.
