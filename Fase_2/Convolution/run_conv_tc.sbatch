@@ -56,8 +56,43 @@ else
     OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
     OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
 fi
-CUDNN_INC="$(normalize_include_flags "${CUDNN_INC:-}")"
-CUDNN_LIBS="${CUDNN_LIBS:--lcudnn}"
+# Resolucion de cuDNN. En PACCA no hay cuDNN del sistema ni modulo: la unica
+# instalacion compatible con CUDA 12 y con la API v7 que usa este codigo es la
+# cuDNN 9.x (wheel cu12) del entorno Analytics. Se auto-detecta desde CUDNN_ROOT
+# para no tener que exportar nada en cada corrida. Sobrescribible con:
+#   sbatch --export=ALL,CUDNN_ROOT=/otra/ruta        run_conv_tc.sbatch
+#   sbatch --export=ALL,CUDNN_INC=...,CUDNN_LIBS=...  run_conv_tc.sbatch
+CUDNN_ROOT="${CUDNN_ROOT:-/opt/ohpc/pub/Analytics/anaconda3/envs/hybrid-profiler/lib/python3.10/site-packages/nvidia/cudnn}"
+
+if [[ -z "${CUDNN_INC:-}" && -f "${CUDNN_ROOT}/include/cudnn.h" ]]; then
+    CUDNN_INC="-I${CUDNN_ROOT}/include"
+else
+    CUDNN_INC="$(normalize_include_flags "${CUDNN_INC:-}")"
+fi
+
+if [[ -z "${CUDNN_LIBS:-}" ]]; then
+    if [[ -e "${CUDNN_ROOT}/lib/libcudnn.so" ]]; then
+        CUDNN_LIBS="-L${CUDNN_ROOT}/lib -lcudnn"
+    elif compgen -G "${CUDNN_ROOT}/lib/libcudnn.so.*" >/dev/null; then
+        # El wheel de cuDNN 9 solo trae libcudnn.so.9 (sin el symlink .so), por
+        # lo que -lcudnn fallaria: se enlaza el soname exacto con -l:.
+        _cudnn_soname="$(basename "$(ls -1 "${CUDNN_ROOT}"/lib/libcudnn.so.* | sort -V | tail -1)")"
+        CUDNN_LIBS="-L${CUDNN_ROOT}/lib -l:${_cudnn_soname}"
+    else
+        CUDNN_LIBS="-lcudnn"
+    fi
+fi
+
+# Runtime: cuDNN 9 despacha a sub-librerias (cnn/graph/ops...) y se apoya en
+# cublas/cudart del mismo stack cu12. Se agregan al LD_LIBRARY_PATH los lib/ de
+# cudnn y de sus paquetes hermanos (../<pkg>/lib) para que el loader los halle.
+if [[ -d "${CUDNN_ROOT}/lib" ]]; then
+    LD_LIBRARY_PATH="${CUDNN_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+    for _libdir in "${CUDNN_ROOT}"/../*/lib; do
+        [[ -d "${_libdir}" ]] && LD_LIBRARY_PATH="${_libdir}:${LD_LIBRARY_PATH}"
+    done
+    export LD_LIBRARY_PATH
+fi
 SMOKE_TEST="${SMOKE_TEST:-0}"
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     RUN_NCU="${RUN_NCU:-0}"
