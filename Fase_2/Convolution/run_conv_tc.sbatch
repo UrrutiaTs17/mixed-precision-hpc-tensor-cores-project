@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --exclusive
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 
 set -euo pipefail
 
@@ -69,6 +69,22 @@ NCU_KERNEL_REGEX="${NCU_KERNEL_REGEX:-.*wmma_gemm_kernel.*}"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-3}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 
+# Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
+# sola vez en Fase_2/common_ncu.sh y se reutiliza entre los .sbatch.
+for _common_ncu in "../common_ncu.sh" "./common_ncu.sh"; do
+    if [[ -f "${_common_ncu}" ]]; then
+        # shellcheck source=/dev/null
+        source "${_common_ncu}"
+        break
+    fi
+done
+
+# Separacion validacion/caracterizacion en NCU:
+#   quick -> --metrics "${NCU_QUICK_METRICS}" (rapido, valida Tensor Cores)
+#   full  -> --set "${NCU_SET}"               (caracterizacion completa)
+NCU_MODE="${NCU_MODE:-quick}"
+TIMEFORMAT=">>> Tiempo real de la llamada ncu (NCU_MODE=${NCU_MODE}): %R s (user %U, sys %S)"
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -85,6 +101,19 @@ echo "Compilando conv_tc..."
     ${OPENBLAS_INC} ${CUDNN_INC} ${CUDNN_LIBS} ${OPENBLAS_LIBS} \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     --allow-unsupported-compiler
+
+# Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
+# el kernel WMMA no se activo (tipicamente por dimensiones no divisibles) y
+# perfilar seria inutil. CUOBJDUMP se resuelve primero por PATH y, si no esta,
+# se asume junto a NVCC (tipico en instalaciones HPC SDK).
+CUOBJDUMP="${CUOBJDUMP:-$(command -v cuobjdump || echo "$(dirname "${NVCC}")/cuobjdump")}"
+HMMA_COUNT=$("${CUOBJDUMP}" --dump-sass conv_tc | grep -c HMMA || true)
+echo "Instrucciones HMMA detectadas en binario: ${HMMA_COUNT}"
+if [[ "${RUN_NCU}" == "1" && "${HMMA_COUNT}" -eq 0 ]]; then
+    echo "ERROR: binario sin instrucciones HMMA; revisar condiciones" \
+         "de divisibilidad M/N/K antes de perfilar." >&2
+    exit 1
+fi
 
 echo "Ejecutando benchmarks de convolucion 2D con Tensor Cores..."
 
@@ -122,13 +151,26 @@ for run in "${RUNS[@]}"; do
 
     if [[ "${RUN_NCU}" == "1" ]]; then
         REPORT="logs/ncu_wmma_conv_N${N}_C${C}_H${H}_W${W}_K${K}_R${R}_S${S}_job${SLURM_JOB_ID:-manual}"
+        # Con batch N>1 el benchmark lanza N invocaciones del kernel WMMA por
+        # iteracion, por lo que hay que saltar WARMUP_ITERS*N lanzamientos para
+        # no perfilar los warmups. WARMUP_ITERS debe coincidir con kWarmupIters
+        # en conv_tensor_activation.cu.
+        WARMUP_ITERS=3
+        NCU_LAUNCH_SKIP_RUN=$((WARMUP_ITERS * N))
+        if [[ "${NCU_MODE}" == "full" ]]; then
+            NCU_CAPTURE_ARGS=(--set "${NCU_SET}")
+        else
+            NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
+        fi
         echo
-        echo "Perfilando WMMA con Nsight Compute..."
+        echo "Perfilando WMMA con Nsight Compute (NCU_MODE=${NCU_MODE}, launch-skip=${NCU_LAUNCH_SKIP_RUN})..."
         echo "Reporte: ${REPORT}.ncu-rep"
-        "${NCU}" --set "${NCU_SET}" \
+        # `time` (y stderr de ncu) se redirigen al .out para correlacionar
+        # duracion vs #SBATCH --time en corridas con --set full.
+        { time "${NCU}" "${NCU_CAPTURE_ARGS[@]}" \
             --target-processes all \
             --kernel-name "regex:${NCU_KERNEL_REGEX}" \
-            --launch-skip "${NCU_LAUNCH_SKIP}" \
+            --launch-skip "${NCU_LAUNCH_SKIP_RUN}" \
             --launch-count "${NCU_LAUNCH_COUNT}" \
             --export "${REPORT}" \
             --force-overwrite \
@@ -138,6 +180,6 @@ for run in "${RUNS[@]}"; do
                 --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
                 --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
                 --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
-                --iters "${ITERS}"
+                --iters "${ITERS}"; } 2>&1
     fi
 done

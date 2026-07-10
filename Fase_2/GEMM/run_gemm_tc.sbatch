@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --exclusive
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 
 set -euo pipefail
 
@@ -67,6 +67,24 @@ NCU_KERNEL_REGEX="${NCU_KERNEL_REGEX:-.*wmma_gemm_kernel.*}"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-3}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 
+# Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
+# sola vez en Fase_2/common_ncu.sh y se reutiliza entre los .sbatch.
+for _common_ncu in "../common_ncu.sh" "./common_ncu.sh"; do
+    if [[ -f "${_common_ncu}" ]]; then
+        # shellcheck source=/dev/null
+        source "${_common_ncu}"
+        break
+    fi
+done
+
+# Separacion validacion/caracterizacion en NCU:
+#   quick -> --metrics "${NCU_QUICK_METRICS}" (rapido, valida Tensor Cores)
+#   full  -> --set "${NCU_SET}"               (caracterizacion completa)
+# Las corridas grandes (M/N/K=12288, 32768) usan quick salvo que se exporte
+# explicitamente NCU_MODE=full (riesgo real de timeout SLURM con --set full).
+NCU_MODE="${NCU_MODE:-quick}"
+TIMEFORMAT=">>> Tiempo real de la llamada ncu (NCU_MODE=${NCU_MODE}): %R s (user %U, sys %S)"
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -83,6 +101,19 @@ echo "Compilando gemm_tc..."
     ${OPENBLAS_INC} -lcublas ${OPENBLAS_LIBS} \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     --allow-unsupported-compiler
+
+# Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
+# el kernel WMMA no se activo (tipicamente por M/N/K no divisibles) y perfilar
+# seria inutil. CUOBJDUMP se resuelve primero por PATH y, si no esta, se asume
+# junto a NVCC (tipico en instalaciones HPC SDK).
+CUOBJDUMP="${CUOBJDUMP:-$(command -v cuobjdump || echo "$(dirname "${NVCC}")/cuobjdump")}"
+HMMA_COUNT=$("${CUOBJDUMP}" --dump-sass gemm_tc | grep -c HMMA || true)
+echo "Instrucciones HMMA detectadas en binario: ${HMMA_COUNT}"
+if [[ "${RUN_NCU}" == "1" && "${HMMA_COUNT}" -eq 0 ]]; then
+    echo "ERROR: binario sin instrucciones HMMA; revisar condiciones" \
+         "de divisibilidad M/N/K antes de perfilar." >&2
+    exit 1
+fi
 
 echo "Ejecutando benchmarks registrados en Primeras_mediciones_rendimiento_PACCA.txt..."
 
@@ -107,16 +138,23 @@ for run in "${RUNS[@]}"; do
 
     if [[ "${RUN_NCU}" == "1" ]]; then
         REPORT="logs/ncu_wmma_m${M}_n${N}_k${K}_job${SLURM_JOB_ID:-manual}"
+        if [[ "${NCU_MODE}" == "full" ]]; then
+            NCU_CAPTURE_ARGS=(--set "${NCU_SET}")
+        else
+            NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
+        fi
         echo
-        echo "Perfilando WMMA con Nsight Compute..."
+        echo "Perfilando WMMA con Nsight Compute (NCU_MODE=${NCU_MODE})..."
         echo "Reporte: ${REPORT}.ncu-rep"
-        "${NCU}" --set "${NCU_SET}" \
+        # `time` (y stderr de ncu) se redirigen al .out para correlacionar
+        # duracion vs #SBATCH --time en corridas con --set full.
+        { time "${NCU}" "${NCU_CAPTURE_ARGS[@]}" \
             --target-processes all \
             --kernel-name "regex:${NCU_KERNEL_REGEX}" \
             --launch-skip "${NCU_LAUNCH_SKIP}" \
             --launch-count "${NCU_LAUNCH_COUNT}" \
             --export "${REPORT}" \
             --force-overwrite \
-            ./gemm_tc --m "${M}" --n "${N}" --k "${K}" --iters "${ITERS}"
+            ./gemm_tc --m "${M}" --n "${N}" --k "${K}" --iters "${ITERS}"; } 2>&1
     fi
 done

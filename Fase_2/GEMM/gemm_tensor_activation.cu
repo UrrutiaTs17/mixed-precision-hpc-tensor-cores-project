@@ -1,6 +1,7 @@
-// nvcc -std=c++17 gemm_tensor_activation.cu -o gemm_tc -I/usr/include/openblas -lcublas -lopenblas -gencode arch=compute_86,code=sm_86 --allow-unsupported-compiler
+// nvcc -std=c++17 gemm_tensor_activation.cu -o gemm_tc -I/usr/include/openblas -lcublas -lopenblas -gencode arch=compute_80,code=sm_80 --allow-unsupported-compiler
 // ./gemm_tc --m 2048 --n 2048 --k 2048 --iters 20
-// sudo /usr/local/cuda/bin/ncu --set full --export reporte_fase2_rtx3050 --force-overwrite ./gemm_tc
+// En PACCA (A100, sm_80) la compilacion y el perfilado con Nsight Compute se
+// lanzan via SLURM: sbatch run_gemm_tc.sbatch  (no ejecutar ncu con sudo).
 
 
 #include <algorithm>

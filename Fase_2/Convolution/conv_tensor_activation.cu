@@ -2,8 +2,11 @@
 // nvcc -std=c++17 conv_tensor_activation.cu -o conv_tc \
 //      -I/usr/include/openblas \
 //      -lcudnn -lopenblas \
-//      -gencode arch=compute_86,code=sm_86 \
+//      -gencode arch=compute_80,code=sm_80 \
 //      --allow-unsupported-compiler
+//
+// En PACCA (A100, sm_80) la compilacion y el perfilado con Nsight Compute se
+// lanzan via SLURM: sbatch run_conv_tc.sbatch  (no ejecutar ncu con sudo).
 //
 // Este programa compara tres rutas de convolucion 2D hacia adelante:
 // 1. CPU con OpenBLAS (via transformacion im2col + SGEMM/DGEMM).
