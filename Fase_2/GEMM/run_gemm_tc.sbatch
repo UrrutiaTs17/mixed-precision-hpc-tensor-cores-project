@@ -104,15 +104,36 @@ echo "Compilando gemm_tc..."
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # el kernel WMMA no se activo (tipicamente por M/N/K no divisibles) y perfilar
-# seria inutil. CUOBJDUMP se resuelve primero por PATH y, si no esta, se asume
-# junto a NVCC (tipico en instalaciones HPC SDK).
-CUOBJDUMP="${CUOBJDUMP:-$(command -v cuobjdump || echo "$(dirname "${NVCC}")/cuobjdump")}"
-HMMA_COUNT=$("${CUOBJDUMP}" --dump-sass gemm_tc | grep -c HMMA || true)
-echo "Instrucciones HMMA detectadas en binario: ${HMMA_COUNT}"
-if [[ "${RUN_NCU}" == "1" && "${HMMA_COUNT}" -eq 0 ]]; then
-    echo "ERROR: binario sin instrucciones HMMA; revisar condiciones" \
-         "de divisibilidad M/N/K antes de perfilar." >&2
-    exit 1
+# seria inutil. CUOBJDUMP se busca por PATH, junto a NVCC, o en el arbol cuda/
+# del HPC SDK (layout tipico .../<version>/cuda/bin/cuobjdump).
+_nvcc_dir="$(dirname "${NVCC}")"
+if [[ -z "${CUOBJDUMP:-}" ]]; then
+    if command -v cuobjdump >/dev/null 2>&1; then
+        CUOBJDUMP="$(command -v cuobjdump)"
+    else
+        for _cand in \
+            "${_nvcc_dir}/cuobjdump" \
+            "${_nvcc_dir}/../../cuda/bin/cuobjdump" \
+            "${_nvcc_dir}"/../../cuda/*/bin/cuobjdump; do
+            if [[ -x "${_cand}" ]]; then
+                CUOBJDUMP="${_cand}"
+                break
+            fi
+        done
+    fi
+fi
+
+if [[ -x "${CUOBJDUMP:-}" ]] || command -v "${CUOBJDUMP:-}" >/dev/null 2>&1; then
+    HMMA_COUNT=$("${CUOBJDUMP}" --dump-sass gemm_tc | grep -c HMMA || true)
+    echo "Instrucciones HMMA detectadas en binario: ${HMMA_COUNT} (cuobjdump: ${CUOBJDUMP})"
+    if [[ "${RUN_NCU}" == "1" && "${HMMA_COUNT}" -eq 0 ]]; then
+        echo "ERROR: binario sin instrucciones HMMA; revisar condiciones" \
+             "de divisibilidad M/N/K antes de perfilar." >&2
+        exit 1
+    fi
+else
+    echo "AVISO: no se encontro cuobjdump; se omite la validacion HMMA." \
+         "Exporta CUOBJDUMP=/ruta/a/cuobjdump para habilitarla." >&2
 fi
 
 echo "Ejecutando benchmarks registrados en Primeras_mediciones_rendimiento_PACCA.txt..."
