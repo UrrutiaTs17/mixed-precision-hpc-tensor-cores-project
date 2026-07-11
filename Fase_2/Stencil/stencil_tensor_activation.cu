@@ -274,6 +274,25 @@ static ErrorMetrics compare_float_vectors(const std::vector<float>& ref,
     return out;
 }
 
+// Compara una referencia FP64 contra un resultado FP32 con el mismo layout
+// lineal (patron compare_fp64_ref_vs_fp32_colmaj de GEMM adaptado a la grilla).
+static ErrorMetrics compare_fp64_ref_vs_fp32(const std::vector<double>& ref_fp64,
+                                             const std::vector<float>& test_fp32) {
+    ErrorMetrics out;
+    double sq_err = 0.0;
+    double sq_ref = 0.0;
+    for (size_t i = 0; i < ref_fp64.size(); ++i) {
+        const double r    = ref_fp64[i];
+        const double t    = static_cast<double>(test_fp32[i]);
+        const double diff = r - t;
+        out.max_abs = std::max(out.max_abs, std::abs(diff));
+        sq_err += diff * diff;
+        sq_ref += r * r;
+    }
+    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
+    return out;
+}
+
 static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
                                      std::vector<float>& out,
                                      int nx,
@@ -306,6 +325,30 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
 
     const double avg_ms = std::chrono::duration<double, std::milli>(end - start).count() / iters;
     return build_metrics(nx, ny, avg_ms);
+}
+
+// Referencia FP64 (ground truth): version double de benchmark_cpu_stencil, una
+// sola aplicacion sin medir tiempo, mismo criterio que la referencia cblas_dgemm
+// de GEMM. Opera sobre una copia en double del mismo input FP32.
+static void compute_cpu_stencil_fp64(const std::vector<double>& in,
+                                     std::vector<double>& out,
+                                     int nx,
+                                     int ny) {
+    for (int y = 0; y < ny; ++y) {
+        for (int x = 0; x < nx; ++x) {
+            if (x == 0 || y == 0 || x == nx - 1 || y == ny - 1) {
+                out[idx2d(x, y, nx)] = in[idx2d(x, y, nx)];
+                continue;
+            }
+
+            const double up = in[idx2d(x, y - 1, nx)];
+            const double down = in[idx2d(x, y + 1, nx)];
+            const double left = in[idx2d(x - 1, y, nx)];
+            const double right = in[idx2d(x + 1, y, nx)];
+            const double center = in[idx2d(x, y, nx)];
+            out[idx2d(x, y, nx)] = 0.25 * (up + down + left + right) - center;
+        }
+    }
 }
 
 __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx, int ny) {
@@ -628,13 +671,16 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
 static void print_reference_comparison(const char* label,
                                        const Metrics& m,
                                        double ref_ms,
-                                       const ErrorMetrics& e) {
+                                       const ErrorMetrics& e_fp64,
+                                       const ErrorMetrics& e_cpu) {
     std::cout << label << " - tiempo         : " << m.ms << " ms\n";
     std::cout << label << " - rendimiento    : " << m.gflops << " GFLOP/s ("
               << m.tflops << " TFLOP/s efectivos)\n";
     std::cout << "Speedup vs CPU             : " << ref_ms / m.ms << "x\n";
-    std::cout << "Error max abs vs CPU       : " << e.max_abs << "\n";
-    std::cout << "Error relativo L2 vs CPU   : " << e.rel_l2 << "\n\n";
+    std::cout << "Error max abs vs FP64      : " << e_fp64.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64  : " << e_fp64.rel_l2 << "\n";
+    std::cout << "Error max abs vs CPU FP32  : " << e_cpu.max_abs << "\n";
+    std::cout << "Error rel L2 vs CPU FP32   : " << e_cpu.rel_l2 << "\n\n";
 }
 
 static void print_configuration(const Options& opt) {
@@ -682,22 +728,38 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     initialize_grid(input, opt.nx, opt.ny);
 
+    // Referencia FP64 (ground truth): una aplicacion del stencil en double
+    // sobre una copia en double del mismo input.
+    std::vector<double> input_fp64(count);
+    std::vector<double> y_ref(count, 0.0);
+    for (size_t i = 0; i < count; ++i) {
+        input_fp64[i] = static_cast<double>(input[i]);
+    }
+    compute_cpu_stencil_fp64(input_fp64, y_ref, opt.nx, opt.ny);
+
     const Metrics cpu = benchmark_cpu_stencil(input, y_cpu, opt.nx, opt.ny, opt.iters);
     const Metrics gpu = benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters);
-    const ErrorMetrics gpu_err = compare_float_vectors(y_cpu, y_gpu);
+    // Metrica primaria: contra el ground truth FP64 (objetivo especifico #3);
+    // secundaria: contra la CPU FP32 (trazabilidad con corridas previas).
+    const ErrorMetrics cpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
+    const ErrorMetrics gpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_gpu);
+    const ErrorMetrics gpu_vs_cpu_err = compare_float_vectors(y_cpu, y_gpu);
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "=========== RESULTADOS STENCIL 2D FASE 2 ===========\n";
     std::cout << "CPU FP32 serial - tiempo   : " << cpu.ms << " ms\n";
     std::cout << "CPU FP32 serial - rend.    : " << cpu.gflops << " GFLOP/s ("
-              << cpu.tflops << " TFLOP/s efectivos)\n\n";
+              << cpu.tflops << " TFLOP/s efectivos)\n";
+    std::cout << "Error max abs vs FP64      : " << cpu_err.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64  : " << cpu_err.rel_l2 << "\n\n";
 
-    print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err);
+    print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err);
 
     if (opt.tc_mode == TensorCoreMode::FP16 || opt.tc_mode == TensorCoreMode::Both) {
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters);
-        const ErrorMetrics tc_fp16_err = compare_float_vectors(y_cpu, y_tc_fp16);
+        const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
+        const ErrorMetrics tc_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_fp16);
         const double fp16_storage_err = storage_roundtrip_max_abs<__half>(y_tc_fp16, y_tc_fp16_reduced);
 
         std::cout << "GPU WMMA FP16 Tensor Core - tiempo : " << tc_fp16.ms << " ms\n";
@@ -705,15 +767,18 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " GFLOP/s (" << tc_fp16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC FP16 vs CPU             : " << cpu.ms / tc_fp16.ms << "x\n";
         std::cout << "Speedup TC FP16 vs GPU FP32        : " << gpu.ms / tc_fp16.ms << "x\n";
-        std::cout << "Error max abs vs CPU               : " << tc_fp16_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs CPU           : " << tc_fp16_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs FP64              : " << tc_fp16_err.max_abs << "\n";
+        std::cout << "Error relativo L2 vs FP64          : " << tc_fp16_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs CPU FP32          : " << tc_fp16_vs_cpu_err.max_abs << "\n";
+        std::cout << "Error relativo L2 vs CPU FP32      : " << tc_fp16_vs_cpu_err.rel_l2 << "\n";
         std::cout << "Error por guardar en FP16 (16 bits): " << fp16_storage_err << "\n\n";
     }
 
     if (opt.tc_mode == TensorCoreMode::BF16 || opt.tc_mode == TensorCoreMode::Both) {
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters);
-        const ErrorMetrics tc_bf16_err = compare_float_vectors(y_cpu, y_tc_bf16);
+        const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
+        const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
         const double bf16_storage_err = storage_roundtrip_max_abs<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced);
 
         std::cout << "GPU WMMA BF16 Tensor Core - tiempo : " << tc_bf16.ms << " ms\n";
@@ -721,8 +786,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " GFLOP/s (" << tc_bf16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC BF16 vs CPU             : " << cpu.ms / tc_bf16.ms << "x\n";
         std::cout << "Speedup TC BF16 vs GPU FP32        : " << gpu.ms / tc_bf16.ms << "x\n";
-        std::cout << "Error max abs vs CPU               : " << tc_bf16_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs CPU           : " << tc_bf16_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs FP64              : " << tc_bf16_err.max_abs << "\n";
+        std::cout << "Error relativo L2 vs FP64          : " << tc_bf16_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs CPU FP32          : " << tc_bf16_vs_cpu_err.max_abs << "\n";
+        std::cout << "Error relativo L2 vs CPU FP32      : " << tc_bf16_vs_cpu_err.rel_l2 << "\n";
         std::cout << "Error por guardar en BF16 (16 bits): " << bf16_storage_err << "\n\n";
     }
 
