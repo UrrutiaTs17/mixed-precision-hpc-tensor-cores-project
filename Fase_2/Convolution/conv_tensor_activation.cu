@@ -327,6 +327,24 @@ static ErrorMetrics compare_double_vectors(const std::vector<double>& ref,
     return out;
 }
 
+// Compara una referencia FP64 contra un resultado FP32 con el mismo layout
+// NCHW lineal (patron compare_fp64_ref_vs_fp32_colmaj de GEMM adaptado).
+static ErrorMetrics compare_fp64_ref_vs_fp32_nchw(const std::vector<double>& ref_fp64,
+                                                  const std::vector<float>&  test_fp32) {
+    ErrorMetrics out;
+    double sq_err = 0.0, sq_ref = 0.0;
+    for (size_t i = 0; i < ref_fp64.size(); ++i) {
+        const double r    = ref_fp64[i];
+        const double t    = static_cast<double>(test_fp32[i]);
+        const double diff = r - t;
+        out.max_abs = std::max(out.max_abs, std::abs(diff));
+        sq_err += diff * diff;
+        sq_ref += r * r;
+    }
+    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
+    return out;
+}
+
 // =========================================================================
 // Impresion de resultados
 // =========================================================================
@@ -452,11 +470,15 @@ static Metrics benchmark_cpu_float(const std::vector<float>& x,
             const float* xn = x.data() + static_cast<size_t>(n) * opt.C * opt.H * opt.W;
             float*       yn = y.data() + static_cast<size_t>(n) * opt.K * d.outH * d.outW;
             im2col_float(xn, col.data(), opt, d);
-            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+            // w NCHW [K,C,R,S] es row-major [M, Kcol]; col se construye
+            // col-major [Kcol, Ncol] (= row-major [Ncol, Kcol], de ahi el
+            // CblasTrans) y la salida NCHW [K, outH*outW] exige row-major
+            // [M, Ncol] con ldc = Ncol, elementwise-comparable con cuDNN.
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         M, Ncol, Kcol,
-                        alpha, w.data(), M,
+                        alpha, w.data(), Kcol,
                         col.data(), Kcol,
-                        beta, yn, M);
+                        beta, yn, Ncol);
         }
     }
     const auto end = std::chrono::high_resolution_clock::now();
@@ -481,11 +503,12 @@ static Metrics benchmark_cpu_double(const std::vector<double>& x,
             const double* xn = x.data() + static_cast<size_t>(n) * opt.C * opt.H * opt.W;
             double*       yn = y.data() + static_cast<size_t>(n) * opt.K * d.outH * d.outW;
             im2col_double(xn, col.data(), opt, d);
-            cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+            // Mismo layout que la version float: salida NCHW row-major.
+            cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         M, Ncol, Kcol,
-                        alpha, w.data(), M,
+                        alpha, w.data(), Kcol,
                         col.data(), Kcol,
-                        beta, yn, M);
+                        beta, yn, Ncol);
         }
     }
     const auto end = std::chrono::high_resolution_clock::now();
@@ -1113,25 +1136,40 @@ static void print_float_report(const Metrics& cpu,
                                 const Metrics& gpu,
                                 const Metrics& tc,
                                 const Metrics& wmma,
+                                const ErrorMetrics& cpu_err,
                                 const ErrorMetrics& gpu_err,
                                 const ErrorMetrics& tc_err,
                                 const ErrorMetrics& wmma_err,
+                                const ErrorMetrics& gpu_vs_cpu_err,
+                                const ErrorMetrics& tc_vs_cpu_err,
+                                const ErrorMetrics& wmma_vs_cpu_err,
                                 const ErrorMetrics& wmma_vs_tc_err) {
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "=========== RESULTADOS CONV 2D FP32 ===========\n";
     std::cout << "CPU im2col+BLAS - tiempo    : " << cpu.ms << " ms\n";
     std::cout << "CPU im2col+BLAS - rend.     : " << cpu.gflops << " GFLOP/s ("
-              << cpu.tflops << " TFLOP/s)\n\n";
+              << cpu.tflops << " TFLOP/s)\n";
+    std::cout << "Error max abs vs FP64       : " << cpu_err.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64   : " << cpu_err.rel_l2 << "\n\n";
 
-    print_reference_comparison("GPU cuDNN clasico  ", gpu, cpu.ms, gpu_err);
+    std::cout << "GPU cuDNN clasico - tiempo  : " << gpu.ms << " ms\n";
+    std::cout << "GPU cuDNN clasico - rend.   : " << gpu.gflops << " GFLOP/s ("
+              << gpu.tflops << " TFLOP/s)\n";
+    std::cout << "Speedup vs CPU              : " << cpu.ms / gpu.ms << "x\n";
+    std::cout << "Error max abs vs FP64       : " << gpu_err.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64   : " << gpu_err.rel_l2 << "\n";
+    std::cout << "Error max abs vs CPU FP32   : " << gpu_vs_cpu_err.max_abs << "\n";
+    std::cout << "Error rel L2 vs CPU FP32    : " << gpu_vs_cpu_err.rel_l2 << "\n\n";
 
     std::cout << "GPU Tensor Core - tiempo    : " << tc.ms << " ms\n";
     std::cout << "GPU Tensor Core - rend.     : " << tc.gflops << " GFLOP/s ("
               << tc.tflops << " TFLOP/s)\n";
     std::cout << "Speedup TC vs CPU           : " << cpu.ms / tc.ms << "x\n";
     std::cout << "Speedup TC vs GPU clasico   : " << gpu.ms / tc.ms << "x\n";
-    std::cout << "Error max abs vs CPU        : " << tc_err.max_abs << "\n";
-    std::cout << "Error relativo L2 vs CPU    : " << tc_err.rel_l2 << "\n\n";
+    std::cout << "Error max abs vs FP64       : " << tc_err.max_abs << "\n";
+    std::cout << "Error relativo L2 vs FP64   : " << tc_err.rel_l2 << "\n";
+    std::cout << "Error max abs vs CPU FP32   : " << tc_vs_cpu_err.max_abs << "\n";
+    std::cout << "Error rel L2 vs CPU FP32    : " << tc_vs_cpu_err.rel_l2 << "\n\n";
 
     if (wmma.ms > 0.0) {
         std::cout << "GPU WMMA custom - tiempo    : " << wmma.ms << " ms\n";
@@ -1140,8 +1178,10 @@ static void print_float_report(const Metrics& cpu,
         std::cout << "Speedup WMMA vs CPU         : " << cpu.ms / wmma.ms << "x\n";
         std::cout << "Speedup WMMA vs GPU clasico : " << gpu.ms / wmma.ms << "x\n";
         std::cout << "Speedup WMMA vs cuDNN TC    : " << tc.ms / wmma.ms << "x\n";
-        std::cout << "Error max abs vs CPU        : " << wmma_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs CPU    : " << wmma_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs FP64       : " << wmma_err.max_abs << "\n";
+        std::cout << "Error relativo L2 vs FP64   : " << wmma_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs CPU FP32   : " << wmma_vs_cpu_err.max_abs << "\n";
+        std::cout << "Error rel L2 vs CPU FP32    : " << wmma_vs_cpu_err.rel_l2 << "\n";
         std::cout << "Error max abs vs cuDNN TC   : " << wmma_vs_tc_err.max_abs << "\n";
         std::cout << "Error relativo L2 vs TC     : " << wmma_vs_tc_err.rel_l2 << "\n";
     } else {
@@ -1178,17 +1218,50 @@ static void run_experiment_float(const Options& opt) {
     initialize_matrix_float(x);
     initialize_matrix_float(w);
 
+    // Referencia FP64 (ground truth): las mismas entradas casteadas a double y
+    // la ruta im2col + cblas_dgemm en una sola pasada, mismo patron que GEMM.
+    std::vector<double> y_ref(y_count, 0.0);
+    {
+        std::vector<double> x_d(x_count), w_d(w_count);
+        for (size_t i = 0; i < x_count; ++i) x_d[i] = static_cast<double>(x[i]);
+        for (size_t i = 0; i < w_count; ++i) w_d[i] = static_cast<double>(w[i]);
+
+        const int M    = opt.K;
+        const int Ncol = d.outH * d.outW;
+        const int Kcol = opt.C * opt.R * opt.S;
+        std::vector<double> col(static_cast<size_t>(Kcol) * Ncol);
+        for (int n = 0; n < opt.N; ++n) {
+            const double* xn = x_d.data() + static_cast<size_t>(n) * opt.C * opt.H * opt.W;
+            double*       yn = y_ref.data() + static_cast<size_t>(n) * opt.K * d.outH * d.outW;
+            im2col_double(xn, col.data(), opt, d);
+            cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        M, Ncol, Kcol,
+                        1.0, w_d.data(), Kcol,
+                        col.data(), Kcol,
+                        0.0, yn, Ncol);
+        }
+    }
+
     const Metrics cpu  = benchmark_cpu_float(x, w, y_cpu, opt, d);
     const Metrics gpu  = benchmark_gpu_cudnn_float(x, w, y_gpu, opt, d);
     const Metrics tc   = benchmark_gpu_tensor_cores_conv(x, w, y_tc, opt, d);
     const Metrics wmma = benchmark_gpu_wmma_conv(x, w, y_wmma, opt, d);
 
-    const ErrorMetrics gpu_err       = compare_float_vectors(y_cpu, y_gpu);
-    const ErrorMetrics tc_err        = compare_float_vectors(y_cpu, y_tc);
-    const ErrorMetrics wmma_err      = compare_float_vectors(y_cpu, y_wmma);
+    // Metricas primarias: contra el ground truth FP64 (objetivo especifico #3).
+    const ErrorMetrics cpu_err       = compare_fp64_ref_vs_fp32_nchw(y_ref, y_cpu);
+    const ErrorMetrics gpu_err       = compare_fp64_ref_vs_fp32_nchw(y_ref, y_gpu);
+    const ErrorMetrics tc_err        = compare_fp64_ref_vs_fp32_nchw(y_ref, y_tc);
+    const ErrorMetrics wmma_err      = compare_fp64_ref_vs_fp32_nchw(y_ref, y_wmma);
+
+    // Metricas secundarias: contra la CPU FP32 (trazabilidad con corridas previas).
+    const ErrorMetrics gpu_vs_cpu    = compare_float_vectors(y_cpu, y_gpu);
+    const ErrorMetrics tc_vs_cpu     = compare_float_vectors(y_cpu, y_tc);
+    const ErrorMetrics wmma_vs_cpu   = compare_float_vectors(y_cpu, y_wmma);
     const ErrorMetrics wmma_vs_tc    = compare_float_vectors(y_tc,  y_wmma);
 
-    print_float_report(cpu, gpu, tc, wmma, gpu_err, tc_err, wmma_err, wmma_vs_tc);
+    print_float_report(cpu, gpu, tc, wmma,
+                       cpu_err, gpu_err, tc_err, wmma_err,
+                       gpu_vs_cpu, tc_vs_cpu, wmma_vs_cpu, wmma_vs_tc);
 }
 
 static void run_experiment_double(const Options& opt) {
