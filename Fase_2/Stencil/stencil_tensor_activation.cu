@@ -526,9 +526,33 @@ void convert_input_to_tc<__nv_bfloat16>(const float* d_in_fp32,
     CHECK_CUDA(cudaGetLastError());
 }
 
+// --- Conversion host-side de __half / __nv_bfloat16 a float ---
+// Se usan unicamente para reportar por stdout, nunca dentro de un kernel.
+// __half2float / __bfloat162float son __host__ __device__ desde CUDA 11,
+// por lo que son validas aqui sin necesidad de un kernel adicional.
+static inline float host_val_to_float(__half v) { return __half2float(v); }
+static inline float host_val_to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+// Mide cuanto se pierde SOLO por el hecho de guardar el resultado WMMA
+// (que internamente ya vive en float, via el acumulador de Tensor Cores)
+// en 16 bits. Antes de este cambio, ese resultado nunca se guardaba de
+// verdad en __half/__nv_bfloat16 -- por eso no se podia medir.
+template <typename T>
+static double storage_roundtrip_max_abs(const std::vector<float>& computed,
+                                        const std::vector<T>& stored) {
+    double max_abs = 0.0;
+    for (size_t i = 0; i < computed.size(); ++i) {
+        double diff = std::fabs(static_cast<double>(computed[i]) -
+                                static_cast<double>(host_val_to_float(stored[i])));
+        max_abs = std::max(max_abs, diff);
+    }
+    return max_abs;
+}
+
 template <typename T>
 static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  std::vector<float>& out,
+                                                 std::vector<T>& out_reduced,
                                                  int nx,
                                                  int ny,
                                                  int iters) {
@@ -536,12 +560,14 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     float* d_in_fp32 = nullptr;
     float* d_out = nullptr;
     T* d_in_tc = nullptr;
+    T* d_out_reduced = nullptr;
     T* d_identity_pos = nullptr;
     T* d_identity_neg = nullptr;
 
     CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_out, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_in_tc, count * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_out_reduced, count * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_pos, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_neg, kTile * kTile * sizeof(T)));
 
@@ -579,9 +605,20 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out, count * sizeof(float), cudaMemcpyDeviceToHost));
 
+    // NUEVO: el resultado WMMA solo existia en float (d_out). Se reutiliza
+    // el mismo conversor ya usado para la entrada (convert_input_to_tc)
+    // para tambien convertir y almacenar la salida en el tipo reducido:
+    // asi el resultado queda realmente guardado en FP16/BF16, no solo
+    // calculado internamente en float.
+    convert_input_to_tc<T>(d_out, d_out_reduced, count);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    out_reduced.resize(count);
+    CHECK_CUDA(cudaMemcpy(out_reduced.data(), d_out_reduced, count * sizeof(T), cudaMemcpyDeviceToHost));
+
     CHECK_CUDA(cudaFree(d_in_fp32));
     CHECK_CUDA(cudaFree(d_out));
     CHECK_CUDA(cudaFree(d_in_tc));
+    CHECK_CUDA(cudaFree(d_out_reduced));
     CHECK_CUDA(cudaFree(d_identity_pos));
     CHECK_CUDA(cudaFree(d_identity_neg));
 
@@ -640,6 +677,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     std::vector<float> y_gpu(count, 0.0f);
     std::vector<float> y_tc_fp16(count, 0.0f);
     std::vector<float> y_tc_bf16(count, 0.0f);
+    std::vector<__half> y_tc_fp16_reduced;
+    std::vector<__nv_bfloat16> y_tc_bf16_reduced;
 
     initialize_grid(input, opt.nx, opt.ny);
 
@@ -657,8 +696,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     if (opt.tc_mode == TensorCoreMode::FP16 || opt.tc_mode == TensorCoreMode::Both) {
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
-            input, y_tc_fp16, opt.nx, opt.ny, opt.iters);
+            input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters);
         const ErrorMetrics tc_fp16_err = compare_float_vectors(y_cpu, y_tc_fp16);
+        const double fp16_storage_err = storage_roundtrip_max_abs<__half>(y_tc_fp16, y_tc_fp16_reduced);
 
         std::cout << "GPU WMMA FP16 Tensor Core - tiempo : " << tc_fp16.ms << " ms\n";
         std::cout << "GPU WMMA FP16 Tensor Core - rend.  : " << tc_fp16.gflops
@@ -666,13 +706,15 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::cout << "Speedup TC FP16 vs CPU             : " << cpu.ms / tc_fp16.ms << "x\n";
         std::cout << "Speedup TC FP16 vs GPU FP32        : " << gpu.ms / tc_fp16.ms << "x\n";
         std::cout << "Error max abs vs CPU               : " << tc_fp16_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs CPU           : " << tc_fp16_err.rel_l2 << "\n\n";
+        std::cout << "Error relativo L2 vs CPU           : " << tc_fp16_err.rel_l2 << "\n";
+        std::cout << "Error por guardar en FP16 (16 bits): " << fp16_storage_err << "\n\n";
     }
 
     if (opt.tc_mode == TensorCoreMode::BF16 || opt.tc_mode == TensorCoreMode::Both) {
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
-            input, y_tc_bf16, opt.nx, opt.ny, opt.iters);
+            input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters);
         const ErrorMetrics tc_bf16_err = compare_float_vectors(y_cpu, y_tc_bf16);
+        const double bf16_storage_err = storage_roundtrip_max_abs<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced);
 
         std::cout << "GPU WMMA BF16 Tensor Core - tiempo : " << tc_bf16.ms << " ms\n";
         std::cout << "GPU WMMA BF16 Tensor Core - rend.  : " << tc_bf16.gflops
@@ -680,7 +722,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::cout << "Speedup TC BF16 vs CPU             : " << cpu.ms / tc_bf16.ms << "x\n";
         std::cout << "Speedup TC BF16 vs GPU FP32        : " << gpu.ms / tc_bf16.ms << "x\n";
         std::cout << "Error max abs vs CPU               : " << tc_bf16_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs CPU           : " << tc_bf16_err.rel_l2 << "\n\n";
+        std::cout << "Error relativo L2 vs CPU           : " << tc_bf16_err.rel_l2 << "\n";
+        std::cout << "Error por guardar en BF16 (16 bits): " << bf16_storage_err << "\n\n";
     }
 
     std::cout << "====================================================\n\n";
