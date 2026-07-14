@@ -30,32 +30,15 @@
 
 #include <cblas.h>
 #include <cudnn.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cuda_pipeline_primitives.h>
 #include <mma.h>
 
-// Valida llamadas a la API de CUDA y termina si ocurre un error.
-#define CHECK_CUDA(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ \
-                  << " -> " << cudaGetErrorString(err) << std::endl; \
-        std::exit(EXIT_FAILURE); \
-    } \
-} while(0)
-
-// Valida llamadas a cuDNN y termina si la biblioteca reporta fallo.
-#define CHECK_CUDNN(call) do { \
-    cudnnStatus_t status = (call); \
-    if (status != CUDNN_STATUS_SUCCESS) { \
-        std::cerr << "cuDNN error at " << __FILE__ << ":" << __LINE__ \
-                  << " -> " << cudnnGetErrorString(status) << std::endl; \
-        std::exit(EXIT_FAILURE); \
-    } \
-} while(0)
-
 namespace {
+
+#include "../common.cuh"
 
 constexpr int kWarmupIters       = 3;
 constexpr int kConversionThreads = 256;
@@ -83,6 +66,13 @@ constexpr int kNumStages = 3;
 // Padding en shared memory para evitar bank conflicts (16 bytes extra por fila).
 constexpr int kWmmaShmemPad = 8;
 
+// Formatos de datos soportados en la ruta cuDNN con Tensor Cores.
+enum class TensorCoreFormat {
+    FP16,
+    BF16,
+    Both
+};
+
 // Parametros configurables desde linea de comandos.
 // Convencion de nombres: N=batch, C=canales entrada, H/W=alto/ancho,
 // K=filtros (canales salida), R/S=alto/ancho del filtro.
@@ -102,24 +92,12 @@ struct Options {
     int dilation_w = 1;
     int iters      = 20;
     bool use_double = false;
+    TensorCoreFormat tc_format = TensorCoreFormat::FP16;
 };
 
 // Dimensiones de la salida: derivadas de la formula estandar de convolucion.
 struct OutputDims {
     int outN, outC, outH, outW;
-};
-
-// Metricas de rendimiento promedio para una ruta de convolucion.
-struct Metrics {
-    double ms     = 0.0;
-    double gflops = 0.0;
-    double tflops = 0.0;
-};
-
-// Metricas de error numerico frente a la referencia en CPU.
-struct ErrorMetrics {
-    double max_abs = 0.0;
-    double rel_l2  = 0.0;
 };
 
 // Envueltura RAII para el handle de cuDNN.
@@ -138,37 +116,6 @@ private:
     cudnnHandle_t handle_ = nullptr;
 };
 
-// Temporizador basado en eventos CUDA para medir tiempo en la GPU.
-class CudaEventTimer {
-public:
-    CudaEventTimer() {
-        CHECK_CUDA(cudaEventCreate(&start_));
-        CHECK_CUDA(cudaEventCreate(&stop_));
-    }
-
-    ~CudaEventTimer() {
-        CHECK_CUDA(cudaEventDestroy(start_));
-        CHECK_CUDA(cudaEventDestroy(stop_));
-    }
-
-    CudaEventTimer(const CudaEventTimer&)            = delete;
-    CudaEventTimer& operator=(const CudaEventTimer&) = delete;
-
-    void start() { CHECK_CUDA(cudaEventRecord(start_)); }
-
-    float stop_and_elapsed_ms() {
-        CHECK_CUDA(cudaEventRecord(stop_));
-        CHECK_CUDA(cudaEventSynchronize(stop_));
-        float elapsed = 0.0f;
-        CHECK_CUDA(cudaEventElapsedTime(&elapsed, start_, stop_));
-        return elapsed;
-    }
-
-private:
-    cudaEvent_t start_ = nullptr;
-    cudaEvent_t stop_  = nullptr;
-};
-
 // =========================================================================
 // Utilidades de linea de comandos
 // =========================================================================
@@ -178,20 +125,25 @@ static void print_usage(const char* prog) {
         << "Uso:\n"
         << "  " << prog << " [--N N] [--C C] [--H H] [--W W] [--K K] [--R R] [--S S]\n"
         << "             [--pad_h P] [--pad_w P] [--stride_h S] [--stride_w S]\n"
-        << "             [--dilation_h D] [--dilation_w D] [--iters I] [--double]\n\n"
+        << "             [--dilation_h D] [--dilation_w D] [--iters I] [--double]\n"
+        << "             [--tc-format fp16|bf16|both]\n\n"
         << "Descripcion:\n"
         << "  Compara cuatro rutas de convolucion 2D hacia adelante:\n"
         << "    1. CPU im2col + OpenBLAS (FP32/FP64)\n"
         << "    2. GPU cuDNN clasico (FP32/FP64, sin Tensor Cores)\n"
-        << "    3. GPU cuDNN con Tensor Cores (FP16 entrada, FP32 acumulacion)\n"
+        << "    3. GPU cuDNN con Tensor Cores (FP16/BF16 entrada, FP32 acumulacion)\n"
         << "    4. GPU im2col FP16 + kernel WMMA custom (Tensor Cores directos)\n"
         << "  La ruta WMMA (4) requiere K multiplo de 32, outH*outW multiplo de 32\n"
         << "  y C*R*S multiplo de 16. Si no se cumple se omite con aviso.\n"
-        << "  Con --double solo se ejecutan las rutas 1 y 2.\n\n"
+        << "  Con --double solo se ejecutan las rutas 1 y 2.\n"
+        << "  --tc-format selecciona el formato de la ruta 3 (por defecto fp16).\n"
+        << "  BF16 requiere GPU Ampere o superior (compute capability >= 8.0).\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --N 1 --C 64 --H 224 --W 224 --K 64 --R 3 --S 3 --iters 10\n"
-        << "  " << prog << " --double --N 1 --C 16 --H 64 --W 64 --K 32 --R 3 --S 3\n";
+        << "  " << prog << " --double --N 1 --C 16 --H 64 --W 64 --K 32 --R 3 --S 3\n"
+        << "  " << prog << " --N 1 --C 64 --H 64 --W 64 --K 64 --R 3 --S 3 --iters 2"
+        << " --tc-format bf16\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -200,6 +152,16 @@ static int parse_int_arg(int& i, int argc, char** argv) {
         std::exit(EXIT_FAILURE);
     }
     return std::atoi(argv[++i]);
+}
+
+static TensorCoreFormat parse_tc_format(const char* value) {
+    if (std::strcmp(value, "fp16") == 0) return TensorCoreFormat::FP16;
+    if (std::strcmp(value, "bf16") == 0) return TensorCoreFormat::BF16;
+    if (std::strcmp(value, "both") == 0) return TensorCoreFormat::Both;
+
+    std::cerr << "Formato Tensor Core no reconocido: " << value
+              << ". Use fp16, bf16 o both." << std::endl;
+    std::exit(EXIT_FAILURE);
 }
 
 static Options parse_args(int argc, char** argv) {
@@ -220,6 +182,13 @@ static Options parse_args(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--dilation_w") == 0) opt.dilation_w = parse_int_arg(i, argc, argv);
         else if (std::strcmp(argv[i], "--iters")      == 0) opt.iters      = parse_int_arg(i, argc, argv);
         else if (std::strcmp(argv[i], "--double")     == 0) opt.use_double = true;
+        else if (std::strcmp(argv[i], "--tc-format")  == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --tc-format\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.tc_format = parse_tc_format(argv[++i]);
+        }
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -299,52 +268,6 @@ static void initialize_matrix_double(std::vector<double>& v) {
 // Metricas de error numerico
 // =========================================================================
 
-static ErrorMetrics compare_float_vectors(const std::vector<float>& ref,
-                                          const std::vector<float>& test) {
-    ErrorMetrics out;
-    double sq_err = 0.0, sq_ref = 0.0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        const double diff = static_cast<double>(ref[i]) - static_cast<double>(test[i]);
-        out.max_abs = std::max(out.max_abs, std::abs(diff));
-        sq_err += diff * diff;
-        sq_ref += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
-    }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
-    return out;
-}
-
-static ErrorMetrics compare_double_vectors(const std::vector<double>& ref,
-                                           const std::vector<double>& test) {
-    ErrorMetrics out;
-    double sq_err = 0.0, sq_ref = 0.0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        const double diff = ref[i] - test[i];
-        out.max_abs = std::max(out.max_abs, std::abs(diff));
-        sq_err += diff * diff;
-        sq_ref += ref[i] * ref[i];
-    }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
-    return out;
-}
-
-// Compara una referencia FP64 contra un resultado FP32 con el mismo layout
-// NCHW lineal (patron compare_fp64_ref_vs_fp32_colmaj de GEMM adaptado).
-static ErrorMetrics compare_fp64_ref_vs_fp32_nchw(const std::vector<double>& ref_fp64,
-                                                  const std::vector<float>&  test_fp32) {
-    ErrorMetrics out;
-    double sq_err = 0.0, sq_ref = 0.0;
-    for (size_t i = 0; i < ref_fp64.size(); ++i) {
-        const double r    = ref_fp64[i];
-        const double t    = static_cast<double>(test_fp32[i]);
-        const double diff = r - t;
-        out.max_abs = std::max(out.max_abs, std::abs(diff));
-        sq_err += diff * diff;
-        sq_ref += r * r;
-    }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
-    return out;
-}
-
 // =========================================================================
 // Impresion de resultados
 // =========================================================================
@@ -382,6 +305,15 @@ static void print_gpu_info() {
               << "\n";
     std::cout << "Memoria compartida/bloque  : " << prop.sharedMemPerBlock / 1024.0 << " KiB\n";
     std::cout << "===========================================================\n\n";
+}
+
+// BF16 Tensor Core (HMMA con operandos __nv_bfloat16) requiere Ampere o superior.
+static bool active_device_supports_bf16_tensor_cores() {
+    int dev = 0;
+    CHECK_CUDA(cudaGetDevice(&dev));
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
+    return prop.major >= 8;
 }
 
 static void print_reference_comparison(const char* label,
@@ -729,6 +661,41 @@ static __half* upload_and_convert_to_half(const std::vector<float>& host_data) {
 }
 
 // =========================================================================
+// Kernels de conversion FP32 <-> BF16 en GPU (mismo patron que FP16 arriba)
+// =========================================================================
+
+__global__ static void convert_float_to_bfloat16_kernel(const float* src, __nv_bfloat16* dst, int size) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        dst[idx] = __float2bfloat16(src[idx]);
+    }
+}
+
+__global__ static void convert_bfloat16_to_float_kernel(const __nv_bfloat16* src, float* dst, int size) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        dst[idx] = __bfloat162float(src[idx]);
+    }
+}
+
+// Sube un vector a GPU como FP32, lo convierte a BF16 en el device y devuelve
+// el puntero BF16. El buffer FP32 intermedio se libera antes de retornar.
+static __nv_bfloat16* upload_and_convert_to_bfloat16(const std::vector<float>& host_data) {
+    const size_t n = host_data.size();
+    float*         d_fp32 = nullptr;
+    __nv_bfloat16* d_bf16 = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_fp32, n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_bf16, n * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMemcpy(d_fp32, host_data.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    const int blocks = static_cast<int>((n + kConversionThreads - 1) / kConversionThreads);
+    convert_float_to_bfloat16_kernel<<<blocks, kConversionThreads>>>(d_fp32, d_bf16, static_cast<int>(n));
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaFree(d_fp32));
+    return d_bf16;
+}
+
+// =========================================================================
 // Ruta 3 - GPU cuDNN con Tensor Cores: FP16 in / FP32 acumulacion y salida
 //
 // Tres pasos obligatorios para activar Tensor Cores en cuDNN:
@@ -848,6 +815,134 @@ static Metrics benchmark_gpu_tensor_cores_conv(const std::vector<float>& x,
     CHECK_CUDA(cudaFree(d_y_fp16));
     CHECK_CUDA(cudaFree(d_x_fp16));
     CHECK_CUDA(cudaFree(d_w_fp16));
+    CHECK_CUDNN(cudnnDestroyTensorDescriptor(xDesc));
+    CHECK_CUDNN(cudnnDestroyTensorDescriptor(yDesc));
+    CHECK_CUDNN(cudnnDestroyFilterDescriptor(wDesc));
+    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(convDesc));
+
+    return build_metrics(opt, d, static_cast<double>(total_ms) / opt.iters);
+}
+
+// =========================================================================
+// Ruta 3b - GPU cuDNN con Tensor Cores: BF16 in / FP32 acumulacion y salida
+//
+// Analoga a benchmark_gpu_tensor_cores_conv, cambiando CUDNN_DATA_HALF por
+// CUDNN_DATA_BFLOAT16. Misma limitacion de layout que se encontro para
+// FP16: el "Type Configurations" de cudnnConvolutionForward() documenta
+// la combinacion 16-bit-in/FLOAT-out (compute FLOAT) como soportada
+// unicamente en NHWC; en NCHW solo esta garantizada la combinacion con
+// entrada Y salida en el mismo tipo de 16 bits (16-bit-in/16-bit-out,
+// compute FLOAT). Esa es la restriccion que ya obligo a usar yDesc=HALF
+// en la ruta FP16 de este archivo (ver comentario original mas arriba).
+//
+// No se asume que BF16 se comporte igual sin verificarlo: por eso se usa
+// aqui exactamente el mismo patron ya validado para FP16 (yDesc=BFLOAT16,
+// conversion a FLOAT despues de medir). Si al ejecutar en PACCA se
+// confirma que cuDNN sí acepta BF16-in/FLOAT-out en NCHW, este paso de
+// conversion se podria eliminar como simplificacion futura; hasta
+// entonces, esta es la ruta segura y coherente con la ruta FP16 existente.
+// =========================================================================
+
+static Metrics benchmark_gpu_tensor_cores_conv_bf16(const std::vector<float>& x,
+                                                    const std::vector<float>& w,
+                                                    std::vector<float>& y,
+                                                    const Options& opt,
+                                                    const OutputDims& d) {
+    // Paso 1: preparar entradas BF16 en GPU.
+    __nv_bfloat16* d_x_bf16 = upload_and_convert_to_bfloat16(x);
+    __nv_bfloat16* d_w_bf16 = upload_and_convert_to_bfloat16(w);
+
+    // Paso 2: crear descriptores con tipos mixtos.
+    cudnnTensorDescriptor_t    xDesc, yDesc;
+    cudnnFilterDescriptor_t    wDesc;
+    cudnnConvolutionDescriptor_t convDesc;
+    CHECK_CUDNN(cudnnCreateTensorDescriptor(&xDesc));
+    CHECK_CUDNN(cudnnCreateTensorDescriptor(&yDesc));
+    CHECK_CUDNN(cudnnCreateFilterDescriptor(&wDesc));
+    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&convDesc));
+
+    // Entrada y filtro en BF16.
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(xDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_BFLOAT16,
+                                           opt.N, opt.C, opt.H, opt.W));
+    CHECK_CUDNN(cudnnSetFilter4dDescriptor(wDesc, CUDNN_DATA_BFLOAT16, CUDNN_TENSOR_NCHW,
+                                           opt.K, opt.C, opt.R, opt.S));
+    // computeType = FLOAT: acumula productos BF16 en un acumulador de 32 bits.
+    CHECK_CUDNN(cudnnSetConvolution2dDescriptor(convDesc,
+                                                opt.pad_h, opt.pad_w,
+                                                opt.stride_h, opt.stride_w,
+                                                opt.dilation_h, opt.dilation_w,
+                                                CUDNN_CROSS_CORRELATION,
+                                                CUDNN_DATA_FLOAT));
+    // Paso 3: activar Tensor Cores explicitamente en el descriptor.
+    CHECK_CUDNN(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
+
+    // Salida BF16 (mismo motivo que la ruta FP16: ver nota de layout arriba).
+    CHECK_CUDNN(cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_BFLOAT16,
+                                           d.outN, d.outC, d.outH, d.outW));
+
+    CudnnHandle handle;
+
+    cudnnConvolutionFwdAlgoPerf_t perf_results[8];
+    int algo_count = 0;
+    CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm_v7(
+        handle.get(), xDesc, wDesc, convDesc, yDesc, 8, &algo_count, perf_results));
+
+    // Algunos algoritmos devueltos pueden tener status != SUCCESS para BF16;
+    // se elige el primero que cuDNN declara ejecutable.
+    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+    for (int ai = 0; ai < algo_count; ++ai) {
+        if (perf_results[ai].status == CUDNN_STATUS_SUCCESS) {
+            algo = perf_results[ai].algo;
+            break;
+        }
+    }
+
+    size_t ws_bytes = 0;
+    CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(
+        handle.get(), xDesc, wDesc, convDesc, yDesc, algo, &ws_bytes));
+
+    // Buffer de salida en BF16 (ver nota de layout arriba).
+    __nv_bfloat16* d_y_bf16 = nullptr;
+    float*         d_y_fp32 = nullptr;
+    void*          d_ws     = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_y_bf16, y.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_y_fp32, y.size() * sizeof(float)));
+    if (ws_bytes > 0) CHECK_CUDA(cudaMalloc(&d_ws, ws_bytes));
+
+    const float alpha = 1.0f, beta = 0.0f;
+
+    for (int i = 0; i < kWarmupIters; ++i) {
+        CHECK_CUDNN(cudnnConvolutionForward(handle.get(), &alpha,
+                                            xDesc, d_x_bf16, wDesc, d_w_bf16,
+                                            convDesc, algo, d_ws, ws_bytes,
+                                            &beta, yDesc, d_y_bf16));
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CudaEventTimer timer;
+    timer.start();
+    for (int i = 0; i < opt.iters; ++i) {
+        CHECK_CUDNN(cudnnConvolutionForward(handle.get(), &alpha,
+                                            xDesc, d_x_bf16, wDesc, d_w_bf16,
+                                            convDesc, algo, d_ws, ws_bytes,
+                                            &beta, yDesc, d_y_bf16));
+    }
+    const float total_ms = timer.stop_and_elapsed_ms();
+
+    // Convertir salida BF16 → FP32 fuera del intervalo medido.
+    const int y_count = static_cast<int>(y.size());
+    const int conv_blocks = (y_count + kConversionThreads - 1) / kConversionThreads;
+    convert_bfloat16_to_float_kernel<<<conv_blocks, kConversionThreads>>>(
+        d_y_bf16, d_y_fp32, y_count);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(y.data(), d_y_fp32, y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    if (d_ws) CHECK_CUDA(cudaFree(d_ws));
+    CHECK_CUDA(cudaFree(d_y_fp32));
+    CHECK_CUDA(cudaFree(d_y_bf16));
+    CHECK_CUDA(cudaFree(d_x_bf16));
+    CHECK_CUDA(cudaFree(d_w_bf16));
     CHECK_CUDNN(cudnnDestroyTensorDescriptor(xDesc));
     CHECK_CUDNN(cudnnDestroyTensorDescriptor(yDesc));
     CHECK_CUDNN(cudnnDestroyFilterDescriptor(wDesc));
@@ -1132,18 +1227,27 @@ static Metrics benchmark_gpu_wmma_conv(const std::vector<float>& x,
 // Reportes finales
 // =========================================================================
 
-static void print_float_report(const Metrics& cpu,
+static void print_float_report(const Options& opt,
+                                const Metrics& cpu,
                                 const Metrics& gpu,
                                 const Metrics& tc,
                                 const Metrics& wmma,
+                                const Metrics& tc_bf16,
                                 const ErrorMetrics& cpu_err,
                                 const ErrorMetrics& gpu_err,
                                 const ErrorMetrics& tc_err,
                                 const ErrorMetrics& wmma_err,
+                                const ErrorMetrics& tc_bf16_err,
                                 const ErrorMetrics& gpu_vs_cpu_err,
                                 const ErrorMetrics& tc_vs_cpu_err,
                                 const ErrorMetrics& wmma_vs_cpu_err,
-                                const ErrorMetrics& wmma_vs_tc_err) {
+                                const ErrorMetrics& wmma_vs_tc_err,
+                                const ErrorMetrics& tc_bf16_vs_cpu_err) {
+    const bool show_fp16 = (opt.tc_format == TensorCoreFormat::FP16 ||
+                            opt.tc_format == TensorCoreFormat::Both);
+    const bool show_bf16 = (opt.tc_format == TensorCoreFormat::BF16 ||
+                            opt.tc_format == TensorCoreFormat::Both);
+
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "=========== RESULTADOS CONV 2D FP32 ===========\n";
     std::cout << "CPU im2col+BLAS - tiempo    : " << cpu.ms << " ms\n";
@@ -1161,15 +1265,29 @@ static void print_float_report(const Metrics& cpu,
     std::cout << "Error max abs vs CPU FP32   : " << gpu_vs_cpu_err.max_abs << "\n";
     std::cout << "Error rel L2 vs CPU FP32    : " << gpu_vs_cpu_err.rel_l2 << "\n\n";
 
-    std::cout << "GPU Tensor Core - tiempo    : " << tc.ms << " ms\n";
-    std::cout << "GPU Tensor Core - rend.     : " << tc.gflops << " GFLOP/s ("
-              << tc.tflops << " TFLOP/s)\n";
-    std::cout << "Speedup TC vs CPU           : " << cpu.ms / tc.ms << "x\n";
-    std::cout << "Speedup TC vs GPU clasico   : " << gpu.ms / tc.ms << "x\n";
-    std::cout << "Error max abs vs FP64       : " << tc_err.max_abs << "\n";
-    std::cout << "Error relativo L2 vs FP64   : " << tc_err.rel_l2 << "\n";
-    std::cout << "Error max abs vs CPU FP32   : " << tc_vs_cpu_err.max_abs << "\n";
-    std::cout << "Error rel L2 vs CPU FP32    : " << tc_vs_cpu_err.rel_l2 << "\n\n";
+    if (show_fp16) {
+        std::cout << "GPU Tensor Core - tiempo    : " << tc.ms << " ms\n";
+        std::cout << "GPU Tensor Core - rend.     : " << tc.gflops << " GFLOP/s ("
+                  << tc.tflops << " TFLOP/s)\n";
+        std::cout << "Speedup TC vs CPU           : " << cpu.ms / tc.ms << "x\n";
+        std::cout << "Speedup TC vs GPU clasico   : " << gpu.ms / tc.ms << "x\n";
+        std::cout << "Error max abs vs FP64       : " << tc_err.max_abs << "\n";
+        std::cout << "Error relativo L2 vs FP64   : " << tc_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs CPU FP32   : " << tc_vs_cpu_err.max_abs << "\n";
+        std::cout << "Error rel L2 vs CPU FP32    : " << tc_vs_cpu_err.rel_l2 << "\n\n";
+    }
+
+    if (show_bf16) {
+        std::cout << "GPU Tensor Core BF16 - tiempo    : " << tc_bf16.ms << " ms\n";
+        std::cout << "GPU Tensor Core BF16 - rend.     : " << tc_bf16.gflops << " GFLOP/s ("
+                  << tc_bf16.tflops << " TFLOP/s)\n";
+        std::cout << "Speedup TC BF16 vs CPU           : " << cpu.ms / tc_bf16.ms << "x\n";
+        std::cout << "Speedup TC BF16 vs GPU clasico   : " << gpu.ms / tc_bf16.ms << "x\n";
+        std::cout << "Error max abs vs FP64            : " << tc_bf16_err.max_abs << "\n";
+        std::cout << "Error relativo L2 vs FP64        : " << tc_bf16_err.rel_l2 << "\n";
+        std::cout << "Error max abs vs CPU FP32        : " << tc_bf16_vs_cpu_err.max_abs << "\n";
+        std::cout << "Error rel L2 vs CPU FP32         : " << tc_bf16_vs_cpu_err.rel_l2 << "\n\n";
+    }
 
     if (wmma.ms > 0.0) {
         std::cout << "GPU WMMA custom - tiempo    : " << wmma.ms << " ms\n";
@@ -1177,13 +1295,17 @@ static void print_float_report(const Metrics& cpu,
                   << wmma.tflops << " TFLOP/s)\n";
         std::cout << "Speedup WMMA vs CPU         : " << cpu.ms / wmma.ms << "x\n";
         std::cout << "Speedup WMMA vs GPU clasico : " << gpu.ms / wmma.ms << "x\n";
-        std::cout << "Speedup WMMA vs cuDNN TC    : " << tc.ms / wmma.ms << "x\n";
         std::cout << "Error max abs vs FP64       : " << wmma_err.max_abs << "\n";
         std::cout << "Error relativo L2 vs FP64   : " << wmma_err.rel_l2 << "\n";
         std::cout << "Error max abs vs CPU FP32   : " << wmma_vs_cpu_err.max_abs << "\n";
         std::cout << "Error rel L2 vs CPU FP32    : " << wmma_vs_cpu_err.rel_l2 << "\n";
-        std::cout << "Error max abs vs cuDNN TC   : " << wmma_vs_tc_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs TC     : " << wmma_vs_tc_err.rel_l2 << "\n";
+        // WMMA custom (Ruta 4) es intrinsecamente FP16; la comparacion contra
+        // cuDNN TC solo tiene referencia valida cuando esa ruta se ejecuto.
+        if (show_fp16) {
+            std::cout << "Speedup WMMA vs cuDNN TC    : " << tc.ms / wmma.ms << "x\n";
+            std::cout << "Error max abs vs cuDNN TC   : " << wmma_vs_tc_err.max_abs << "\n";
+            std::cout << "Error relativo L2 vs TC     : " << wmma_vs_tc_err.rel_l2 << "\n";
+        }
     } else {
         std::cout << "GPU WMMA custom             : omitida (alineacion no cumplida)\n";
     }
@@ -1207,6 +1329,17 @@ static void print_double_report(const Metrics& cpu,
 // =========================================================================
 
 static void run_experiment_float(const Options& opt) {
+    const bool want_fp16 = (opt.tc_format == TensorCoreFormat::FP16 ||
+                            opt.tc_format == TensorCoreFormat::Both);
+    const bool want_bf16 = (opt.tc_format == TensorCoreFormat::BF16 ||
+                            opt.tc_format == TensorCoreFormat::Both);
+
+    if (want_bf16 && !active_device_supports_bf16_tensor_cores()) {
+        std::cerr << "La ruta Tensor Core BF16 requiere arquitectura Ampere o superior"
+                     " (compute capability >= 8.0)." << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+
     const OutputDims d      = compute_output_dims(opt);
     const size_t x_count    = static_cast<size_t>(opt.N) * opt.C * opt.H * opt.W;
     const size_t w_count    = static_cast<size_t>(opt.K) * opt.C * opt.R * opt.S;
@@ -1215,6 +1348,7 @@ static void run_experiment_float(const Options& opt) {
     std::vector<float> x(x_count), w(w_count);
     std::vector<float> y_cpu(y_count, 0.0f), y_gpu(y_count, 0.0f);
     std::vector<float> y_tc(y_count, 0.0f),  y_wmma(y_count, 0.0f);
+    std::vector<float> y_tc_bf16(y_count, 0.0f);
     initialize_matrix_float(x);
     initialize_matrix_float(w);
 
@@ -1244,24 +1378,35 @@ static void run_experiment_float(const Options& opt) {
 
     const Metrics cpu  = benchmark_cpu_float(x, w, y_cpu, opt, d);
     const Metrics gpu  = benchmark_gpu_cudnn_float(x, w, y_gpu, opt, d);
-    const Metrics tc   = benchmark_gpu_tensor_cores_conv(x, w, y_tc, opt, d);
     const Metrics wmma = benchmark_gpu_wmma_conv(x, w, y_wmma, opt, d);
 
+    Metrics tc{}, tc_bf16{};
+    ErrorMetrics tc_err{}, tc_vs_cpu{}, tc_bf16_err{}, tc_bf16_vs_cpu{};
+
+    if (want_fp16) {
+        tc = benchmark_gpu_tensor_cores_conv(x, w, y_tc, opt, d);
+        tc_err     = compare_fp64_ref_vs_fp32(y_ref, y_tc);
+        tc_vs_cpu  = compare_float_vectors(y_cpu, y_tc);
+    }
+    if (want_bf16) {
+        tc_bf16 = benchmark_gpu_tensor_cores_conv_bf16(x, w, y_tc_bf16, opt, d);
+        tc_bf16_err    = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
+        tc_bf16_vs_cpu = compare_float_vectors(y_cpu, y_tc_bf16);
+    }
+
     // Metricas primarias: contra el ground truth FP64 (objetivo especifico #3).
-    const ErrorMetrics cpu_err       = compare_fp64_ref_vs_fp32_nchw(y_ref, y_cpu);
-    const ErrorMetrics gpu_err       = compare_fp64_ref_vs_fp32_nchw(y_ref, y_gpu);
-    const ErrorMetrics tc_err        = compare_fp64_ref_vs_fp32_nchw(y_ref, y_tc);
-    const ErrorMetrics wmma_err      = compare_fp64_ref_vs_fp32_nchw(y_ref, y_wmma);
+    const ErrorMetrics cpu_err       = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
+    const ErrorMetrics gpu_err       = compare_fp64_ref_vs_fp32(y_ref, y_gpu);
+    const ErrorMetrics wmma_err      = compare_fp64_ref_vs_fp32(y_ref, y_wmma);
 
     // Metricas secundarias: contra la CPU FP32 (trazabilidad con corridas previas).
     const ErrorMetrics gpu_vs_cpu    = compare_float_vectors(y_cpu, y_gpu);
-    const ErrorMetrics tc_vs_cpu     = compare_float_vectors(y_cpu, y_tc);
     const ErrorMetrics wmma_vs_cpu   = compare_float_vectors(y_cpu, y_wmma);
     const ErrorMetrics wmma_vs_tc    = compare_float_vectors(y_tc,  y_wmma);
 
-    print_float_report(cpu, gpu, tc, wmma,
-                       cpu_err, gpu_err, tc_err, wmma_err,
-                       gpu_vs_cpu, tc_vs_cpu, wmma_vs_cpu, wmma_vs_tc);
+    print_float_report(opt, cpu, gpu, tc, wmma, tc_bf16,
+                       cpu_err, gpu_err, tc_err, wmma_err, tc_bf16_err,
+                       gpu_vs_cpu, tc_vs_cpu, wmma_vs_cpu, wmma_vs_tc, tc_bf16_vs_cpu);
 }
 
 static void run_experiment_double(const Options& opt) {

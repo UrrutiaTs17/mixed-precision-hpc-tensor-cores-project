@@ -37,16 +37,9 @@
 #include <string>
 #include <vector>
 
-#define CHECK_CUDA(call) do {                                                   \
-    cudaError_t err = (call);                                                   \
-    if (err != cudaSuccess) {                                                   \
-        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__           \
-                  << " -> " << cudaGetErrorString(err) << std::endl;           \
-        std::exit(EXIT_FAILURE);                                                \
-    }                                                                           \
-} while(0)
-
 namespace {
+
+#include "../common.cuh"
 
 using namespace nvcuda;
 
@@ -66,49 +59,6 @@ struct Options {
     int ny = 2048;
     int iters = 20;
     TensorCoreMode tc_mode = TensorCoreMode::Both;
-};
-
-struct Metrics {
-    double ms = 0.0;
-    double gflops = 0.0;
-    double tflops = 0.0;
-};
-
-struct ErrorMetrics {
-    double max_abs = 0.0;
-    double rel_l2 = 0.0;
-};
-
-class CudaEventTimer {
-public:
-    CudaEventTimer() {
-        CHECK_CUDA(cudaEventCreate(&start_));
-        CHECK_CUDA(cudaEventCreate(&stop_));
-    }
-
-    ~CudaEventTimer() {
-        CHECK_CUDA(cudaEventDestroy(start_));
-        CHECK_CUDA(cudaEventDestroy(stop_));
-    }
-
-    CudaEventTimer(const CudaEventTimer&) = delete;
-    CudaEventTimer& operator=(const CudaEventTimer&) = delete;
-
-    void start() {
-        CHECK_CUDA(cudaEventRecord(start_));
-    }
-
-    float stop_and_elapsed_ms() {
-        CHECK_CUDA(cudaEventRecord(stop_));
-        CHECK_CUDA(cudaEventSynchronize(stop_));
-        float elapsed = 0.0f;
-        CHECK_CUDA(cudaEventElapsedTime(&elapsed, start_, stop_));
-        return elapsed;
-    }
-
-private:
-    cudaEvent_t start_ = nullptr;
-    cudaEvent_t stop_ = nullptr;
 };
 
 __host__ __device__ inline int idx2d(int x, int y, int nx) {
@@ -257,40 +207,6 @@ static void initialize_grid(std::vector<float>& v, int nx, int ny) {
             v[idx2d(x, y, nx)] = wave + 0.001f * static_cast<float>(centered);
         }
     }
-}
-
-static ErrorMetrics compare_float_vectors(const std::vector<float>& ref,
-                                          const std::vector<float>& test) {
-    ErrorMetrics out;
-    double sq_err = 0.0;
-    double sq_ref = 0.0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        const double diff = static_cast<double>(ref[i]) - static_cast<double>(test[i]);
-        out.max_abs = std::max(out.max_abs, std::abs(diff));
-        sq_err += diff * diff;
-        sq_ref += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
-    }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
-    return out;
-}
-
-// Compara una referencia FP64 contra un resultado FP32 con el mismo layout
-// lineal (patron compare_fp64_ref_vs_fp32_colmaj de GEMM adaptado a la grilla).
-static ErrorMetrics compare_fp64_ref_vs_fp32(const std::vector<double>& ref_fp64,
-                                             const std::vector<float>& test_fp32) {
-    ErrorMetrics out;
-    double sq_err = 0.0;
-    double sq_ref = 0.0;
-    for (size_t i = 0; i < ref_fp64.size(); ++i) {
-        const double r    = ref_fp64[i];
-        const double t    = static_cast<double>(test_fp32[i]);
-        const double diff = r - t;
-        out.max_abs = std::max(out.max_abs, std::abs(diff));
-        sq_err += diff * diff;
-        sq_ref += r * r;
-    }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
-    return out;
 }
 
 static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
