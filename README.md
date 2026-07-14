@@ -38,12 +38,18 @@ Este proyecto investiga el impacto numérico y energético de la computación en
 
 ```
 mixed-precision-hpc-tensor-cores-project/
-├── Fase_1/          # Línea base analítica
+├── Fase_1/                  # Línea base analítica
 │   ├── GEMM/
 │   ├── Convolution/
+│   └── Stencil2D/
+├── Fase_2/                  # Precisión mixta y activación de Tensor Cores
+│   ├── GEMM/
+│   ├── Convolution/
+│   ├── Stencil/
+│   ├── common.cuh           # Utilidades compartidas (CHECK_CUDA, timer, métricas)
+│   └── common_ncu.sh        # Definiciones compartidas de perfilado con Nsight Compute
+├── Fase_3/                  # Cuantificación del drift numérico (encadenamiento genuino)
 │   └── Stencil/
-├── Fase_2/          # Precisión mixta y Tensor Cores
-│   └── GEMM/
 ├── README.md
 └── .gitignore
 ```
