@@ -589,11 +589,12 @@ static double storage_roundtrip_max_abs(const std::vector<float>& computed,
 // iteracion > 1 debe reconvertir la salida float de la iteracion anterior a T
 // antes de usarla como entrada de la siguiente (reutiliza convert_input_to_tc).
 // El warm-up encadena de la misma forma pero es descartable: al terminar se
-// reconvierte d_in_fp32 (nunca modificado) para reiniciar d_in_tc al estado
-// original antes del bucle medido, igual que en benchmark_gpu_fp32_stencil.
-// d_out arranca como copia completa del input y el kernel jamas escribe las
-// celdas de borde (ver comentario en stencil2d_wmma_kernel), asi que quedan
-// preservadas en cualquier numero de iteraciones sin necesidad de restaurarlas.
+// reconvierte d_in_fp32 (nunca modificado) para reiniciar d_in_tc, y se
+// restaura d_out con una copia fresca de in via cudaMemcpy, igual que en
+// benchmark_gpu_fp32_stencil, para que el bucle medido siempre arranque
+// desde el estado original (necesario para que --iters 1 coincida con
+// Fase_2/Stencil). Este reset explicito no depende de que el kernel deje
+// intactas las celdas de borde: es robusto aunque esa logica cambie.
 template <typename T>
 static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  std::vector<float>& out,
@@ -644,10 +645,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Reinicia d_in_tc al input original: el warm-up encadenado es descartable
-    // y no debe alterar el estado que vera el bucle medido (necesario para que
-    // --iters 1 coincida con Fase_2/Stencil).
+    // Reinicia d_in_tc y d_out al estado original: el warm-up encadenado es
+    // descartable y no debe alterar el estado que vera el bucle medido
+    // (necesario para que --iters 1 coincida con Fase_2/Stencil).
     convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
+    CHECK_CUDA(cudaMemcpy(d_out, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaDeviceSynchronize());
 
     CudaEventTimer timer;
