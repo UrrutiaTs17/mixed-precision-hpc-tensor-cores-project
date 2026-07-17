@@ -123,7 +123,7 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
 else
     # Dimensiones de referencia del proyecto (mismas del hint Nsight en el .cu).
     declare -a RUNS=(
-        "4096 4096 20 both"
+        "16384 16384 200 both"
     )
 fi
 
