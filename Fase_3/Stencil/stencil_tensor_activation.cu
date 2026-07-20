@@ -685,6 +685,27 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     return build_metrics(nx, ny, static_cast<double>(total_ms) / iters);
 }
 
+// Imprime max_abs/rel_l2, o un mensaje explicito si la referencia o la
+// solucion no son finitas (evita imprimir "0.000000"/"nan" como si fuera
+// una medicion valida).
+static void print_error_metrics(const char* label_max, const char* label_l2,
+                                 const ErrorMetrics& e) {
+    if (!e.reference_finite) {
+        std::cout << label_max
+                   << "REFERENCIA NO FINITA: la solucion diverguio; "
+                      "L2/Linf no medibles en esta configuracion\n";
+        return;
+    }
+    if (!e.solution_finite) {
+        std::cout << label_max
+                   << "SOLUCION NO FINITA: la ruta diverguio; "
+                      "L2/Linf no medibles en esta configuracion\n";
+        return;
+    }
+    std::cout << label_max << e.max_abs << "\n";
+    std::cout << label_l2  << e.rel_l2  << "\n";
+}
+
 static void print_reference_comparison(const char* label,
                                        const Metrics& m,
                                        double ref_ms,
@@ -694,10 +715,9 @@ static void print_reference_comparison(const char* label,
     std::cout << label << " - rendimiento    : " << m.gflops << " GFLOP/s ("
               << m.tflops << " TFLOP/s efectivos)\n";
     std::cout << "Speedup vs CPU             : " << ref_ms / m.ms << "x\n";
-    std::cout << "Error max abs vs FP64      : " << e_fp64.max_abs << "\n";
-    std::cout << "Error relativo L2 vs FP64  : " << e_fp64.rel_l2 << "\n";
-    std::cout << "Error max abs vs CPU FP32  : " << e_cpu.max_abs << "\n";
-    std::cout << "Error rel L2 vs CPU FP32   : " << e_cpu.rel_l2 << "\n\n";
+    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", e_fp64);
+    print_error_metrics("Error max abs vs CPU FP32  : ", "Error rel L2 vs CPU FP32   : ", e_cpu);
+    std::cout << "\n";
 }
 
 static void print_configuration(const Options& opt) {
@@ -713,12 +733,13 @@ static void print_configuration(const Options& opt) {
     std::cout << "===================================================\n\n";
 }
 
-static void print_nsight_hint(const char* exe_name) {
+static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters) {
     std::cout << "Validacion Nsight Compute:\n";
     std::cout << "  ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \\\n";
     std::cout << "      --metrics sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed,"
               << "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \\\n";
-    std::cout << "      " << exe_name << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n";
+    std::cout << "      " << exe_name << " --nx " << nx << " --ny " << ny
+              << " --iters " << iters << " --tc fp16\n";
 }
 
 static void run_benchmark(const Options& opt, const char* exe_name) {
@@ -769,8 +790,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     std::cout << "CPU FP32 serial - tiempo   : " << cpu.ms << " ms\n";
     std::cout << "CPU FP32 serial - rend.    : " << cpu.gflops << " GFLOP/s ("
               << cpu.tflops << " TFLOP/s efectivos)\n";
-    std::cout << "Error max abs vs FP64      : " << cpu_err.max_abs << "\n";
-    std::cout << "Error relativo L2 vs FP64  : " << cpu_err.rel_l2 << "\n\n";
+    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", cpu_err);
+    std::cout << "\n";
 
     print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err);
 
@@ -786,10 +807,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " GFLOP/s (" << tc_fp16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC FP16 vs CPU             : " << cpu.ms / tc_fp16.ms << "x\n";
         std::cout << "Speedup TC FP16 vs GPU FP32        : " << gpu.ms / tc_fp16.ms << "x\n";
-        std::cout << "Error max abs vs FP64              : " << tc_fp16_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs FP64          : " << tc_fp16_err.rel_l2 << "\n";
-        std::cout << "Error max abs vs CPU FP32          : " << tc_fp16_vs_cpu_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs CPU FP32      : " << tc_fp16_vs_cpu_err.rel_l2 << "\n";
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_fp16_err);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_fp16_vs_cpu_err);
         std::cout << "Error por guardar en FP16 (16 bits): " << fp16_storage_err << "\n\n";
     }
 
@@ -805,15 +824,13 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " GFLOP/s (" << tc_bf16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC BF16 vs CPU             : " << cpu.ms / tc_bf16.ms << "x\n";
         std::cout << "Speedup TC BF16 vs GPU FP32        : " << gpu.ms / tc_bf16.ms << "x\n";
-        std::cout << "Error max abs vs FP64              : " << tc_bf16_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs FP64          : " << tc_bf16_err.rel_l2 << "\n";
-        std::cout << "Error max abs vs CPU FP32          : " << tc_bf16_vs_cpu_err.max_abs << "\n";
-        std::cout << "Error relativo L2 vs CPU FP32      : " << tc_bf16_vs_cpu_err.rel_l2 << "\n";
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_bf16_err);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_bf16_vs_cpu_err);
         std::cout << "Error por guardar en BF16 (16 bits): " << bf16_storage_err << "\n\n";
     }
 
     std::cout << "====================================================\n\n";
-    print_nsight_hint(exe_name);
+    print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters);
 }
 
 }  // namespace

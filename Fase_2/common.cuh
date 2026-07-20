@@ -105,6 +105,8 @@ struct Metrics {
 struct ErrorMetrics {
     double max_abs = 0.0;
     double rel_l2  = 0.0;
+    bool   reference_finite = true;  // false si algun valor de la referencia no es finito
+    bool   solution_finite  = true;  // false si algun valor de la solucion no es finito
 };
 
 // Compara una referencia FP64 contra un resultado FP32, elemento a elemento
@@ -117,14 +119,17 @@ static ErrorMetrics compare_fp64_ref_vs_fp32(const std::vector<double>& ref_fp64
     double sq_err = 0.0;
     double sq_ref = 0.0;
     for (size_t i = 0; i < ref_fp64.size(); ++i) {
-        const double r    = ref_fp64[i];
-        const double t    = static_cast<double>(test_fp32[i]);
+        const double r = ref_fp64[i];
+        const double t = static_cast<double>(test_fp32[i]);
+        if (!std::isfinite(r)) { out.reference_finite = false; continue; }
+        if (!std::isfinite(t)) { out.solution_finite = false; continue; }
         const double diff = r - t;
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
         sq_ref += r * r;
     }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
+    out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
+                 ? std::sqrt(sq_err / sq_ref) : 0.0;
     return out;
 }
 
@@ -136,12 +141,17 @@ static ErrorMetrics compare_float_vectors(const std::vector<float>& ref,
     double sq_err = 0.0;
     double sq_ref = 0.0;
     for (size_t i = 0; i < ref.size(); ++i) {
-        const double diff = static_cast<double>(ref[i]) - static_cast<double>(test[i]);
+        const double r = static_cast<double>(ref[i]);
+        const double t = static_cast<double>(test[i]);
+        if (!std::isfinite(r)) { out.reference_finite = false; continue; }
+        if (!std::isfinite(t)) { out.solution_finite = false; continue; }
+        const double diff = r - t;
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
-        sq_ref += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+        sq_ref += r * r;
     }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
+    out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
+                 ? std::sqrt(sq_err / sq_ref) : 0.0;
     return out;
 }
 
@@ -152,11 +162,16 @@ static ErrorMetrics compare_double_vectors(const std::vector<double>& ref,
     double sq_err = 0.0;
     double sq_ref = 0.0;
     for (size_t i = 0; i < ref.size(); ++i) {
-        const double diff = ref[i] - test[i];
+        const double r = ref[i];
+        const double t = test[i];
+        if (!std::isfinite(r)) { out.reference_finite = false; continue; }
+        if (!std::isfinite(t)) { out.solution_finite = false; continue; }
+        const double diff = r - t;
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
-        sq_ref += ref[i] * ref[i];
+        sq_ref += r * r;
     }
-    out.rel_l2 = sq_ref > 0.0 ? std::sqrt(sq_err / sq_ref) : 0.0;
+    out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
+                 ? std::sqrt(sq_err / sq_ref) : 0.0;
     return out;
 }
