@@ -105,6 +105,12 @@ struct Metrics {
 struct ErrorMetrics {
     double max_abs = 0.0;
     double rel_l2  = 0.0;
+    // NUEVO (Fase 3, drift por checkpoint): l2_abs es ||test-ref||_2 sin
+    // normalizar (numerador de rel_l2); ref_l2_norm es ||ref||_2. Solo los
+    // llena compare_fp64_ref_vs_fp32; compare_float_vectors/compare_double_vectors
+    // los dejan en su valor por defecto (0.0), pues ningun llamador actual los usa.
+    double l2_abs      = 0.0;
+    double ref_l2_norm = 0.0;
     bool   reference_finite = true;  // false si algun valor de la referencia no es finito
     bool   solution_finite  = true;  // false si algun valor de la solucion no es finito
 };
@@ -130,6 +136,8 @@ static ErrorMetrics compare_fp64_ref_vs_fp32(const std::vector<double>& ref_fp64
     }
     out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
                  ? std::sqrt(sq_err / sq_ref) : 0.0;
+    out.l2_abs = (out.reference_finite && std::isfinite(sq_err)) ? std::sqrt(sq_err) : 0.0;
+    out.ref_l2_norm = (out.reference_finite && std::isfinite(sq_ref)) ? std::sqrt(sq_ref) : 0.0;
     return out;
 }
 

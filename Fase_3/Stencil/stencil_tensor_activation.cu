@@ -67,6 +67,10 @@ struct Options {
     int ny = 2048;
     int iters = 20;
     TensorCoreMode tc_mode = TensorCoreMode::Both;
+    // 0 (por defecto) = sin checkpoints, comportamiento identico al previo.
+    // K > 0: cada K iteraciones, cada ruta se compara contra un snapshot FP64
+    // de esa misma iteracion (ver CheckpointContext / compute_cpu_stencil_fp64).
+    int checkpoint_every = 0;
 };
 
 __host__ __device__ inline int idx2d(int x, int y, int nx) {
@@ -76,14 +80,20 @@ __host__ __device__ inline int idx2d(int x, int y, int nx) {
 static void print_usage(const char* prog) {
     std::cout
         << "Uso:\n"
-        << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]\n\n"
+        << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
+           " [--checkpoint-every K]\n\n"
         << "Descripcion:\n"
         << "  Compara CPU FP32, GPU CUDA FP32 y GPU WMMA Tensor Core para stencil 2D.\n"
         << "  La ruta Tensor Core usa operandos FP16/BF16 y acumulacion/salida FP32.\n\n"
+        << "  --checkpoint-every K (K entero > 0) mide drift numerico: cada K\n"
+        << "  iteraciones, cada ruta se compara contra un snapshot FP64 de esa misma\n"
+        << "  iteracion y se emiten filas CSV_DRIFT/CSV_ONSET por stdout. K=0 o ausente\n"
+        << "  (por defecto) no activa checkpoints, comportamiento identico al previo.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
-        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n";
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --checkpoint-every 5\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -118,6 +128,8 @@ static Options parse_args(int argc, char** argv) {
                 std::exit(EXIT_FAILURE);
             }
             opt.tc_mode = parse_tc_mode(argv[++i]);
+        } else if (std::strcmp(argv[i], "--checkpoint-every") == 0) {
+            opt.checkpoint_every = parse_int_arg(i, argc, argv);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -130,6 +142,10 @@ static Options parse_args(int argc, char** argv) {
 
     if (opt.nx < 3 || opt.ny < 3 || opt.iters <= 0) {
         std::cerr << "nx y ny deben ser >= 3; iters debe ser positivo.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    if (opt.checkpoint_every < 0) {
+        std::cerr << "checkpoint-every debe ser >= 0 (0 desactiva los checkpoints).\n";
         std::exit(EXIT_FAILURE);
     }
     return opt;
@@ -281,16 +297,38 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
     return build_metrics(nx, ny, avg_ms);
 }
 
+// Devuelve false si algun elemento de v no es finito (usada solo para decidir
+// hasta donde la referencia FP64 sigue siendo utilizable como ground truth
+// de checkpoints; ver compute_cpu_stencil_fp64).
+static bool all_finite_fp64(const std::vector<double>& v) {
+    for (double x : v) {
+        if (!std::isfinite(x)) return false;
+    }
+    return true;
+}
+
 // Referencia FP64 (ground truth): version double de benchmark_cpu_stencil,
 // encadenada por el MISMO numero de iteraciones (iters) que las rutas
 // comparadas -condicion de aceptacion de Fase 3: sin esto el error vs FP64
 // quedaria invalido para iters>1 (N pasos encadenados contra 1 solo paso)-.
 // Opera sobre una copia en double del mismo input FP32, sin medir tiempo.
+//
+// checkpoint_every > 0 activa snapshots para medir drift: al completar cada
+// iteracion multiplo de checkpoint_every (K, 2K, 3K, ...) se copia el estado
+// actual a checkpoints.push_back(...). En cuanto un checkpoint no es
+// finito se deja de tomar snapshots (el operador es lineal: una vez no
+// finito, el campo se mantiene no finito el resto de iteraciones), de modo
+// que checkpoints.size() ya equivale al numero de checkpoints "validos"
+// (referencia finita), sin necesidad de un escaneo posterior sobre todos
+// los snapshots guardados. checkpoint_every <= 0 preserva el comportamiento
+// original: checkpoints queda vacio, sin copias ni memoria adicional.
 static void compute_cpu_stencil_fp64(const std::vector<double>& in,
                                      std::vector<double>& out,
                                      int nx,
                                      int ny,
-                                     int iters) {
+                                     int iters,
+                                     int checkpoint_every,
+                                     std::vector<std::vector<double>>& checkpoints) {
     auto apply = [&](const std::vector<double>& src, std::vector<double>& dst) {
         for (int y = 0; y < ny; ++y) {
             for (int x = 0; x < nx; ++x) {
@@ -313,9 +351,20 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
     std::vector<double> buf_b = in;
     std::vector<double>* src = &buf_a;
     std::vector<double>* dst = &buf_b;
+    checkpoints.clear();
+    bool reference_diverged = false;
     for (int i = 0; i < iters; ++i) {
         apply(*src, *dst);
         std::swap(src, dst);
+
+        const int iter_number = i + 1;
+        if (checkpoint_every > 0 && !reference_diverged && iter_number % checkpoint_every == 0) {
+            if (all_finite_fp64(*src)) {
+                checkpoints.push_back(*src);
+            } else {
+                reference_diverged = true;
+            }
+        }
     }
     out = *src;
 }
@@ -338,11 +387,62 @@ __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx
     out[idx2d(x, y, nx)] = 0.25f * (up + down + left + right) - center;
 }
 
+// Contexto compartido de checkpoints para las tres rutas de baja precision:
+// snapshots FP64 por checkpoint (iteraciones {K, 2K, ...}, ver
+// compute_cpu_stencil_fp64) y el intervalo K que los genero.
+// checkpoint_every <= 0 desactiva el mecanismo por completo.
+struct CheckpointContext {
+    int checkpoint_every = 0;
+    const std::vector<std::vector<double>>& fp64_checkpoints;
+};
+
+// Emite una fila CSV_DRIFT parseable para (ruta, checkpoint). Reutiliza las
+// guardas de finitud de ErrorMetrics: si la ruta diverge en este checkpoint
+// (solution_finite == false) imprime NONFINITE en los tres campos de error
+// en vez de un numero, para nunca imprimir "0.000000" ante inf/NaN. La
+// norma de referencia (ref_l2_norm) es siempre finita aqui porque
+// record_checkpoint solo llama a esta funcion para checkpoints con
+// referencia FP64 finita.
+static void emit_csv_drift_row(const char* route, int iter_number, const ErrorMetrics& e) {
+    std::cout << "CSV_DRIFT," << route << "," << iter_number << "," << e.ref_l2_norm << ",";
+    if (!e.solution_finite) {
+        std::cout << "NONFINITE,NONFINITE,NONFINITE\n";
+    } else {
+        std::cout << e.l2_abs << "," << e.rel_l2 << "," << e.max_abs << "\n";
+    }
+}
+
+// Precondicion (garantizada por los llamadores, ver mas abajo): ckpt.checkpoint_every > 0
+// y iter_number % ckpt.checkpoint_every == 0. Si el checkpoint cae fuera del
+// rango con referencia finita (ver compute_cpu_stencil_fp64), no emite nada
+// (asi se "deja de emitir la curva" una vez la referencia FP64 diverge).
+// Si no, compara host_buf (ya copiado D2H por el llamador, sin copia extra)
+// contra el snapshot FP64 correspondiente, emite CSV_DRIFT y registra en
+// onset_iter el PRIMER checkpoint en que la ruta (no la referencia) deja de
+// ser finita.
+static void record_checkpoint(const CheckpointContext& ckpt,
+                              const char* route,
+                              int iter_number,
+                              const std::vector<float>& host_buf,
+                              int& onset_iter) {
+    const int ckpt_idx = iter_number / ckpt.checkpoint_every - 1;
+    if (ckpt_idx < 0 || ckpt_idx >= static_cast<int>(ckpt.fp64_checkpoints.size())) return;
+
+    const ErrorMetrics e = compare_fp64_ref_vs_fp32(ckpt.fp64_checkpoints[ckpt_idx], host_buf);
+    emit_csv_drift_row(route, iter_number, e);
+    if (!e.solution_finite && onset_iter < 0) {
+        onset_iter = iter_number;
+    }
+}
+
 static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
                                           std::vector<float>& out,
                                           int nx,
                                           int ny,
-                                          int iters) {
+                                          int iters,
+                                          const CheckpointContext& ckpt,
+                                          const char* route_label,
+                                          int& onset_iter) {
     const size_t count = in.size();
     float* d_a = nullptr;
     float* d_b = nullptr;
@@ -372,13 +472,31 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMemcpy(d_a, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_b, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
+    // costo) cuando el checkpointing esta desactivado.
+    std::vector<float> checkpoint_host_buf;
+    if (ckpt.checkpoint_every > 0) {
+        checkpoint_host_buf.resize(count);
+    }
+
     float* d_in = d_a;
     float* d_out = d_b;
     CudaEventTimer timer;
     timer.start();
+    // Nota: si ckpt.checkpoint_every > 0, el tiempo medido aqui incluye las
+    // copias D2H y comparaciones de checkpoint (ms/GFLOPs deja de ser un
+    // numero de throughput puro); es el mismo trade-off para las tres rutas.
     for (int i = 0; i < iters; ++i) {
         stencil2d_fp32_kernel<<<grid, block>>>(d_in, d_out, nx, ny);
         std::swap(d_in, d_out);
+
+        // Solo LEE d_in (ya con el swap aplicado, ver comentario mas abajo);
+        // no altera el ping-pong.
+        if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_in,
+                                  count * sizeof(float), cudaMemcpyDeviceToHost));
+            record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
+        }
     }
     const float total_ms = timer.stop_and_elapsed_ms();
     CHECK_CUDA(cudaGetLastError());
@@ -601,7 +719,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  std::vector<T>& out_reduced,
                                                  int nx,
                                                  int ny,
-                                                 int iters) {
+                                                 int iters,
+                                                 const CheckpointContext& ckpt,
+                                                 const char* route_label,
+                                                 int& onset_iter) {
     const size_t count = in.size();
     float* d_in_fp32 = nullptr;
     float* d_out = nullptr;
@@ -652,13 +773,32 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMemcpy(d_out, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
+    // costo) cuando el checkpointing esta desactivado.
+    std::vector<float> checkpoint_host_buf;
+    if (ckpt.checkpoint_every > 0) {
+        checkpoint_host_buf.resize(count);
+    }
+
     CudaEventTimer timer;
     timer.start();
+    // Nota: si ckpt.checkpoint_every > 0, el tiempo medido aqui incluye las
+    // copias D2H y comparaciones de checkpoint (ms/GFLOPs deja de ser un
+    // numero de throughput puro); es el mismo trade-off para las tres rutas.
     for (int i = 0; i < iters; ++i) {
         stencil2d_wmma_kernel<T><<<grid, block>>>(d_in_tc, d_out, d_identity_pos,
                                                   d_identity_neg, nx, ny);
         if (i + 1 < iters) {
             convert_input_to_tc<T>(d_out, d_in_tc, count);
+        }
+
+        // Solo LEE d_out (el acumulador WMMA ya vive en float ahi mismo,
+        // independientemente de si ya se reconvirtio a d_in_tc arriba); no
+        // altera la conversion ni la logica de fragmentos WMMA.
+        if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out,
+                                  count * sizeof(float), cudaMemcpyDeviceToHost));
+            record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
         }
     }
     const float total_ms = timer.stop_and_elapsed_ms();
@@ -755,6 +895,12 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::exit(EXIT_FAILURE);
     }
 
+    // Fijado aqui (y no justo antes de "RESULTADOS...", como antes) para que
+    // las filas CSV_DRIFT -que pueden emitirse desde dentro de
+    // benchmark_gpu_fp32_stencil, antes de llegar a esa seccion- usen el
+    // mismo formato numerico que el resto de la salida.
+    std::cout << std::fixed << std::setprecision(6);
+
     const size_t count = static_cast<size_t>(opt.nx) * static_cast<size_t>(opt.ny);
     std::vector<float> input(count);
     std::vector<float> y_cpu(count, 0.0f);
@@ -775,17 +921,35 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     for (size_t i = 0; i < count; ++i) {
         input_fp64[i] = static_cast<double>(input[i]);
     }
-    compute_cpu_stencil_fp64(input_fp64, y_ref, opt.nx, opt.ny, opt.iters);
+    // Con --checkpoint-every K > 0, fp64_checkpoints recibe un snapshot por
+    // cada iteracion multiplo de K (ver compute_cpu_stencil_fp64); su tamano
+    // final ya es el numero de checkpoints "validos" (referencia finita).
+    std::vector<std::vector<double>> fp64_checkpoints;
+    compute_cpu_stencil_fp64(input_fp64, y_ref, opt.nx, opt.ny, opt.iters,
+                             opt.checkpoint_every, fp64_checkpoints);
+
+    if (opt.checkpoint_every > 0) {
+        const int got = static_cast<int>(fp64_checkpoints.size());
+        const int expected = opt.iters / opt.checkpoint_every;
+        if (got < expected) {
+            const int divergence_iter = (got + 1) * opt.checkpoint_every;
+            std::cout << "Referencia FP64 no finita desde iter " << divergence_iter
+                      << "; CSV_DRIFT se detiene ahi para todas las rutas ("
+                      << got << " de " << expected << " checkpoints validos).\n\n";
+        }
+    }
+    const CheckpointContext ckpt{opt.checkpoint_every, fp64_checkpoints};
 
     const Metrics cpu = benchmark_cpu_stencil(input, y_cpu, opt.nx, opt.ny, opt.iters);
-    const Metrics gpu = benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters);
+    int onset_gpu_fp32 = -1;
+    const Metrics gpu = benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters,
+                                                    ckpt, "GPU_FP32", onset_gpu_fp32);
     // Metrica primaria: contra el ground truth FP64 (objetivo especifico #3);
     // secundaria: contra la CPU FP32 (trazabilidad con corridas previas).
     const ErrorMetrics cpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
     const ErrorMetrics gpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_gpu);
     const ErrorMetrics gpu_vs_cpu_err = compare_float_vectors(y_cpu, y_gpu);
 
-    std::cout << std::fixed << std::setprecision(6);
     std::cout << "=========== RESULTADOS STENCIL 2D FASE 3 ===========\n";
     std::cout << "CPU FP32 serial - tiempo   : " << cpu.ms << " ms\n";
     std::cout << "CPU FP32 serial - rend.    : " << cpu.gflops << " GFLOP/s ("
@@ -795,9 +959,16 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err);
 
+    bool ran_fp16 = false;
+    bool ran_bf16 = false;
+    int onset_fp16 = -1;
+    int onset_bf16 = -1;
+
     if (opt.tc_mode == TensorCoreMode::FP16 || opt.tc_mode == TensorCoreMode::Both) {
+        ran_fp16 = true;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
-            input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters);
+            input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters,
+            ckpt, "WMMA_FP16", onset_fp16);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
         const ErrorMetrics tc_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_fp16);
         const double fp16_storage_err = storage_roundtrip_max_abs<__half>(y_tc_fp16, y_tc_fp16_reduced);
@@ -813,8 +984,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     }
 
     if (opt.tc_mode == TensorCoreMode::BF16 || opt.tc_mode == TensorCoreMode::Both) {
+        ran_bf16 = true;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
-            input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters);
+            input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters,
+            ckpt, "WMMA_BF16", onset_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
         const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
         const double bf16_storage_err = storage_roundtrip_max_abs<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced);
@@ -830,6 +1003,19 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     }
 
     std::cout << "====================================================\n\n";
+
+    if (opt.checkpoint_every > 0) {
+        std::cout << "=========== RESUMEN ONSET DE DIVERGENCIA ===========\n";
+        std::cout << "CSV_ONSET,GPU_FP32," << onset_gpu_fp32 << "\n";
+        if (ran_fp16) {
+            std::cout << "CSV_ONSET,WMMA_FP16," << onset_fp16 << "\n";
+        }
+        if (ran_bf16) {
+            std::cout << "CSV_ONSET,WMMA_BF16," << onset_bf16 << "\n";
+        }
+        std::cout << "=====================================================\n\n";
+    }
+
     print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters);
 }
 
