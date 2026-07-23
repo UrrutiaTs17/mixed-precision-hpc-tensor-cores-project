@@ -43,6 +43,13 @@ NCU_KERNEL_REGEX="${NCU_KERNEL_REGEX:-.*stencil2d_wmma_kernel.*}"
 # Debe coincidir con kWarmupIters en stencil_tensor_activation.cu (Fase_3/Stencil).
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-3}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
+# Barrido de iteraciones (Fase 3, horizonte de overflow): 10..120 caen dentro
+# del horizonte de FP32/BF16 (produce L2/Linf finitas); 200 se conserva para
+# documentar el colapso por desbordamiento de exponente (ver stencil_tensor_activation.cu).
+ITERS_LIST="${ITERS_LIST:-10 50 100 120 200}"
+# Restriccion de tiempo: NCU solo se corre para un valor de ITERS de la lista,
+# no para todos -- mantiene el numero de reportes NCU en 2 (fp16 y bf16).
+ITERS_NCU="${ITERS_NCU:-100}"
 
 # Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
 # sola vez en Fase_2/common_ncu.sh y se reutiliza entre los .sbatch de todas
@@ -121,10 +128,13 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
         "512 512 3 both"
     )
 else
-    # Dimensiones de referencia del proyecto (mismas del hint Nsight en el .cu).
-    declare -a RUNS=(
-        "16384 16384 200 both"
-    )
+    # Dimensiones de referencia del proyecto (mismas del hint Nsight en el .cu),
+    # barridas sobre ITERS_LIST para cubrir tanto la ventana finita (10..120)
+    # como el colapso documentado en iters=200.
+    declare -a RUNS=()
+    for ITERS_VAL in ${ITERS_LIST}; do
+        RUNS+=("16384 16384 ${ITERS_VAL} both")
+    done
 fi
 
 for run in "${RUNS[@]}"; do
@@ -135,7 +145,7 @@ for run in "${RUNS[@]}"; do
     echo "============================================================"
     ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}"
 
-    if [[ "${RUN_NCU}" == "1" ]]; then
+    if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
         # Con --tc both el binario lanza primero todos los kernels FP16 y luego
         # los BF16; como --launch-skip cuenta lanzamientos que matchean el regex
         # de forma global, un solo pase de ncu con skip=3 solo capturaria la

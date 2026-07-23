@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -250,8 +251,12 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
                                      std::vector<float>& out,
                                      int nx,
                                      int ny,
-                                     int iters) {
-    auto apply = [&](const std::vector<float>& src, std::vector<float>& dst) {
+                                     int iters,
+                                     int& first_nonfinite_iter) {
+    // first_nf == nullptr durante el warm-up: esas iteraciones son descartables
+    // y no deben contaminar la medicion (se reinicia antes del bucle medido).
+    auto apply = [&](const std::vector<float>& src, std::vector<float>& dst,
+                     int iter_number, int* first_nf) {
         for (int y = 0; y < ny; ++y) {
             for (int x = 0; x < nx; ++x) {
                 if (x == 0 || y == 0 || x == nx - 1 || y == ny - 1) {
@@ -264,7 +269,11 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
                 const float left = src[idx2d(x - 1, y, nx)];
                 const float right = src[idx2d(x + 1, y, nx)];
                 const float center = src[idx2d(x, y, nx)];
-                dst[idx2d(x, y, nx)] = 0.25f * (up + down + left + right) - center;
+                const float val = 0.25f * (up + down + left + right) - center;
+                dst[idx2d(x, y, nx)] = val;
+                if (first_nf != nullptr && *first_nf == INT_MAX && !std::isfinite(val)) {
+                    *first_nf = iter_number;
+                }
             }
         }
     };
@@ -275,7 +284,7 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
         std::vector<float>* warm_src = &warm_a;
         std::vector<float>* warm_dst = &warm_b;
         for (int i = 0; i < kWarmupIters; ++i) {
-            apply(*warm_src, *warm_dst);
+            apply(*warm_src, *warm_dst, i + 1, nullptr);
             std::swap(warm_src, warm_dst);
         }
     }
@@ -285,9 +294,10 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
     std::vector<float>* src = &buf_a;
     std::vector<float>* dst = &buf_b;
 
+    first_nonfinite_iter = INT_MAX;
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iters; ++i) {
-        apply(*src, *dst);
+        apply(*src, *dst, i + 1, &first_nonfinite_iter);
         std::swap(src, dst);
     }
     auto end = std::chrono::high_resolution_clock::now();
@@ -328,7 +338,8 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
                                      int ny,
                                      int iters,
                                      int checkpoint_every,
-                                     std::vector<std::vector<double>>& checkpoints) {
+                                     std::vector<std::vector<double>>& checkpoints,
+                                     int& first_nonfinite_iter) {
     auto apply = [&](const std::vector<double>& src, std::vector<double>& dst) {
         for (int y = 0; y < ny; ++y) {
             for (int x = 0; x < nx; ++x) {
@@ -353,11 +364,15 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
     std::vector<double>* dst = &buf_b;
     checkpoints.clear();
     bool reference_diverged = false;
+    first_nonfinite_iter = INT_MAX;
     for (int i = 0; i < iters; ++i) {
         apply(*src, *dst);
         std::swap(src, dst);
 
         const int iter_number = i + 1;
+        if (first_nonfinite_iter == INT_MAX && !all_finite_fp64(*src)) {
+            first_nonfinite_iter = iter_number;
+        }
         if (checkpoint_every > 0 && !reference_diverged && iter_number % checkpoint_every == 0) {
             if (all_finite_fp64(*src)) {
                 checkpoints.push_back(*src);
@@ -369,7 +384,17 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
     out = *src;
 }
 
-__global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx, int ny) {
+// Registra en *first_nf la PRIMERA iteracion (atomicMin) en que un punto
+// interior deja de ser finito. Compartido por el kernel FP32 clasico y por
+// el kernel WMMA templado para no duplicar la logica de deteccion.
+__device__ inline void mark_first_nonfinite(int* first_nf, int iter, float val) {
+    if (!isfinite(val)) {
+        atomicMin(first_nf, iter);
+    }
+}
+
+__global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx, int ny,
+                                             int iter, int* first_nf) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= nx || y >= ny) return;
@@ -384,7 +409,9 @@ __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx
     const float left = in[idx2d(x - 1, y, nx)];
     const float right = in[idx2d(x + 1, y, nx)];
     const float center = in[idx2d(x, y, nx)];
-    out[idx2d(x, y, nx)] = 0.25f * (up + down + left + right) - center;
+    const float val = 0.25f * (up + down + left + right) - center;
+    out[idx2d(x, y, nx)] = val;
+    mark_first_nonfinite(first_nf, iter, val);
 }
 
 // Contexto compartido de checkpoints para las tres rutas de baja precision:
@@ -442,12 +469,15 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
                                           int iters,
                                           const CheckpointContext& ckpt,
                                           const char* route_label,
-                                          int& onset_iter) {
+                                          int& onset_iter,
+                                          int& first_nonfinite_iter) {
     const size_t count = in.size();
     float* d_a = nullptr;
     float* d_b = nullptr;
+    int* d_first_nf = nullptr;
     CHECK_CUDA(cudaMalloc(&d_a, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_b, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
     // Ambos buffers arrancan como copia completa del input: el kernel nunca
     // escribe las celdas de borde, asi que deben preservarse desde el inicio
     // en cualquier buffer que llegue a jugar el rol de d_out.
@@ -464,13 +494,20 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     float* warm_in = d_a;
     float* warm_out = d_b;
     for (int i = 0; i < kWarmupIters; ++i) {
-        stencil2d_fp32_kernel<<<grid, block>>>(warm_in, warm_out, nx, ny);
+        stencil2d_fp32_kernel<<<grid, block>>>(warm_in, warm_out, nx, ny, i + 1, d_first_nf);
         std::swap(warm_in, warm_out);
     }
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(d_a, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_b, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Reinicia el contador de overflow tras el warm-up: sus iteraciones son
+    // descartables y no deben contaminar la medicion del bucle cronometrado.
+    {
+        const int init_val = INT_MAX;
+        CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
+    }
 
     // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
     // costo) cuando el checkpointing esta desactivado.
@@ -487,7 +524,7 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     // copias D2H y comparaciones de checkpoint (ms/GFLOPs deja de ser un
     // numero de throughput puro); es el mismo trade-off para las tres rutas.
     for (int i = 0; i < iters; ++i) {
-        stencil2d_fp32_kernel<<<grid, block>>>(d_in, d_out, nx, ny);
+        stencil2d_fp32_kernel<<<grid, block>>>(d_in, d_out, nx, ny, i + 1, d_first_nf);
         std::swap(d_in, d_out);
 
         // Solo LEE d_in (ya con el swap aplicado, ver comentario mas abajo);
@@ -502,9 +539,11 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaGetLastError());
     // Tras el ultimo swap, d_in apunta al buffer con la salida mas reciente.
     CHECK_CUDA(cudaMemcpy(out.data(), d_in, count * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
 
     CHECK_CUDA(cudaFree(d_a));
     CHECK_CUDA(cudaFree(d_b));
+    CHECK_CUDA(cudaFree(d_first_nf));
     return build_metrics(nx, ny, static_cast<double>(total_ms) / iters);
 }
 
@@ -565,7 +604,9 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
                                              const T* identity_pos,
                                              const T* identity_neg,
                                              int nx,
-                                             int ny) {
+                                             int ny,
+                                             int iter,
+                                             int* first_nf) {
     const int x0 = 1 + blockIdx.x * kTile;
     const int y0 = 1 + blockIdx.y * kTile;
     const bool full_tile = (x0 + kTile - 1 < nx - 1) && (y0 + kTile - 1 < ny - 1);
@@ -628,7 +669,9 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         for (int linear = threadIdx.x; linear < kTile * kTile; linear += blockDim.x) {
             const int local_x = linear % kTile;
             const int local_y = linear / kTile;
-            out[idx2d(x0 + local_x, y0 + local_y, nx)] = out_tile[linear];
+            const float val = out_tile[linear];
+            out[idx2d(x0 + local_x, y0 + local_y, nx)] = val;
+            mark_first_nonfinite(first_nf, iter, val);
         }
         return;
     }
@@ -654,7 +697,9 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         const float left = tc_to_float(in[idx2d(x - 1, y, nx)]);
         const float right = tc_to_float(in[idx2d(x + 1, y, nx)]);
         const float center = tc_to_float(in[idx2d(x, y, nx)]);
-        out[idx2d(x, y, nx)] = 0.25f * (up + down + left + right) - center;
+        const float val = 0.25f * (up + down + left + right) - center;
+        out[idx2d(x, y, nx)] = val;
+        mark_first_nonfinite(first_nf, iter, val);
     }
 }
 
@@ -722,7 +767,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  int iters,
                                                  const CheckpointContext& ckpt,
                                                  const char* route_label,
-                                                 int& onset_iter) {
+                                                 int& onset_iter,
+                                                 int& first_nonfinite_iter) {
     const size_t count = in.size();
     float* d_in_fp32 = nullptr;
     float* d_out = nullptr;
@@ -730,6 +776,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     T* d_out_reduced = nullptr;
     T* d_identity_pos = nullptr;
     T* d_identity_neg = nullptr;
+    int* d_first_nf = nullptr;
 
     CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_out, count * sizeof(float)));
@@ -737,6 +784,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMalloc(&d_out_reduced, count * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_pos, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_neg, kTile * kTile * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
 
     CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_out, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
@@ -758,7 +806,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
 
     for (int i = 0; i < kWarmupIters; ++i) {
         stencil2d_wmma_kernel<T><<<grid, block>>>(d_in_tc, d_out, d_identity_pos,
-                                                  d_identity_neg, nx, ny);
+                                                  d_identity_neg, nx, ny, i + 1, d_first_nf);
         if (i + 1 < kWarmupIters) {
             convert_input_to_tc<T>(d_out, d_in_tc, count);
         }
@@ -772,6 +820,13 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
     CHECK_CUDA(cudaMemcpy(d_out, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Reinicia el contador de overflow tras el warm-up: sus iteraciones son
+    // descartables y no deben contaminar la medicion del bucle cronometrado.
+    {
+        const int init_val = INT_MAX;
+        CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
+    }
 
     // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
     // costo) cuando el checkpointing esta desactivado.
@@ -787,7 +842,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // numero de throughput puro); es el mismo trade-off para las tres rutas.
     for (int i = 0; i < iters; ++i) {
         stencil2d_wmma_kernel<T><<<grid, block>>>(d_in_tc, d_out, d_identity_pos,
-                                                  d_identity_neg, nx, ny);
+                                                  d_identity_neg, nx, ny, i + 1, d_first_nf);
         if (i + 1 < iters) {
             convert_input_to_tc<T>(d_out, d_in_tc, count);
         }
@@ -804,6 +859,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     const float total_ms = timer.stop_and_elapsed_ms();
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out, count * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
 
     // NUEVO: el resultado WMMA solo existia en float (d_out). Se reutiliza
     // el mismo conversor ya usado para la entrada (convert_input_to_tc)
@@ -821,15 +877,18 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaFree(d_out_reduced));
     CHECK_CUDA(cudaFree(d_identity_pos));
     CHECK_CUDA(cudaFree(d_identity_neg));
+    CHECK_CUDA(cudaFree(d_first_nf));
 
     return build_metrics(nx, ny, static_cast<double>(total_ms) / iters);
 }
 
 // Imprime max_abs/rel_l2, o un mensaje explicito si la referencia o la
 // solucion no son finitas (evita imprimir "0.000000"/"nan" como si fuera
-// una medicion valida).
+// una medicion valida). first_nf es la primera iteracion no finita de LA
+// RUTA evaluada (no de la referencia); se concatena como causa solo cuando
+// la ruta (no la referencia) es la que diverge.
 static void print_error_metrics(const char* label_max, const char* label_l2,
-                                 const ErrorMetrics& e) {
+                                 const ErrorMetrics& e, int first_nf) {
     if (!e.reference_finite) {
         std::cout << label_max
                    << "REFERENCIA NO FINITA: la solucion diverguio; "
@@ -839,24 +898,41 @@ static void print_error_metrics(const char* label_max, const char* label_l2,
     if (!e.solution_finite) {
         std::cout << label_max
                    << "SOLUCION NO FINITA: la ruta diverguio; "
-                      "L2/Linf no medibles en esta configuracion\n";
+                      "L2/Linf no medibles en esta configuracion";
+        if (first_nf != INT_MAX) {
+            std::cout << " (desbordamiento de exponente en iteracion " << first_nf << ")";
+        }
+        std::cout << "\n";
         return;
     }
     std::cout << label_max << e.max_abs << "\n";
     std::cout << label_l2  << e.rel_l2  << "\n";
 }
 
+// n == INT_MAX (sentinel de "nunca se marco") se reporta como "ninguna".
+static void print_first_nonfinite(const char* label, int first_nf, int iters) {
+    std::cout << label;
+    if (first_nf == INT_MAX) {
+        std::cout << "ninguna (finito hasta iters=" << iters << ")\n";
+    } else {
+        std::cout << first_nf << "\n";
+    }
+}
+
 static void print_reference_comparison(const char* label,
                                        const Metrics& m,
                                        double ref_ms,
                                        const ErrorMetrics& e_fp64,
-                                       const ErrorMetrics& e_cpu) {
+                                       const ErrorMetrics& e_cpu,
+                                       int first_nf,
+                                       int iters) {
     std::cout << label << " - tiempo         : " << m.ms << " ms\n";
     std::cout << label << " - rendimiento    : " << m.gflops << " GFLOP/s ("
               << m.tflops << " TFLOP/s efectivos)\n";
     std::cout << "Speedup vs CPU             : " << ref_ms / m.ms << "x\n";
-    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", e_fp64);
-    print_error_metrics("Error max abs vs CPU FP32  : ", "Error rel L2 vs CPU FP32   : ", e_cpu);
+    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", e_fp64, first_nf);
+    print_error_metrics("Error max abs vs CPU FP32  : ", "Error rel L2 vs CPU FP32   : ", e_cpu, first_nf);
+    print_first_nonfinite("Primera iteracion no finita : ", first_nf, iters);
     std::cout << "\n";
 }
 
@@ -870,16 +946,27 @@ static void print_configuration(const Options& opt) {
     std::cout << "Iteraciones                : " << opt.iters << "\n";
     std::cout << "Tile Tensor Core           : 16x16 con WMMA\n";
     std::cout << "Acumulacion TC             : FP32\n";
+    std::cout << "Horizonte teorico de overflow      : FP16~16  BF16~128  FP32~128  FP64~1024\n";
     std::cout << "===================================================\n\n";
 }
 
-static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters) {
+static const char* tc_mode_to_string(TensorCoreMode mode) {
+    switch (mode) {
+        case TensorCoreMode::FP16: return "fp16";
+        case TensorCoreMode::BF16: return "bf16";
+        case TensorCoreMode::Both: return "both";
+    }
+    return "both";
+}
+
+static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters,
+                              TensorCoreMode tc_mode) {
     std::cout << "Validacion Nsight Compute:\n";
     std::cout << "  ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \\\n";
     std::cout << "      --metrics sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed,"
               << "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \\\n";
     std::cout << "      " << exe_name << " --nx " << nx << " --ny " << ny
-              << " --iters " << iters << " --tc fp16\n";
+              << " --iters " << iters << " --tc " << tc_mode_to_string(tc_mode) << "\n";
 }
 
 static void run_benchmark(const Options& opt, const char* exe_name) {
@@ -925,8 +1012,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     // cada iteracion multiplo de K (ver compute_cpu_stencil_fp64); su tamano
     // final ya es el numero de checkpoints "validos" (referencia finita).
     std::vector<std::vector<double>> fp64_checkpoints;
+    int first_nf_fp64_ref = INT_MAX;
     compute_cpu_stencil_fp64(input_fp64, y_ref, opt.nx, opt.ny, opt.iters,
-                             opt.checkpoint_every, fp64_checkpoints);
+                             opt.checkpoint_every, fp64_checkpoints, first_nf_fp64_ref);
 
     if (opt.checkpoint_every > 0) {
         const int got = static_cast<int>(fp64_checkpoints.size());
@@ -940,10 +1028,13 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     }
     const CheckpointContext ckpt{opt.checkpoint_every, fp64_checkpoints};
 
-    const Metrics cpu = benchmark_cpu_stencil(input, y_cpu, opt.nx, opt.ny, opt.iters);
+    int first_nf_cpu = INT_MAX;
+    const Metrics cpu = benchmark_cpu_stencil(input, y_cpu, opt.nx, opt.ny, opt.iters, first_nf_cpu);
     int onset_gpu_fp32 = -1;
+    int first_nf_gpu_fp32 = INT_MAX;
     const Metrics gpu = benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters,
-                                                    ckpt, "GPU_FP32", onset_gpu_fp32);
+                                                    ckpt, "GPU_FP32", onset_gpu_fp32,
+                                                    first_nf_gpu_fp32);
     // Metrica primaria: contra el ground truth FP64 (objetivo especifico #3);
     // secundaria: contra la CPU FP32 (trazabilidad con corridas previas).
     const ErrorMetrics cpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
@@ -951,24 +1042,30 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     const ErrorMetrics gpu_vs_cpu_err = compare_float_vectors(y_cpu, y_gpu);
 
     std::cout << "=========== RESULTADOS STENCIL 2D FASE 3 ===========\n";
+    print_first_nonfinite("Primera iteracion no finita (ref FP64)     : ", first_nf_fp64_ref, opt.iters);
+    std::cout << "\n";
     std::cout << "CPU FP32 serial - tiempo   : " << cpu.ms << " ms\n";
     std::cout << "CPU FP32 serial - rend.    : " << cpu.gflops << " GFLOP/s ("
               << cpu.tflops << " TFLOP/s efectivos)\n";
-    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", cpu_err);
+    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", cpu_err, first_nf_cpu);
+    print_first_nonfinite("Primera iteracion no finita : ", first_nf_cpu, opt.iters);
     std::cout << "\n";
 
-    print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err);
+    print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err,
+                               first_nf_gpu_fp32, opt.iters);
 
     bool ran_fp16 = false;
     bool ran_bf16 = false;
     int onset_fp16 = -1;
     int onset_bf16 = -1;
+    int first_nf_fp16 = INT_MAX;
+    int first_nf_bf16 = INT_MAX;
 
     if (opt.tc_mode == TensorCoreMode::FP16 || opt.tc_mode == TensorCoreMode::Both) {
         ran_fp16 = true;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters,
-            ckpt, "WMMA_FP16", onset_fp16);
+            ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
         const ErrorMetrics tc_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_fp16);
         const double fp16_storage_err = storage_roundtrip_max_abs<__half>(y_tc_fp16, y_tc_fp16_reduced);
@@ -978,8 +1075,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " GFLOP/s (" << tc_fp16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC FP16 vs CPU             : " << cpu.ms / tc_fp16.ms << "x\n";
         std::cout << "Speedup TC FP16 vs GPU FP32        : " << gpu.ms / tc_fp16.ms << "x\n";
-        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_fp16_err);
-        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_fp16_vs_cpu_err);
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_fp16_err, first_nf_fp16);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_fp16_vs_cpu_err, first_nf_fp16);
+        print_first_nonfinite("Primera iteracion no finita        : ", first_nf_fp16, opt.iters);
         std::cout << "Error por guardar en FP16 (16 bits): " << fp16_storage_err << "\n\n";
     }
 
@@ -987,7 +1085,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         ran_bf16 = true;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters,
-            ckpt, "WMMA_BF16", onset_bf16);
+            ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
         const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
         const double bf16_storage_err = storage_roundtrip_max_abs<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced);
@@ -997,8 +1095,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " GFLOP/s (" << tc_bf16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC BF16 vs CPU             : " << cpu.ms / tc_bf16.ms << "x\n";
         std::cout << "Speedup TC BF16 vs GPU FP32        : " << gpu.ms / tc_bf16.ms << "x\n";
-        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_bf16_err);
-        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_bf16_vs_cpu_err);
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_bf16_err, first_nf_bf16);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_bf16_vs_cpu_err, first_nf_bf16);
+        print_first_nonfinite("Primera iteracion no finita        : ", first_nf_bf16, opt.iters);
         std::cout << "Error por guardar en BF16 (16 bits): " << bf16_storage_err << "\n\n";
     }
 
@@ -1016,7 +1115,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::cout << "=====================================================\n\n";
     }
 
-    print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters);
+    print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters, opt.tc_mode);
 }
 
 }  // namespace
