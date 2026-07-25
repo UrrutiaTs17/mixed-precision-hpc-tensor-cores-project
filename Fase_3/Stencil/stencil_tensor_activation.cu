@@ -39,10 +39,13 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -56,6 +59,12 @@ constexpr int kTile = 16;
 constexpr int kWarpThreads = 32;
 constexpr int kWarmupIters = 3;
 constexpr int kConversionThreads = 256;
+// occupancy: con 1 warp/bloque el techo de 32 CTAs/SM del A100 fija 32
+// warps/SM (50%) pese a que registros (64 warps/SM) y shared (36 bloques) lo
+// permitirian; con 4 warps/bloque, shared por bloque = 4*3584 B = 14 KiB
+// (10 bloques/SM x 4 warps = 40 warps/SM, 62.5%) y los CTAs bajan de 1.05M a
+// 262144 (gridDim.x = ceil(total_tiles / kWarpsPerBlock)).
+constexpr int kWarpsPerBlock = 4;
 
 enum class TensorCoreMode {
     FP16,
@@ -72,17 +81,40 @@ struct Options {
     // K > 0: cada K iteraciones, cada ruta se compara contra un snapshot FP64
     // de esa misma iteracion (ver CheckpointContext / compute_cpu_stencil_fp64).
     int checkpoint_every = 0;
+    // Vacio (por defecto) = sin CSV, comportamiento identico al previo.
+    std::string csv_path;
+    // false (por defecto) = comportamiento identico al previo. true: omite
+    // referencias CPU/FP64 y metricas de error (ver run_profile_only) para
+    // que ncu no pague su costo antes de llegar al kernel perfilado.
+    bool profile_only = false;
 };
 
 __host__ __device__ inline int idx2d(int x, int y, int nx) {
     return y * nx + x;
 }
 
+// Formatea valores de error/normas en notacion cientifica de 6 cifras: %f con
+// rango dinamico de 30 ordenes de magnitud (stencil diverge como 2^n) produce
+// literales como "11527513700657988108288.000000" en vez de un numero legible.
+static std::string fmt_sci(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.6e", v);
+    return buf;
+}
+
+// Un decimal para porcentajes (desglose WMMA/conversion/no atribuido): el
+// stream global usa std::fixed con 6 decimales, demasiados para un "%".
+static std::string fmt_pct1(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.1f", v);
+    return buf;
+}
+
 static void print_usage(const char* prog) {
     std::cout
         << "Uso:\n"
         << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
-           " [--checkpoint-every K]\n\n"
+           " [--checkpoint-every K] [--csv RUTA] [--profile-only]\n\n"
         << "Descripcion:\n"
         << "  Compara CPU FP32, GPU CUDA FP32 y GPU WMMA Tensor Core para stencil 2D.\n"
         << "  La ruta Tensor Core usa operandos FP16/BF16 y acumulacion/salida FP32.\n\n"
@@ -90,6 +122,11 @@ static void print_usage(const char* prog) {
         << "  iteraciones, cada ruta se compara contra un snapshot FP64 de esa misma\n"
         << "  iteracion y se emiten filas CSV_DRIFT/CSV_ONSET por stdout. K=0 o ausente\n"
         << "  (por defecto) no activa checkpoints, comportamiento identico al previo.\n\n"
+        << "  --csv RUTA agrega una fila por ruta/configuracion a RUTA (cabecera solo\n"
+        << "  si el archivo no existe). Ausente (por defecto) no escribe CSV.\n\n"
+        << "  --profile-only ejecuta solo GPU FP32 clasico + la ruta TC de --tc (no\n"
+        << "  admite --tc both), sin referencias CPU/FP64 ni metricas de error: para\n"
+        << "  perfilar con ncu sin pagar su costo. Ausente (por defecto) no la activa.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
@@ -131,6 +168,14 @@ static Options parse_args(int argc, char** argv) {
             opt.tc_mode = parse_tc_mode(argv[++i]);
         } else if (std::strcmp(argv[i], "--checkpoint-every") == 0) {
             opt.checkpoint_every = parse_int_arg(i, argc, argv);
+        } else if (std::strcmp(argv[i], "--csv") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --csv\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.csv_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--profile-only") == 0) {
+            opt.profile_only = true;
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -147,6 +192,11 @@ static Options parse_args(int argc, char** argv) {
     }
     if (opt.checkpoint_every < 0) {
         std::cerr << "checkpoint-every debe ser >= 0 (0 desactiva los checkpoints).\n";
+        std::exit(EXIT_FAILURE);
+    }
+    if (opt.profile_only && opt.tc_mode == TensorCoreMode::Both) {
+        std::cerr << "--profile-only no admite --tc both: perfila una sola ruta TC"
+                     " (fp16 o bf16) por invocacion.\n";
         std::exit(EXIT_FAILURE);
     }
     return opt;
@@ -384,34 +434,54 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
     out = *src;
 }
 
-// Registra en *first_nf la PRIMERA iteracion (atomicMin) en que un punto
-// interior deja de ser finito. Compartido por el kernel FP32 clasico y por
-// el kernel WMMA templado para no duplicar la logica de deteccion.
-__device__ inline void mark_first_nonfinite(int* first_nf, int iter, float val) {
-    if (!isfinite(val)) {
-        atomicMin(first_nf, iter);
+// Marca en *first_nf la PRIMERA iteracion (atomicMin) en que algun punto
+// interior del grid completo deja de ser finito. Reduccion en shared: una
+// sola atomica por BLOQUE (hilo lider) en vez de una por hilo -- con ~268M
+// hilos marcando sobre la misma direccion global al divergir, la version
+// por hilo serializaba el kernel (t_div ~constante e independiente del
+// kernel/precision, ver contexto). *(volatile int*)first_nf es una lectura
+// no atomica: solo es un early-out para evitar atomicMin redundantes una vez
+// que ya hay un iter menor o igual registrado; la correccion final depende
+// solo de atomicMin, no de esta lectura.
+__device__ inline void reduce_and_mark_first_nonfinite(int* first_nf, int iter, int blk_bad) {
+    if (blk_bad != 0) {
+        if (*(volatile int*)first_nf > iter) {
+            atomicMin(first_nf, iter);
+        }
     }
 }
 
 __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx, int ny,
                                              int iter, int* first_nf) {
+    __shared__ int blk_bad;
+    if (threadIdx.x == 0 && threadIdx.y == 0) blk_bad = 0;
+    __syncthreads();
+
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= nx || y >= ny) return;
+    const bool in_range = (x < nx && y < ny);
+    const bool active = in_range && !(x == 0 || y == 0 || x == nx - 1 || y == ny - 1);
 
-    if (x == 0 || y == 0 || x == nx - 1 || y == ny - 1) {
-        out[idx2d(x, y, nx)] = in[idx2d(x, y, nx)];
-        return;
+    float val = 0.0f;
+    if (in_range) {
+        if (active) {
+            const float up = in[idx2d(x, y - 1, nx)];
+            const float down = in[idx2d(x, y + 1, nx)];
+            const float left = in[idx2d(x - 1, y, nx)];
+            const float right = in[idx2d(x + 1, y, nx)];
+            const float center = in[idx2d(x, y, nx)];
+            val = 0.25f * (up + down + left + right) - center;
+            if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
+        } else {
+            val = in[idx2d(x, y, nx)];
+        }
     }
+    __syncthreads();
 
-    const float up = in[idx2d(x, y - 1, nx)];
-    const float down = in[idx2d(x, y + 1, nx)];
-    const float left = in[idx2d(x - 1, y, nx)];
-    const float right = in[idx2d(x + 1, y, nx)];
-    const float center = in[idx2d(x, y, nx)];
-    const float val = 0.25f * (up + down + left + right) - center;
-    out[idx2d(x, y, nx)] = val;
-    mark_first_nonfinite(first_nf, iter, val);
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        reduce_and_mark_first_nonfinite(first_nf, iter, blk_bad);
+    }
+    if (in_range) out[idx2d(x, y, nx)] = val;
 }
 
 // Contexto compartido de checkpoints para las tres rutas de baja precision:
@@ -431,11 +501,11 @@ struct CheckpointContext {
 // record_checkpoint solo llama a esta funcion para checkpoints con
 // referencia FP64 finita.
 static void emit_csv_drift_row(const char* route, int iter_number, const ErrorMetrics& e) {
-    std::cout << "CSV_DRIFT," << route << "," << iter_number << "," << e.ref_l2_norm << ",";
+    std::cout << "CSV_DRIFT," << route << "," << iter_number << "," << fmt_sci(e.ref_l2_norm) << ",";
     if (!e.solution_finite) {
         std::cout << "NONFINITE,NONFINITE,NONFINITE\n";
     } else {
-        std::cout << e.l2_abs << "," << e.rel_l2 << "," << e.max_abs << "\n";
+        std::cout << fmt_sci(e.l2_abs) << "," << fmt_sci(e.rel_l2) << "," << fmt_sci(e.max_abs) << "\n";
     }
 }
 
@@ -571,6 +641,24 @@ __device__ inline float tc_to_float(__nv_bfloat16 v) {
     return __bfloat162float(v);
 }
 
+// Misma funcion de conversion que convert_float_to_half_kernel /
+// convert_float_to_bfloat16_kernel (__float2half / __float2bfloat16): el
+// kernel WMMA la usa para escribir out_tc directamente, sin pasar por el
+// kernel de conversion dentro del bucle. Un redondeo distinto rompería la
+// comparabilidad con las fases anteriores.
+template <typename T>
+__device__ inline T float_to_tc(float v);
+
+template <>
+__device__ inline __half float_to_tc<__half>(float v) {
+    return __float2half(v);
+}
+
+template <>
+__device__ inline __nv_bfloat16 float_to_tc<__nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
+}
+
 static __half make_tc_value_half(float x) {
     return __float2half(x);
 }
@@ -598,22 +686,76 @@ void initialize_scaled_identity<__nv_bfloat16>(std::vector<__nv_bfloat16>& mat, 
     }
 }
 
+// Bytes de shared por WARP (no por bloque): tc_tiles[5][16][16] en T +
+// out_tile[16][16] en float. Con T de 2 bytes da 2560 + 1024 = 3584 B/warp
+// (confirmado por NCU: tamano estatico de shared con 1 warp/bloque). Usadas
+// tanto por el kernel (para particionar smem_raw) como por el host (para
+// dimensionar el shared dinamico del lanzamiento) -- una sola definicion
+// evita que ambos lados se desincronicen.
 template <typename T>
-__global__ static void stencil2d_wmma_kernel(const T* in,
-                                             float* out,
-                                             const T* identity_pos,
-                                             const T* identity_neg,
+__host__ __device__ constexpr size_t wmma_tc_tiles_bytes() {
+    return 5 * kTile * kTile * sizeof(T);
+}
+__host__ __device__ constexpr size_t wmma_out_tile_bytes() {
+    return kTile * kTile * sizeof(float);
+}
+template <typename T>
+__host__ __device__ constexpr size_t wmma_warp_shared_bytes() {
+    return wmma_tc_tiles_bytes<T>() + wmma_out_tile_bytes();
+}
+
+template <typename T>
+__global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
+                                             float* __restrict__ out_fp32,
+                                             T* __restrict__ out_tc,
+                                             const T* __restrict__ identity_pos,
+                                             const T* __restrict__ identity_neg,
                                              int nx,
                                              int ny,
                                              int iter,
-                                             int* first_nf) {
-    const int x0 = 1 + blockIdx.x * kTile;
-    const int y0 = 1 + blockIdx.y * kTile;
+                                             bool write_fp32,
+                                             int* __restrict__ first_nf) {
+    // Cada warp procesa un tile 16x16 propio e independiente (shared privada
+    // por warp, ver smem_raw mas abajo): el bloque ya no es 1 warp = 1 tile,
+    // es kWarpsPerBlock warps = kWarpsPerBlock tiles.
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    // El grid ahora es 1D (blockIdx.y no se usa): tiles_x se recalcula con la
+    // MISMA formula que el host usa para dimensionar el grid (ver
+    // benchmark_gpu_tensor_core_stencil), preservando el mapeo tile->dominio
+    // (x0/y0) sin agregar un parametro nuevo a la firma.
+    const int tiles_x = (nx - 2 + kTile - 1) / kTile;
+    const int tile_id = blockIdx.x * kWarpsPerBlock + warp_id;
+    const int tile_x = tile_id % tiles_x;
+    const int tile_y = tile_id / tiles_x;
+
+    const int x0 = 1 + tile_x * kTile;
+    const int y0 = 1 + tile_y * kTile;
     const bool full_tile = (x0 + kTile - 1 < nx - 1) && (y0 + kTile - 1 < ny - 1);
 
+    // full_tile es uniforme POR WARP (mismo tile_id para las 32 lanes de un
+    // warp), asi que __syncwarp() dentro de cada rama es valido aunque
+    // distintos warps del bloque tomen ramas distintas. Ningun hilo hace
+    // return antes del __syncthreads() final: los warps "fantasma" que
+    // gridDim.x = ceil(total_tiles/kWarpsPerBlock) agrega al ultimo bloque
+    // (tile_id >= total_tiles) caen en tile_y >= tiles_y, lo que fuerza
+    // full_tile = false y active = false para sus 256 puntos (ver rama
+    // else): no leen ni escriben nada, pero igual llegan al final.
+    __shared__ int blk_bad;
+    if (threadIdx.x == 0) blk_bad = 0;
+    __syncthreads();
+
     if (full_tile) {
-        __shared__ __align__(32) T tc_tiles[5 * kTile * kTile];
-        __shared__ __align__(32) float out_tile[kTile * kTile];
+        // smem_raw es la shared dinamica de TODO el bloque (kWarpsPerBlock *
+        // wmma_warp_shared_bytes<T>(), fijada por el host al lanzar); cada
+        // warp toma su propia porcion via warp_id, sin solaparse con las
+        // demas: tc_tiles primero, out_tile justo despues, igual que las
+        // dos declaraciones estaticas que reemplazan (mismo tamano/layout).
+        extern __shared__ __align__(32) char smem_raw[];
+        T* tc_tiles = reinterpret_cast<T*>(smem_raw + warp_id * wmma_warp_shared_bytes<T>());
+        float* out_tile = reinterpret_cast<float*>(smem_raw + warp_id * wmma_warp_shared_bytes<T>()
+                                                    + wmma_tc_tiles_bytes<T>());
 
         T* left_tile = tc_tiles + 0 * kTile * kTile;
         T* right_tile = tc_tiles + 1 * kTile * kTile;
@@ -621,7 +763,7 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         T* down_tile = tc_tiles + 3 * kTile * kTile;
         T* center_tile = tc_tiles + 4 * kTile * kTile;
 
-        for (int linear = threadIdx.x; linear < kTile * kTile; linear += blockDim.x) {
+        for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
             const int local_x = linear % kTile;
             const int local_y = linear / kTile;
             const int x = x0 + local_x;
@@ -666,40 +808,56 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         wmma::store_matrix_sync(out_tile, acc_frag, kTile, wmma::mem_row_major);
         __syncwarp();
 
-        for (int linear = threadIdx.x; linear < kTile * kTile; linear += blockDim.x) {
+        // Finitud evaluada sobre el acumulador FP32 (out_tile), antes de
+        // convertir a T. out_tc SIEMPRE se escribe (reemplaza al kernel de
+        // conversion dentro del bucle); out_fp32 solo cuando write_fp32 (ultima
+        // iteracion medida o checkpoint), con la MISMA funcion de conversion
+        // que convert_float_to_half_kernel/convert_float_to_bfloat16_kernel.
+        for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
             const int local_x = linear % kTile;
             const int local_y = linear / kTile;
             const float val = out_tile[linear];
-            out[idx2d(x0 + local_x, y0 + local_y, nx)] = val;
-            mark_first_nonfinite(first_nf, iter, val);
+            const int idx = idx2d(x0 + local_x, y0 + local_y, nx);
+            out_tc[idx] = float_to_tc<T>(val);
+            if (write_fp32) out_fp32[idx] = val;
+            if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
         }
-        return;
+    } else {
+        for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
+            const int local_x = linear % kTile;
+            const int local_y = linear / kTile;
+            const int x = x0 + local_x;
+            const int y = y0 + local_y;
+
+            // Esta guarda cubre, a la vez, tres casos: el borde fisico de la
+            // grilla (x/y == 0 o == nx-1/ny-1, que nunca se recalcula), los
+            // indices que caen fuera de rango porque este es el ultimo tile
+            // parcial de la fila/columna (x0/y0 + kTile puede exceder
+            // nx-1/ny-1 cuando nx-2 o ny-2 no son multiplos de kTile), y los
+            // warps fantasma sin tile real (ver comentario de tile_id mas
+            // arriba). Los tres se resuelven igual: no leer ni escribir para
+            // ese punto. active (no return) porque el trip count del for es
+            // uniforme entre lanes de un warp: todos deben llegar al
+            // __syncthreads() de mas abajo.
+            const bool active = !(x <= 0 || y <= 0 || x >= nx - 1 || y >= ny - 1);
+            if (active) {
+                const float up = tc_to_float(in[idx2d(x, y - 1, nx)]);
+                const float down = tc_to_float(in[idx2d(x, y + 1, nx)]);
+                const float left = tc_to_float(in[idx2d(x - 1, y, nx)]);
+                const float right = tc_to_float(in[idx2d(x + 1, y, nx)]);
+                const float center = tc_to_float(in[idx2d(x, y, nx)]);
+                const float val = 0.25f * (up + down + left + right) - center;
+                const int idx = idx2d(x, y, nx);
+                out_tc[idx] = float_to_tc<T>(val);
+                if (write_fp32) out_fp32[idx] = val;
+                if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
+            }
+        }
     }
 
-    for (int linear = threadIdx.x; linear < kTile * kTile; linear += blockDim.x) {
-        const int local_x = linear % kTile;
-        const int local_y = linear / kTile;
-        const int x = x0 + local_x;
-        const int y = y0 + local_y;
-
-        // Esta guarda cubre, a la vez, dos casos distintos: el borde fisico
-        // de la grilla (x/y == 0 o == nx-1/ny-1, que nunca se recalcula) y
-        // los indices que caen fuera de rango porque este es el ultimo tile
-        // parcial de la fila/columna (x0/y0 + kTile puede exceder nx-1/ny-1
-        // cuando nx-2 o ny-2 no son multiplos de kTile). Ambos casos se
-        // resuelven igual: no escribir out[] para ese hilo.
-        if (x <= 0 || y <= 0 || x >= nx - 1 || y >= ny - 1) {
-            continue;
-        }
-
-        const float up = tc_to_float(in[idx2d(x, y - 1, nx)]);
-        const float down = tc_to_float(in[idx2d(x, y + 1, nx)]);
-        const float left = tc_to_float(in[idx2d(x - 1, y, nx)]);
-        const float right = tc_to_float(in[idx2d(x + 1, y, nx)]);
-        const float center = tc_to_float(in[idx2d(x, y, nx)]);
-        const float val = 0.25f * (up + down + left + right) - center;
-        out[idx2d(x, y, nx)] = val;
-        mark_first_nonfinite(first_nf, iter, val);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        reduce_and_mark_first_nonfinite(first_nf, iter, blk_bad);
     }
 }
 
@@ -733,31 +891,45 @@ static inline float host_val_to_float(__nv_bfloat16 v) { return __bfloat162float
 
 // Mide cuanto se pierde SOLO por el hecho de guardar el resultado WMMA
 // (que internamente ya vive en float, via el acumulador de Tensor Cores)
-// en 16 bits. Antes de este cambio, ese resultado nunca se guardaba de
-// verdad en __half/__nv_bfloat16 -- por eso no se podia medir.
+// en 16 bits, normalizado por ||computed||_inf (el error absoluto escala con
+// la solucion: 7.81e-3 @10, 7.52e9 @50, 4.84e24 @100 para BF16). Siempre se
+// evalua sobre el mismo conjunto de indices (los finitos de "computed"), haya
+// divergido la ruta o no: antes, std::max(acc, NaN) descartaba en silencio
+// las celdas ya no finitas, por lo que a iters=200 (con casi todo el campo
+// no finito) el maximo quedaba tomado solo sobre el borde y daba un valor
+// pequeno inconsistente con iters=100.
 template <typename T>
-static double storage_roundtrip_max_abs(const std::vector<float>& computed,
+static double storage_roundtrip_rel_err(const std::vector<float>& computed,
                                         const std::vector<T>& stored) {
     double max_abs = 0.0;
+    double computed_linf = 0.0;
     for (size_t i = 0; i < computed.size(); ++i) {
-        double diff = std::fabs(static_cast<double>(computed[i]) -
-                                static_cast<double>(host_val_to_float(stored[i])));
-        max_abs = std::max(max_abs, diff);
+        const double x = static_cast<double>(computed[i]);
+        if (!std::isfinite(x)) continue;
+        computed_linf = std::max(computed_linf, std::fabs(x));
+        const double t = static_cast<double>(host_val_to_float(stored[i]));
+        if (!std::isfinite(t)) continue;
+        max_abs = std::max(max_abs, std::fabs(x - t));
     }
-    return max_abs;
+    return (computed_linf > 0.0) ? max_abs / computed_linf : 0.0;
 }
 
-// Encadenamiento genuino salida(i) -> entrada(i+1): el kernel WMMA consume T
-// (half/bfloat16) pero produce float (acumulador Tensor Core), asi que cada
-// iteracion > 1 debe reconvertir la salida float de la iteracion anterior a T
-// antes de usarla como entrada de la siguiente (reutiliza convert_input_to_tc).
-// El warm-up encadena de la misma forma pero es descartable: al terminar se
-// reconvierte d_in_fp32 (nunca modificado) para reiniciar d_in_tc, y se
-// restaura d_out con una copia fresca de in via cudaMemcpy, igual que en
-// benchmark_gpu_fp32_stencil, para que el bucle medido siempre arranque
-// desde el estado original (necesario para que --iters 1 coincida con
-// Fase_2/Stencil). Este reset explicito no depende de que el kernel deje
-// intactas las celdas de borde: es robusto aunque esa logica cambie.
+// Encadenamiento genuino salida(i) -> entrada(i+1): el kernel WMMA ahora
+// escribe out_tc (T) directamente cada iteracion (misma funcion de
+// conversion que antes aplicaba el kernel de conversion aparte, ver
+// float_to_tc<T>), asi que el ping-pong entre iteraciones es un simple
+// std::swap de punteros T*, igual que benchmark_gpu_fp32_stencil -- ya no
+// hace falta relanzar convert_input_to_tc dentro del bucle. out_fp32 sigue
+// siendo un buffer FP32 aparte (no participa del ping-pong): el kernel solo
+// lo escribe cuando write_fp32 es true (ultima iteracion medida o
+// checkpoint), que es cuando algo aguas abajo va a medir error. El warm-up
+// encadena de la misma forma (write_fp32=false, descartable) pero al
+// terminar se reconvierte d_in_fp32 (nunca modificado) hacia AMBOS buffers T
+// -- el kernel nunca escribe las celdas de borde, asi que deben preservarse
+// desde el inicio en cualquier buffer que llegue a jugar el rol de entrada
+// -- y se restaura out_fp32 con una copia fresca de in via cudaMemcpy, para
+// que el bucle medido siempre arranque desde el estado original (necesario
+// para que --iters 1 coincida con Fase_2/Stencil).
 template <typename T>
 static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  std::vector<float>& out,
@@ -768,26 +940,28 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  const CheckpointContext& ckpt,
                                                  const char* route_label,
                                                  int& onset_iter,
-                                                 int& first_nonfinite_iter) {
+                                                 int& first_nonfinite_iter,
+                                                 double& t_wmma_ms_out,
+                                                 double& t_conv_ms_out) {
     const size_t count = in.size();
     float* d_in_fp32 = nullptr;
-    float* d_out = nullptr;
+    float* d_out_fp32 = nullptr;
     T* d_in_tc = nullptr;
-    T* d_out_reduced = nullptr;
+    T* d_out_tc = nullptr;
     T* d_identity_pos = nullptr;
     T* d_identity_neg = nullptr;
     int* d_first_nf = nullptr;
 
     CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_out, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_out_fp32, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_in_tc, count * sizeof(T)));
-    CHECK_CUDA(cudaMalloc(&d_out_reduced, count * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_out_tc, count * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_pos, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_neg, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
 
     CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_out, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 
     std::vector<T> identity_pos(kTile * kTile);
     std::vector<T> identity_neg(kTile * kTile);
@@ -798,27 +972,46 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMemcpy(d_identity_neg, identity_neg.data(), identity_neg.size() * sizeof(T),
                           cudaMemcpyHostToDevice));
 
-    dim3 block(kWarpThreads);
-    dim3 grid((nx - 2 + kTile - 1) / kTile, (ny - 2 + kTile - 1) / kTile);
+    // gridDim.x ya no es tiles_x/tiles_y (2D, 1 tile = 1 bloque): es 1D,
+    // ceil(total_tiles / kWarpsPerBlock), con kWarpsPerBlock tiles por
+    // bloque (ver derivacion de tile_id/tiles_x dentro del kernel, misma
+    // formula de tiles_x/tiles_y que aqui). shared_bytes es dinamica (antes
+    // era estatica, __shared__ T tc_tiles[...]/float out_tile[...] por
+    // bloque): kWarpsPerBlock * wmma_warp_shared_bytes<T>() = 4*3584 = 14336
+    // B, muy por debajo de 48 KiB (no requiere
+    // cudaFuncAttributeMaxDynamicSharedMemorySize).
+    const int tiles_x = (nx - 2 + kTile - 1) / kTile;
+    const int tiles_y = (ny - 2 + kTile - 1) / kTile;
+    const int total_tiles = tiles_x * tiles_y;
+    static_assert(kWarpsPerBlock * wmma_warp_shared_bytes<T>() <= 49152,
+                 "shared por bloque excede 48 KiB estaticos/dinamicos");
+    dim3 block(kWarpsPerBlock * kWarpThreads);
+    dim3 grid((total_tiles + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    const size_t shared_bytes = static_cast<size_t>(kWarpsPerBlock) * wmma_warp_shared_bytes<T>();
 
+    // Ambos buffers del ping-pong T arrancan como conversion completa (borde
+    // incluido) del input pristino: ver comentario de la funcion.
     convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
+    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    T* tc_in = d_in_tc;
+    T* tc_out = d_out_tc;
     for (int i = 0; i < kWarmupIters; ++i) {
-        stencil2d_wmma_kernel<T><<<grid, block>>>(d_in_tc, d_out, d_identity_pos,
-                                                  d_identity_neg, nx, ny, i + 1, d_first_nf);
-        if (i + 1 < kWarmupIters) {
-            convert_input_to_tc<T>(d_out, d_in_tc, count);
-        }
+        stencil2d_wmma_kernel<T><<<grid, block, shared_bytes>>>(
+            tc_in, d_out_fp32, tc_out, d_identity_pos, d_identity_neg,
+            nx, ny, i + 1, /*write_fp32=*/false, d_first_nf);
+        std::swap(tc_in, tc_out);
     }
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Reinicia d_in_tc y d_out al estado original: el warm-up encadenado es
-    // descartable y no debe alterar el estado que vera el bucle medido
-    // (necesario para que --iters 1 coincida con Fase_2/Stencil).
+    // Reinicia d_in_tc, d_out_tc y d_out_fp32 al estado original: el warm-up
+    // encadenado es descartable y no debe alterar el estado que vera el
+    // bucle medido (necesario para que --iters 1 coincida con Fase_2/Stencil).
     convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
-    CHECK_CUDA(cudaMemcpy(d_out, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
+    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Reinicia el contador de overflow tras el warm-up: sus iteraciones son
@@ -835,46 +1028,73 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         checkpoint_host_buf.resize(count);
     }
 
+    // Pares de eventos por lanzamiento del kernel WMMA (iters), sin
+    // sincronizar dentro del bucle: se graban en el stream con
+    // cudaEventRecord y solo se leen con cudaEventElapsedTime DESPUES de
+    // timer.stop_and_elapsed_ms(), que ya sincronizo una vez al final. Ya no
+    // existe un kernel de conversion separado dentro del bucle (out_tc se
+    // escribe directamente desde stencil2d_wmma_kernel), asi que
+    // t_conv_ms_out queda en 0: no hay nada que medir por separado.
+    std::vector<cudaEvent_t> wmma_start(iters), wmma_stop(iters);
+    for (int i = 0; i < iters; ++i) {
+        CHECK_CUDA(cudaEventCreate(&wmma_start[i]));
+        CHECK_CUDA(cudaEventCreate(&wmma_stop[i]));
+    }
+
     CudaEventTimer timer;
     timer.start();
     // Nota: si ckpt.checkpoint_every > 0, el tiempo medido aqui incluye las
     // copias D2H y comparaciones de checkpoint (ms/GFLOPs deja de ser un
     // numero de throughput puro); es el mismo trade-off para las tres rutas.
     for (int i = 0; i < iters; ++i) {
-        stencil2d_wmma_kernel<T><<<grid, block>>>(d_in_tc, d_out, d_identity_pos,
-                                                  d_identity_neg, nx, ny, i + 1, d_first_nf);
-        if (i + 1 < iters) {
-            convert_input_to_tc<T>(d_out, d_in_tc, count);
-        }
+        // write_fp32 solo en la ultima iteracion medida o en un checkpoint:
+        // es lo unico que necesita d_out_fp32 (comparacion final de error,
+        // o CSV_DRIFT contra el snapshot FP64 de esta iteracion).
+        const bool write_fp32 = (i + 1 == iters) ||
+                                (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0);
+        CHECK_CUDA(cudaEventRecord(wmma_start[i]));
+        stencil2d_wmma_kernel<T><<<grid, block, shared_bytes>>>(
+            tc_in, d_out_fp32, tc_out, d_identity_pos, d_identity_neg,
+            nx, ny, i + 1, write_fp32, d_first_nf);
+        CHECK_CUDA(cudaEventRecord(wmma_stop[i]));
+        std::swap(tc_in, tc_out);
 
-        // Solo LEE d_out (el acumulador WMMA ya vive en float ahi mismo,
-        // independientemente de si ya se reconvirtio a d_in_tc arriba); no
-        // altera la conversion ni la logica de fragmentos WMMA.
         if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
-            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out,
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out_fp32,
                                   count * sizeof(float), cudaMemcpyDeviceToHost));
             record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
         }
     }
     const float total_ms = timer.stop_and_elapsed_ms();
     CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaMemcpy(out.data(), d_out, count * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
 
-    // NUEVO: el resultado WMMA solo existia en float (d_out). Se reutiliza
-    // el mismo conversor ya usado para la entrada (convert_input_to_tc)
-    // para tambien convertir y almacenar la salida en el tipo reducido:
-    // asi el resultado queda realmente guardado en FP16/BF16, no solo
-    // calculado internamente en float.
-    convert_input_to_tc<T>(d_out, d_out_reduced, count);
-    CHECK_CUDA(cudaDeviceSynchronize());
+    double t_wmma_sum_ms = 0.0;
+    for (int i = 0; i < iters; ++i) {
+        float ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(&ms, wmma_start[i], wmma_stop[i]));
+        t_wmma_sum_ms += ms;
+        CHECK_CUDA(cudaEventDestroy(wmma_start[i]));
+        CHECK_CUDA(cudaEventDestroy(wmma_stop[i]));
+    }
+    // Mismo denominador (iters) que build_metrics usa para total_ms: asi
+    // t_wmma_ms_out + t_conv_ms_out + no_atribuido reproduce exactamente el
+    // t/iter total sin redondeos cruzados entre distintos denominadores.
+    t_wmma_ms_out = t_wmma_sum_ms / iters;
+    t_conv_ms_out = 0.0;
+
+    // El resultado T final ya quedo escrito por el kernel (float_to_tc<T>,
+    // misma funcion que antes aplicaba convert_input_to_tc): tras el ultimo
+    // swap, tc_in apunta al buffer con la salida mas reciente, sin necesidad
+    // de reconvertir por separado.
     out_reduced.resize(count);
-    CHECK_CUDA(cudaMemcpy(out_reduced.data(), d_out_reduced, count * sizeof(T), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(out_reduced.data(), tc_in, count * sizeof(T), cudaMemcpyDeviceToHost));
 
     CHECK_CUDA(cudaFree(d_in_fp32));
-    CHECK_CUDA(cudaFree(d_out));
+    CHECK_CUDA(cudaFree(d_out_fp32));
     CHECK_CUDA(cudaFree(d_in_tc));
-    CHECK_CUDA(cudaFree(d_out_reduced));
+    CHECK_CUDA(cudaFree(d_out_tc));
     CHECK_CUDA(cudaFree(d_identity_pos));
     CHECK_CUDA(cudaFree(d_identity_neg));
     CHECK_CUDA(cudaFree(d_first_nf));
@@ -888,7 +1108,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
 // RUTA evaluada (no de la referencia); se concatena como causa solo cuando
 // la ruta (no la referencia) es la que diverge.
 static void print_error_metrics(const char* label_max, const char* label_l2,
-                                 const ErrorMetrics& e, int first_nf) {
+                                 const char* label_linf, const ErrorMetrics& e, int first_nf) {
     if (!e.reference_finite) {
         std::cout << label_max
                    << "REFERENCIA NO FINITA: la solucion diverguio; "
@@ -905,8 +1125,9 @@ static void print_error_metrics(const char* label_max, const char* label_l2,
         std::cout << "\n";
         return;
     }
-    std::cout << label_max << e.max_abs << "\n";
-    std::cout << label_l2  << e.rel_l2  << "\n";
+    std::cout << label_max  << fmt_sci(e.max_abs)  << "\n";
+    std::cout << label_l2   << fmt_sci(e.rel_l2)   << "\n";
+    std::cout << label_linf << fmt_sci(e.rel_linf) << "\n";
 }
 
 // n == INT_MAX (sentinel de "nunca se marco") se reporta como "ninguna".
@@ -926,14 +1147,122 @@ static void print_reference_comparison(const char* label,
                                        const ErrorMetrics& e_cpu,
                                        int first_nf,
                                        int iters) {
-    std::cout << label << " - tiempo         : " << m.ms << " ms\n";
+    std::cout << label << " - tiempo/iter (media) : " << m.ms << " ms\n";
+    std::cout << label << " - tiempo total        : " << m.ms * iters << " ms\n";
     std::cout << label << " - rendimiento    : " << m.gflops << " GFLOP/s ("
               << m.tflops << " TFLOP/s efectivos)\n";
     std::cout << "Speedup vs CPU             : " << ref_ms / m.ms << "x\n";
-    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", e_fp64, first_nf);
-    print_error_metrics("Error max abs vs CPU FP32  : ", "Error rel L2 vs CPU FP32   : ", e_cpu, first_nf);
+    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ",
+                        "Error rel Linf vs FP64     : ", e_fp64, first_nf);
+    print_error_metrics("Error max abs vs CPU FP32  : ", "Error rel L2 vs CPU FP32   : ",
+                        "Error rel Linf vs CPU FP32 : ", e_cpu, first_nf);
     print_first_nonfinite("Primera iteracion no finita : ", first_nf, iters);
     std::cout << "\n";
+}
+
+// Imprime, una sola vez por corrida, las normas de la referencia FP64: dan
+// escala al error absoluto (Linf/L2 sin normalizar no dicen nada por si
+// solos, ver comentario de ErrorMetrics::rel_linf).
+static void print_fp64_reference_norms(const std::vector<double>& y_ref, int first_nf_fp64_ref) {
+    if (first_nf_fp64_ref != INT_MAX) {
+        std::cout << "Norma ||u^n||_inf (ref FP64) : REFERENCIA NO FINITA\n";
+        std::cout << "Norma ||u^n||_2   (ref FP64) : REFERENCIA NO FINITA\n";
+        return;
+    }
+    double norm_inf = 0.0;
+    double sq = 0.0;
+    for (double x : y_ref) {
+        norm_inf = std::max(norm_inf, std::abs(x));
+        sq += x * x;
+    }
+    std::cout << "Norma ||u^n||_inf (ref FP64) : " << fmt_sci(norm_inf) << "\n";
+    std::cout << "Norma ||u^n||_2   (ref FP64) : " << fmt_sci(std::sqrt(sq)) << "\n";
+}
+
+// Abre el CSV en modo append; escribe la cabecera solo si el archivo aun no
+// existe (probeado antes de abrir en modo append, que no trunca ni crea con
+// contenido previo visible al ifstream).
+static std::ofstream open_csv(const std::string& path) {
+    std::ifstream probe(path);
+    const bool exists = probe.good();
+    probe.close();
+    std::ofstream csv(path, std::ios::app);
+    if (!exists) {
+        csv << "kernel,formato,nx,ny,iters,t_ms_iter,t_ms_total,gflops_utiles,rel_l2,rel_linf,"
+               "linf_abs,ref_linf,n_star,storage_rel_err,t_ms_iter_wmma,t_ms_iter_conv\n";
+    }
+    return csv;
+}
+
+// Una fila por ruta/configuracion. n_star es -1 cuando la ruta se mantuvo
+// finita; storage_rel_err, t_ms_iter_wmma y t_ms_iter_conv son "NA" en
+// cpu_fp32/gpu_fp32 (no aplica: esas rutas no pasan por 16 bits ni separan
+// kernel WMMA de conversion).
+static void write_csv_row(std::ofstream& csv, const std::string& formato, int nx, int ny,
+                          int iters, double t_ms_iter, double gflops, const ErrorMetrics& e,
+                          int first_nf, const std::string& storage_rel_err,
+                          const std::string& t_ms_iter_wmma = "NA",
+                          const std::string& t_ms_iter_conv = "NA") {
+    const int n_star = (first_nf == INT_MAX) ? -1 : first_nf;
+    csv << "stencil," << formato << "," << nx << "," << ny << "," << iters << ","
+        << fmt_sci(t_ms_iter) << "," << fmt_sci(t_ms_iter * iters) << "," << fmt_sci(gflops) << ","
+        << fmt_sci(e.rel_l2) << "," << fmt_sci(e.rel_linf) << "," << fmt_sci(e.max_abs) << ","
+        << fmt_sci(e.ref_linf) << "," << n_star << "," << storage_rel_err << ","
+        << t_ms_iter_wmma << "," << t_ms_iter_conv << "\n";
+}
+
+// Umbral de overflow por formato (maximo valor finito representable), solo
+// para la PREDICCION del horizonte. FP32/FP64 salen de std::numeric_limits;
+// FP16/BF16 se dejan explicitos porque numeric_limits<__half/__nv_bfloat16>
+// no esta garantizado en compilacion host. BF16 comparte los 8 bits de
+// exponente de FP32 (mismo rango, distinta mantisa), por eso su umbral es
+// del mismo orden que el de FP32.
+constexpr double kFp16Max = 65504.0;
+constexpr double kBf16Max = 3.38953139e38;
+
+// Proyecta la condicion inicial u^0 (sin modificarla) sobre el modo de
+// Nyquist (pi,pi): a_nyq = |<u^0, e_nyq>| / N, con e_nyq(i,j) = (-1)^(i+j).
+// El operador discreto 0.25*(up+down+left+right)-center tiene simbolo
+// 0.5*(cos(tx)+cos(ty)) - 1, que en (tx,ty)=(pi,pi) vale exactamente -2
+// (|lambda|=2, propiedad del operador, no un parametro ajustable): bajo esa
+// condicion inicial la componente Nyquist crece como a_nyq * 2^n hasta
+// desbordar el formato en n* = log2(fmt_max / a_nyq). Se calcula en FP64,
+// una sola vez, antes de cualquier region cronometrada.
+static double compute_nyquist_component(const std::vector<float>& u0, int nx, int ny) {
+    double a_nyq = 0.0;
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            a_nyq += static_cast<double>(u0[idx2d(i, j, nx)]) * (((i + j) & 1) ? -1.0 : 1.0);
+        }
+    }
+    return std::fabs(a_nyq) / (static_cast<double>(nx) * static_cast<double>(ny));
+}
+
+static std::string fmt_horizon_row(const char* label, double predicted, int measured_n) {
+    // measured_n == INT_MAX (nunca diverguio, o la ruta ni se corrio): -1,
+    // mismo centinela que n_star en el CSV.
+    const int shown = (measured_n == INT_MAX) ? -1 : measured_n;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "  %-5s : %6.1f / %4d\n", label, predicted, shown);
+    return buf;
+}
+
+// Predicho (a partir de a_nyq, calculado antes de correr nada) vs medido
+// (primera iteracion no finita de cada ruta, INT_MAX si nunca diverguio).
+static void print_overflow_horizon(double a_nyq, int n_fp16, int n_bf16, int n_gpu_fp32, int n_fp64) {
+    const double pred_fp16 = std::log2(kFp16Max / a_nyq);
+    const double pred_bf16 = std::log2(kBf16Max / a_nyq);
+    const double pred_fp32 = std::log2(static_cast<double>(std::numeric_limits<float>::max()) / a_nyq);
+    const double pred_fp64 = std::log2(std::numeric_limits<double>::max() / a_nyq);
+
+    std::cout << "=========== HORIZONTE DE OVERFLOW (Fase 3) ===========\n";
+    std::cout << "Horizonte de overflow (predicho / medido)\n";
+    std::cout << fmt_horizon_row("FP16", pred_fp16, n_fp16);
+    std::cout << fmt_horizon_row("BF16", pred_bf16, n_bf16);
+    std::cout << fmt_horizon_row("FP32", pred_fp32, n_gpu_fp32);
+    std::cout << fmt_horizon_row("FP64", pred_fp64, n_fp64);
+    std::cout << "  Componente Nyquist de u^0 : " << fmt_sci(a_nyq) << "\n";
+    std::cout << "=======================================================\n\n";
 }
 
 static void print_configuration(const Options& opt) {
@@ -946,7 +1275,6 @@ static void print_configuration(const Options& opt) {
     std::cout << "Iteraciones                : " << opt.iters << "\n";
     std::cout << "Tile Tensor Core           : 16x16 con WMMA\n";
     std::cout << "Acumulacion TC             : FP32\n";
-    std::cout << "Horizonte teorico de overflow      : FP16~16  BF16~128  FP32~128  FP64~1024\n";
     std::cout << "===================================================\n\n";
 }
 
@@ -959,14 +1287,76 @@ static const char* tc_mode_to_string(TensorCoreMode mode) {
     return "both";
 }
 
+// Metricas y regex deben coincidir con NCU_QUICK_METRICS / NCU_KERNEL_REGEX_WMMA
+// en Fase_2/common_ncu.sh y run_stencil_tc.sbatch (antes este hint mostraba solo
+// 2 metricas mientras la corrida real usa las 12 de NCU_QUICK_METRICS).
+// --launch-skip se deriva de kWarmupIters (no un literal) para no desincronizarse.
 static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters,
                               TensorCoreMode tc_mode) {
-    std::cout << "Validacion Nsight Compute:\n";
+    std::cout << "Validacion Nsight Compute (coincide con NCU_QUICK_METRICS):\n";
     std::cout << "  ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \\\n";
-    std::cout << "      --metrics sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed,"
-              << "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \\\n";
+    std::cout << "      --launch-skip " << kWarmupIters << " --launch-count 1 \\\n";
+    std::cout << "      --metrics sm__inst_executed_pipe_tensor_op_hmma.sum,"
+                 "sm__inst_executed_pipe_tensor_op_hmma_type_hfma2.sum,"
+                 "sm__ops_path_tensor_src_fp16_dst_fp32.sum,"
+                 "sm__ops_path_tensor_src_bf16_dst_fp32.sum,"
+                 "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,"
+                 "sm__warps_active.avg.pct_of_peak_sustained_active,"
+                 "sm__throughput.avg.pct_of_peak_sustained_elapsed,"
+                 "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,"
+                 "dram__bytes_read.sum,dram__bytes_write.sum,"
+                 "l1tex__t_sector_hit_rate.pct,"
+                 "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct \\\n";
     std::cout << "      " << exe_name << " --nx " << nx << " --ny " << ny
-              << " --iters " << iters << " --tc " << tc_mode_to_string(tc_mode) << "\n";
+              << " --iters " << iters << " --tc " << tc_mode_to_string(tc_mode)
+              << " --profile-only\n";
+}
+
+// Modo --profile-only: los ~1723 s de pared por llamada a ncu eran, sobre
+// todo, la aplicacion recalculando la referencia CPU FP32 (~742s) y la FP64
+// encadenada (~900s) ANTES de llegar al kernel bajo perfil (que en si tarda
+// segundos con --launch-skip/--launch-count). Aqui se omiten ambas
+// referencias y todo el calculo/impresion de metricas de error, conservando
+// condicion inicial, warm-up (kWarmupIters) y el bucle de iters con el mismo
+// ping-pong que benchmark_gpu_fp32_stencil / benchmark_gpu_tensor_core_stencil
+// usan en la corrida completa (sin --profile-only). GPU FP32 clasico se
+// mantiene (no es un "reference": es la ruta que perfila stencil2d_fp32_kernel).
+static void run_profile_only(const Options& opt) {
+    std::cout << "*** MODO --profile-only: sin referencia CPU FP32 ni FP64 encadenada,"
+                 " sin metricas de error. GPU FP32 clasico + TC "
+              << tc_mode_to_string(opt.tc_mode) << " ***\n\n";
+
+    const size_t count = static_cast<size_t>(opt.nx) * static_cast<size_t>(opt.ny);
+    std::vector<float> input(count);
+    initialize_grid(input, opt.nx, opt.ny);
+
+    const std::vector<std::vector<double>> no_checkpoints;
+    const CheckpointContext ckpt{0, no_checkpoints};
+
+    std::vector<float> y_gpu(count, 0.0f);
+    int onset_gpu_fp32 = -1;
+    int first_nf_gpu_fp32 = INT_MAX;
+    benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters,
+                               ckpt, "GPU_FP32", onset_gpu_fp32, first_nf_gpu_fp32);
+
+    double t_wmma_ms_unused = 0.0, t_conv_ms_unused = 0.0;
+    if (opt.tc_mode == TensorCoreMode::FP16) {
+        std::vector<float> y_tc_fp16(count, 0.0f);
+        std::vector<__half> y_tc_fp16_reduced;
+        int onset_fp16 = -1;
+        int first_nf_fp16 = INT_MAX;
+        benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
+                                                  opt.iters, ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16,
+                                                  t_wmma_ms_unused, t_conv_ms_unused);
+    } else {
+        std::vector<float> y_tc_bf16(count, 0.0f);
+        std::vector<__nv_bfloat16> y_tc_bf16_reduced;
+        int onset_bf16 = -1;
+        int first_nf_bf16 = INT_MAX;
+        benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
+                                                         opt.iters, ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16,
+                                                         t_wmma_ms_unused, t_conv_ms_unused);
+    }
 }
 
 static void run_benchmark(const Options& opt, const char* exe_name) {
@@ -980,6 +1370,26 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         !device_supports_bf16_tensor_cores()) {
         std::cerr << "BF16 Tensor Core requiere arquitectura Ampere o superior (SM >= 80).\n";
         std::exit(EXIT_FAILURE);
+    }
+
+    if (opt.profile_only) {
+        run_profile_only(opt);
+        return;
+    }
+
+    // NCU_PROFILING lo exporta run_stencil_tc.sbatch (via common_ncu.sh)
+    // unicamente al invocar ncu: los tiempos bajo perfilado quedan inflados
+    // (ver contexto: 22.96 ms FP16 bajo ncu vs 15.90 ms limpio) y no deben
+    // confundirse con una corrida normal.
+    const bool under_ncu = std::getenv("NCU_PROFILING") != nullptr;
+    if (under_ncu) {
+        std::cout << "\n*** CORRIDA BAJO NSIGHT COMPUTE — TIEMPOS NO VALIDOS ***\n";
+    }
+
+    std::ofstream csv;
+    const bool csv_enabled = !opt.csv_path.empty();
+    if (csv_enabled) {
+        csv = open_csv(opt.csv_path);
     }
 
     // Fijado aqui (y no justo antes de "RESULTADOS...", como antes) para que
@@ -998,6 +1408,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     std::vector<__nv_bfloat16> y_tc_bf16_reduced;
 
     initialize_grid(input, opt.nx, opt.ny);
+
+    // Prediccion del horizonte de overflow (ver comentario de la funcion):
+    // se mide la condicion inicial ya generada, no se la modifica; corre
+    // antes de cualquier CudaEventTimer/std::chrono de las rutas medidas.
+    const double a_nyq = compute_nyquist_component(input, opt.nx, opt.ny);
 
     // Referencia FP64 (ground truth): opt.iters aplicaciones encadenadas del
     // stencil en double sobre una copia en double del mismo input, mismo
@@ -1043,16 +1458,27 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     std::cout << "=========== RESULTADOS STENCIL 2D FASE 3 ===========\n";
     print_first_nonfinite("Primera iteracion no finita (ref FP64)     : ", first_nf_fp64_ref, opt.iters);
+    print_fp64_reference_norms(y_ref, first_nf_fp64_ref);
     std::cout << "\n";
-    std::cout << "CPU FP32 serial - tiempo   : " << cpu.ms << " ms\n";
+    std::cout << "CPU FP32 serial - tiempo/iter (media) : " << cpu.ms << " ms\n";
+    std::cout << "CPU FP32 serial - tiempo total        : " << cpu.ms * opt.iters << " ms\n";
     std::cout << "CPU FP32 serial - rend.    : " << cpu.gflops << " GFLOP/s ("
               << cpu.tflops << " TFLOP/s efectivos)\n";
-    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ", cpu_err, first_nf_cpu);
+    print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ",
+                        "Error rel Linf vs FP64     : ", cpu_err, first_nf_cpu);
     print_first_nonfinite("Primera iteracion no finita : ", first_nf_cpu, opt.iters);
     std::cout << "\n";
+    if (csv_enabled) {
+        write_csv_row(csv, under_ncu ? "NCU_cpu_fp32" : "cpu_fp32", opt.nx, opt.ny, opt.iters,
+                     cpu.ms, cpu.gflops, cpu_err, first_nf_cpu, "NA");
+    }
 
     print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err,
                                first_nf_gpu_fp32, opt.iters);
+    if (csv_enabled) {
+        write_csv_row(csv, under_ncu ? "NCU_gpu_fp32" : "gpu_fp32", opt.nx, opt.ny, opt.iters,
+                     gpu.ms, gpu.gflops, gpu_err, first_nf_gpu_fp32, "NA");
+    }
 
     bool ran_fp16 = false;
     bool ran_bf16 = false;
@@ -1063,45 +1489,87 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     if (opt.tc_mode == TensorCoreMode::FP16 || opt.tc_mode == TensorCoreMode::Both) {
         ran_fp16 = true;
+        double t_wmma_ms_fp16 = 0.0, t_conv_ms_fp16 = 0.0;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters,
-            ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16);
+            ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
         const ErrorMetrics tc_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_fp16);
-        const double fp16_storage_err = storage_roundtrip_max_abs<__half>(y_tc_fp16, y_tc_fp16_reduced);
+        const double fp16_storage_rel = storage_roundtrip_rel_err<__half>(y_tc_fp16, y_tc_fp16_reduced);
+        // Sin instrumentar por separado el lector asume que el cuello de
+        // botella es el Tensor Core; en realidad convert_float_to_half_kernel
+        // (reconversion de d_out a T en cada iteracion) explica buena parte
+        // del t/iter total. no_atribuido cubre overhead de lanzamiento
+        // (1048576 bloques) no capturado por ninguno de los dos eventos.
+        const double t_unattrib_fp16 = tc_fp16.ms - t_wmma_ms_fp16 - t_conv_ms_fp16;
 
-        std::cout << "GPU WMMA FP16 Tensor Core - tiempo : " << tc_fp16.ms << " ms\n";
+        std::cout << "GPU WMMA FP16 Tensor Core - tiempo/iter (media) : " << tc_fp16.ms << " ms\n";
+        std::cout << "GPU WMMA FP16 Tensor Core - tiempo total        : " << tc_fp16.ms * opt.iters << " ms\n";
         std::cout << "GPU WMMA FP16 Tensor Core - rend.  : " << tc_fp16.gflops
                   << " GFLOP/s (" << tc_fp16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC FP16 vs CPU             : " << cpu.ms / tc_fp16.ms << "x\n";
         std::cout << "Speedup TC FP16 vs GPU FP32        : " << gpu.ms / tc_fp16.ms << "x\n";
-        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_fp16_err, first_nf_fp16);
-        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_fp16_vs_cpu_err, first_nf_fp16);
+        std::cout << "t kernel WMMA/iter  : " << t_wmma_ms_fp16 << " ms ("
+                  << fmt_pct1(100.0 * t_wmma_ms_fp16 / tc_fp16.ms) << " %)\n";
+        std::cout << "t conversion/iter   : " << t_conv_ms_fp16 << " ms ("
+                  << fmt_pct1(100.0 * t_conv_ms_fp16 / tc_fp16.ms) << " %)\n";
+        std::cout << "t no atribuido/iter : " << t_unattrib_fp16 << " ms ("
+                  << fmt_pct1(100.0 * t_unattrib_fp16 / tc_fp16.ms) << " %)\n";
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
+                            "Error rel Linf vs FP64             : ", tc_fp16_err, first_nf_fp16);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
+                            "Error rel Linf vs CPU FP32         : ", tc_fp16_vs_cpu_err, first_nf_fp16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_fp16, opt.iters);
-        std::cout << "Error por guardar en FP16 (16 bits): " << fp16_storage_err << "\n\n";
+        std::cout << "Error relativo por guardar en FP16 (16 bits): " << fmt_sci(fp16_storage_rel) << "\n\n";
+        if (csv_enabled) {
+            write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.nx, opt.ny, opt.iters,
+                         tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16, fmt_sci(fp16_storage_rel),
+                         fmt_sci(t_wmma_ms_fp16), fmt_sci(t_conv_ms_fp16));
+        }
     }
 
     if (opt.tc_mode == TensorCoreMode::BF16 || opt.tc_mode == TensorCoreMode::Both) {
         ran_bf16 = true;
+        double t_wmma_ms_bf16 = 0.0, t_conv_ms_bf16 = 0.0;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters,
-            ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16);
+            ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
         const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
-        const double bf16_storage_err = storage_roundtrip_max_abs<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced);
+        const double bf16_storage_rel = storage_roundtrip_rel_err<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced);
+        // Ver comentario analogo en el bloque FP16: sin este desglose el
+        // 2.3x de t/iter frente a GPU FP32 clasico se le atribuiria por
+        // error al Tensor Core en vez de a convert_float_to_bfloat16_kernel.
+        const double t_unattrib_bf16 = tc_bf16.ms - t_wmma_ms_bf16 - t_conv_ms_bf16;
 
-        std::cout << "GPU WMMA BF16 Tensor Core - tiempo : " << tc_bf16.ms << " ms\n";
+        std::cout << "GPU WMMA BF16 Tensor Core - tiempo/iter (media) : " << tc_bf16.ms << " ms\n";
+        std::cout << "GPU WMMA BF16 Tensor Core - tiempo total        : " << tc_bf16.ms * opt.iters << " ms\n";
         std::cout << "GPU WMMA BF16 Tensor Core - rend.  : " << tc_bf16.gflops
                   << " GFLOP/s (" << tc_bf16.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Speedup TC BF16 vs CPU             : " << cpu.ms / tc_bf16.ms << "x\n";
         std::cout << "Speedup TC BF16 vs GPU FP32        : " << gpu.ms / tc_bf16.ms << "x\n";
-        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ", tc_bf16_err, first_nf_bf16);
-        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ", tc_bf16_vs_cpu_err, first_nf_bf16);
+        std::cout << "t kernel WMMA/iter  : " << t_wmma_ms_bf16 << " ms ("
+                  << fmt_pct1(100.0 * t_wmma_ms_bf16 / tc_bf16.ms) << " %)\n";
+        std::cout << "t conversion/iter   : " << t_conv_ms_bf16 << " ms ("
+                  << fmt_pct1(100.0 * t_conv_ms_bf16 / tc_bf16.ms) << " %)\n";
+        std::cout << "t no atribuido/iter : " << t_unattrib_bf16 << " ms ("
+                  << fmt_pct1(100.0 * t_unattrib_bf16 / tc_bf16.ms) << " %)\n";
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
+                            "Error rel Linf vs FP64             : ", tc_bf16_err, first_nf_bf16);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
+                            "Error rel Linf vs CPU FP32         : ", tc_bf16_vs_cpu_err, first_nf_bf16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_bf16, opt.iters);
-        std::cout << "Error por guardar en BF16 (16 bits): " << bf16_storage_err << "\n\n";
+        std::cout << "Error relativo por guardar en BF16 (16 bits): " << fmt_sci(bf16_storage_rel) << "\n\n";
+        if (csv_enabled) {
+            write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.nx, opt.ny, opt.iters,
+                         tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16, fmt_sci(bf16_storage_rel),
+                         fmt_sci(t_wmma_ms_bf16), fmt_sci(t_conv_ms_bf16));
+        }
     }
 
     std::cout << "====================================================\n\n";
+
+    print_overflow_horizon(a_nyq, first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
 
     if (opt.checkpoint_every > 0) {
         std::cout << "=========== RESUMEN ONSET DE DIVERGENCIA ===========\n";

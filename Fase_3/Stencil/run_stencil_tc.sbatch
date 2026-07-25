@@ -35,20 +35,30 @@ else
     RUN_NCU="${RUN_NCU:-1}"
 fi
 NCU_SET="${NCU_SET:-full}"
-# El kernel WMMA es un template sobre T (__half / __nv_bfloat16); ncu filtra por
-# nombre demangled, asi que este regex cubre ambas instanciaciones:
-#   (anonymous namespace)::stencil2d_wmma_kernel<__half>(...)
-#   (anonymous namespace)::stencil2d_wmma_kernel<__nv_bfloat16>(...)
-NCU_KERNEL_REGEX="${NCU_KERNEL_REGEX:-.*stencil2d_wmma_kernel.*}"
-# Debe coincidir con kWarmupIters en stencil_tensor_activation.cu (Fase_3/Stencil).
-NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-3}"
+# Se perfilan tres kernels en invocaciones ncu SEPARADAS (un regex cada una):
+# el WMMA (template sobre T = __half / __nv_bfloat16; ncu filtra por nombre
+# demangled, asi que el regex cubre ambas instanciaciones), el GPU FP32
+# clasico y las conversiones float<->16 bits que corren dentro de la ruta WMMA.
+NCU_KERNEL_REGEX_WMMA="${NCU_KERNEL_REGEX_WMMA:-.*stencil2d_wmma_kernel.*}"
+NCU_KERNEL_REGEX_FP32="${NCU_KERNEL_REGEX_FP32:-.*stencil2d_fp32_kernel.*}"
+NCU_KERNEL_REGEX_CONVERT="${NCU_KERNEL_REGEX_CONVERT:-.*convert_float_to_(half|bfloat16)_kernel.*}"
+# Debe coincidir con kWarmupIters en stencil_tensor_activation.cu (Fase_3/Stencil);
+# se deriva del propio fuente en vez de repetir el literal para que ambos no
+# puedan desincronizarse si kWarmupIters cambia.
+KWARMUP_ITERS_CU="$(grep -m1 'kWarmupIters *=' stencil_tensor_activation.cu | grep -oE '[0-9]+' | head -n1)"
+NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-${KWARMUP_ITERS_CU}}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
-# Barrido de iteraciones (Fase 3, horizonte de overflow): 10..120 caen dentro
-# del horizonte de FP32/BF16 (produce L2/Linf finitas); 200 se conserva para
-# documentar el colapso por desbordamiento de exponente (ver stencil_tensor_activation.cu).
-ITERS_LIST="${ITERS_LIST:-10 50 100 120 200}"
+# Barrido de METRICAS (16384^2): 10..120 caen dentro del horizonte de
+# FP32/BF16/FP16 (produce L2/Linf finitas). Se elimino 200: a este tamano
+# divergen las tres rutas GPU (n* FP32~142, BF16~138, FP16~28) y toda la
+# corrida sale "REFERENCIA NO FINITA" sin ningun dato comparable -- era la
+# corrida mas cara del job sin aportar nada. El horizonte de divergencia en
+# si (donde SI importa iters grande) se mide aparte, a 4096^2, en
+# run_stencil_horizon.sbatch.
+ITERS_LIST="${ITERS_LIST:-10 50 100 120}"
 # Restriccion de tiempo: NCU solo se corre para un valor de ITERS de la lista,
-# no para todos -- mantiene el numero de reportes NCU en 2 (fp16 y bf16).
+# no para todos -- mantiene el numero de reportes NCU en 5 por corrida (WMMA
+# fp16/bf16, conversion fp16/bf16, FP32 clasico una sola vez).
 ITERS_NCU="${ITERS_NCU:-100}"
 
 # Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
@@ -84,6 +94,7 @@ nvidia-smi || true
 echo "Compilando stencil_tc (Fase_3/Stencil, incluye Fase_2/common.cuh por ruta relativa)..."
 "${NVCC}" -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
+    -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
     --allow-unsupported-compiler
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
@@ -129,13 +140,37 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
     )
 else
     # Dimensiones de referencia del proyecto (mismas del hint Nsight en el .cu),
-    # barridas sobre ITERS_LIST para cubrir tanto la ventana finita (10..120)
-    # como el colapso documentado en iters=200.
+    # barridas sobre ITERS_LIST dentro de la ventana finita (10..120): todas
+    # las metricas (L2/Linf/gflops/etc.) quedan comparables entre corridas.
     declare -a RUNS=()
     for ITERS_VAL in ${ITERS_LIST}; do
         RUNS+=("16384 16384 ${ITERS_VAL} both")
     done
 fi
+
+# Perfila UN solo kernel (regex + tc_type que lo activa) con --profile-only en
+# el binario: evita recalcular la referencia CPU FP32 (~742s) y la FP64
+# encadenada (~900s) antes de llegar al kernel bajo perfil (~1723s de pared
+# por llamada a ncu antes de este cambio). Usa NX/NY/ITERS/NCU_CAPTURE_ARGS
+# del ambito que la invoca (bucle principal, mas abajo).
+ncu_profile_kernel() {
+    local label="$1" regex="$2" tc_type="$3" report_tag="$4"
+    local report="logs/ncu_${report_tag}_nx${NX}_ny${NY}_job${SLURM_JOB_ID:-manual}"
+    echo
+    echo "Perfilando ${label} con Nsight Compute (NCU_MODE=${NCU_MODE})..."
+    echo "Reporte: ${report}.ncu-rep"
+    # `time` (y stderr de ncu) se redirigen al .out para correlacionar
+    # duracion vs #SBATCH --time en corridas con --set full.
+    { time ncu_run "${NCU}" "${NCU_CAPTURE_ARGS[@]}" \
+        --target-processes all \
+        --kernel-name "regex:${regex}" \
+        --launch-skip "${NCU_LAUNCH_SKIP}" \
+        --launch-count "${NCU_LAUNCH_COUNT}" \
+        --export "${report}" \
+        --force-overwrite \
+        ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${tc_type}" \
+            --profile-only; } 2>&1
+}
 
 for run in "${RUNS[@]}"; do
     read -r NX NY ITERS TC <<< "${run}"
@@ -151,6 +186,8 @@ for run in "${RUNS[@]}"; do
         # de forma global, un solo pase de ncu con skip=3 solo capturaria la
         # instanciacion FP16. Se perfila cada tipo por separado (--tc fp16 /
         # --tc bf16): un reporte por precision con skip/count deterministas.
+        # --profile-only exige --tc fp16|bf16 (nunca both), asi que este split
+        # ya es obligatorio, no solo una optimizacion de --launch-skip.
         if [[ "${TC}" == "both" ]]; then
             NCU_TC_TYPES=(fp16 bf16)
         else
@@ -161,21 +198,19 @@ for run in "${RUNS[@]}"; do
         else
             NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
         fi
+
+        # GPU FP32 clasico no depende de la precision TC: perfilarlo una vez
+        # por corrida (no por TC_TYPE) evita duplicar tiempo de pared sin
+        # informacion nueva. El valor de --tc que se le pasa es irrelevante
+        # para ese kernel; se usa el primero de NCU_TC_TYPES.
+        ncu_profile_kernel "GPU FP32 clasico" "${NCU_KERNEL_REGEX_FP32}" \
+            "${NCU_TC_TYPES[0]}" "fp32_stencil"
+
         for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
-            REPORT="logs/ncu_wmma_stencil_nx${NX}_ny${NY}_${TC_TYPE}_job${SLURM_JOB_ID:-manual}"
-            echo
-            echo "Perfilando WMMA ${TC_TYPE} con Nsight Compute (NCU_MODE=${NCU_MODE})..."
-            echo "Reporte: ${REPORT}.ncu-rep"
-            # `time` (y stderr de ncu) se redirigen al .out para correlacionar
-            # duracion vs #SBATCH --time en corridas con --set full.
-            { time "${NCU}" "${NCU_CAPTURE_ARGS[@]}" \
-                --target-processes all \
-                --kernel-name "regex:${NCU_KERNEL_REGEX}" \
-                --launch-skip "${NCU_LAUNCH_SKIP}" \
-                --launch-count "${NCU_LAUNCH_COUNT}" \
-                --export "${REPORT}" \
-                --force-overwrite \
-                ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC_TYPE}"; } 2>&1
+            ncu_profile_kernel "WMMA ${TC_TYPE}" "${NCU_KERNEL_REGEX_WMMA}" \
+                "${TC_TYPE}" "wmma_stencil_${TC_TYPE}"
+            ncu_profile_kernel "conversion ${TC_TYPE}" "${NCU_KERNEL_REGEX_CONVERT}" \
+                "${TC_TYPE}" "convert_${TC_TYPE}"
         done
     fi
 done

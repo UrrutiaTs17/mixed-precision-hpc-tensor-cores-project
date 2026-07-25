@@ -111,6 +111,11 @@ struct ErrorMetrics {
     // los dejan en su valor por defecto (0.0), pues ningun llamador actual los usa.
     double l2_abs      = 0.0;
     double ref_l2_norm = 0.0;
+    // NUEVO (Fase 3, error relativo en norma infinito): ref_linf es ||ref||_inf
+    // (max abs sobre los mismos elementos que contribuyen a max_abs/sq_ref);
+    // rel_linf = max_abs / ref_linf, el analogo en L-infinito de rel_l2.
+    double ref_linf = 0.0;
+    double rel_linf = 0.0;
     bool   reference_finite = true;  // false si algun valor de la referencia no es finito
     bool   solution_finite  = true;  // false si algun valor de la solucion no es finito
 };
@@ -124,6 +129,7 @@ static ErrorMetrics compare_fp64_ref_vs_fp32(const std::vector<double>& ref_fp64
     ErrorMetrics out;
     double sq_err = 0.0;
     double sq_ref = 0.0;
+    double ref_linf = 0.0;
     for (size_t i = 0; i < ref_fp64.size(); ++i) {
         const double r = ref_fp64[i];
         const double t = static_cast<double>(test_fp32[i]);
@@ -133,11 +139,14 @@ static ErrorMetrics compare_fp64_ref_vs_fp32(const std::vector<double>& ref_fp64
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
         sq_ref += r * r;
+        ref_linf = std::max(ref_linf, std::abs(r));
     }
     out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
                  ? std::sqrt(sq_err / sq_ref) : 0.0;
     out.l2_abs = (out.reference_finite && std::isfinite(sq_err)) ? std::sqrt(sq_err) : 0.0;
     out.ref_l2_norm = (out.reference_finite && std::isfinite(sq_ref)) ? std::sqrt(sq_ref) : 0.0;
+    out.ref_linf = (out.reference_finite && std::isfinite(ref_linf)) ? ref_linf : 0.0;
+    out.rel_linf = (out.reference_finite && out.ref_linf > 0.0) ? out.max_abs / out.ref_linf : 0.0;
     return out;
 }
 
@@ -148,6 +157,7 @@ static ErrorMetrics compare_float_vectors(const std::vector<float>& ref,
     ErrorMetrics out;
     double sq_err = 0.0;
     double sq_ref = 0.0;
+    double ref_linf = 0.0;
     for (size_t i = 0; i < ref.size(); ++i) {
         const double r = static_cast<double>(ref[i]);
         const double t = static_cast<double>(test[i]);
@@ -157,9 +167,12 @@ static ErrorMetrics compare_float_vectors(const std::vector<float>& ref,
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
         sq_ref += r * r;
+        ref_linf = std::max(ref_linf, std::abs(r));
     }
     out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
                  ? std::sqrt(sq_err / sq_ref) : 0.0;
+    out.ref_linf = (out.reference_finite && std::isfinite(ref_linf)) ? ref_linf : 0.0;
+    out.rel_linf = (out.reference_finite && out.ref_linf > 0.0) ? out.max_abs / out.ref_linf : 0.0;
     return out;
 }
 
@@ -169,6 +182,7 @@ static ErrorMetrics compare_double_vectors(const std::vector<double>& ref,
     ErrorMetrics out;
     double sq_err = 0.0;
     double sq_ref = 0.0;
+    double ref_linf = 0.0;
     for (size_t i = 0; i < ref.size(); ++i) {
         const double r = ref[i];
         const double t = test[i];
@@ -178,8 +192,11 @@ static ErrorMetrics compare_double_vectors(const std::vector<double>& ref,
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
         sq_ref += r * r;
+        ref_linf = std::max(ref_linf, std::abs(r));
     }
     out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
                  ? std::sqrt(sq_err / sq_ref) : 0.0;
+    out.ref_linf = (out.reference_finite && std::isfinite(ref_linf)) ? ref_linf : 0.0;
+    out.rel_linf = (out.reference_finite && out.ref_linf > 0.0) ? out.max_abs / out.ref_linf : 0.0;
     return out;
 }
