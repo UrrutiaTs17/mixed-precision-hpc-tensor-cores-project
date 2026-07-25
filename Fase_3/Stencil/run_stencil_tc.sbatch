@@ -56,6 +56,16 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 # si (donde SI importa iters grande) se mide aparte, a 4096^2, en
 # run_stencil_horizon.sbatch.
 ITERS_LIST="${ITERS_LIST:-10 50 100 120}"
+# Necesario para que storage_rel (error relativo de guardar en FP16/BF16) sea
+# evaluable en las corridas donde la ruta diverge antes de ITERS (p.ej. FP16
+# con n*~28 en corridas con ITERS>28): sin --checkpoint-every, stencil_tc solo
+# puede capturar un estado FP32 finito en la ULTIMA iteracion medida, y si esa
+# iteracion ya diverguio no hay forma de recuperar un estado finito posterior
+# al hecho (ver comentario storage_rel_eval_iter en
+# benchmark_gpu_tensor_core_stencil, stencil_tensor_activation.cu). 5 deja
+# checkpoints en 5,10,15,20,25,... -- el ultimo antes de n*~28 (FP16, el
+# formato que diverge mas temprano) cae en 25, bien dentro del rango finito.
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 # Restriccion de tiempo: NCU solo se corre para un valor de ITERS de la lista,
 # no para todos -- mantiene el numero de reportes NCU en 5 por corrida (WMMA
 # fp16/bf16, conversion fp16/bf16, FP32 clasico una sola vez).
@@ -178,7 +188,8 @@ for run in "${RUNS[@]}"; do
     echo "============================================================"
     echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}"
     echo "============================================================"
-    ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}"
+    ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
+        --checkpoint-every "${CHECKPOINT_EVERY}"
 
     if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
         # Con --tc both el binario lanza primero todos los kernels FP16 y luego

@@ -121,7 +121,11 @@ static void print_usage(const char* prog) {
         << "  --checkpoint-every K (K entero > 0) mide drift numerico: cada K\n"
         << "  iteraciones, cada ruta se compara contra un snapshot FP64 de esa misma\n"
         << "  iteracion y se emiten filas CSV_DRIFT/CSV_ONSET por stdout. K=0 o ausente\n"
-        << "  (por defecto) no activa checkpoints, comportamiento identico al previo.\n\n"
+        << "  (por defecto) no activa checkpoints, comportamiento identico al previo.\n"
+        << "  Tambien es la UNICA forma de que storage_rel (error relativo de guardar\n"
+        << "  en FP16/BF16) sea evaluable cuando una ruta diverge antes de --iters: sin\n"
+        << "  checkpoints, si la ruta diverge, storage_rel se reporta como \"NO EVALUABLE\"\n"
+        << "  (no hay estado intermedio finito que se pueda recuperar despues del hecho).\n\n"
         << "  --csv RUTA agrega una fila por ruta/configuracion a RUTA (cabecera solo\n"
         << "  si el archivo no existe). Ausente (por defecto) no escribe CSV.\n\n"
         << "  --profile-only ejecuta solo GPU FP32 clasico + la ruta TC de --tc (no\n"
@@ -382,6 +386,11 @@ static bool all_finite_fp64(const std::vector<double>& v) {
 // (referencia finita), sin necesidad de un escaneo posterior sobre todos
 // los snapshots guardados. checkpoint_every <= 0 preserva el comportamiento
 // original: checkpoints queda vacio, sin copias ni memoria adicional.
+//
+// linf_per_iter retorna ||u^n||_inf para cada iteracion n=1..iters (usada
+// para calibrar el horizonte de overflow desde el patron FP64, no desde la
+// proyeccion Nyquist). Se llena siempre (incluso sin checkpoints), hasta que
+// la referencia diverga.
 static void compute_cpu_stencil_fp64(const std::vector<double>& in,
                                      std::vector<double>& out,
                                      int nx,
@@ -389,6 +398,7 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
                                      int iters,
                                      int checkpoint_every,
                                      std::vector<std::vector<double>>& checkpoints,
+                                     std::vector<double>& linf_per_iter,
                                      int& first_nonfinite_iter) {
     auto apply = [&](const std::vector<double>& src, std::vector<double>& dst) {
         for (int y = 0; y < ny; ++y) {
@@ -413,6 +423,7 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
     std::vector<double>* src = &buf_a;
     std::vector<double>* dst = &buf_b;
     checkpoints.clear();
+    linf_per_iter.clear();
     bool reference_diverged = false;
     first_nonfinite_iter = INT_MAX;
     for (int i = 0; i < iters; ++i) {
@@ -420,6 +431,24 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
         std::swap(src, dst);
 
         const int iter_number = i + 1;
+
+        // Computa ||u^n||_inf: util para calibrar horizon de overflow desde
+        // el patron FP64 (ver compute_overflow_horizon_from_reference). Se
+        // agrega mientras la referencia sea finita; una vez que diverge se
+        // detiene para evitar NaN/inf en el vector.
+        double linf = 0.0;
+        bool src_finite = true;
+        for (const auto& x : *src) {
+            if (!std::isfinite(x)) {
+                src_finite = false;
+                break;
+            }
+            linf = std::max(linf, std::fabs(x));
+        }
+        if (src_finite) {
+            linf_per_iter.push_back(linf);
+        }
+
         if (first_nonfinite_iter == INT_MAX && !all_finite_fp64(*src)) {
             first_nonfinite_iter = iter_number;
         }
@@ -891,27 +920,34 @@ static inline float host_val_to_float(__nv_bfloat16 v) { return __bfloat162float
 
 // Mide cuanto se pierde SOLO por el hecho de guardar el resultado WMMA
 // (que internamente ya vive en float, via el acumulador de Tensor Cores)
-// en 16 bits, normalizado por ||computed||_inf (el error absoluto escala con
-// la solucion: 7.81e-3 @10, 7.52e9 @50, 4.84e24 @100 para BF16). Siempre se
-// evalua sobre el mismo conjunto de indices (los finitos de "computed"), haya
-// divergido la ruta o no: antes, std::max(acc, NaN) descartaba en silencio
-// las celdas ya no finitas, por lo que a iters=200 (con casi todo el campo
-// no finito) el maximo quedaba tomado solo sobre el borde y daba un valor
-// pequeno inconsistente con iters=100.
+// en 16 bits, normalizado por ||computed||_inf:
+//   storage_rel = max_i |x_i - float(T(x_i))| / ||x||_inf
+// Siempre se evalua sobre la ULTIMA ITERACION FINITA de computed (incluso
+// si la ruta divergio despues), garantizando que todos los valores sean
+// finitos y la normalizacion sea representativa.
+struct StorageRelResult {
+    double rel_err = 0.0;
+    int eval_iter = 0;  // iter en que se evaluo (util para anotar)
+};
+
 template <typename T>
-static double storage_roundtrip_rel_err(const std::vector<float>& computed,
-                                        const std::vector<T>& stored) {
+static StorageRelResult storage_roundtrip_rel_err(const std::vector<float>& computed,
+                                                  const std::vector<T>& stored,
+                                                  int iter_context) {
     double max_abs = 0.0;
     double computed_linf = 0.0;
+    // computed ya esta garantizado que sea la ultima iteracion finita
+    // (ver benchmark_gpu_tensor_core_stencil), asi que todos sus valores
+    // deben ser finitos.
     for (size_t i = 0; i < computed.size(); ++i) {
         const double x = static_cast<double>(computed[i]);
-        if (!std::isfinite(x)) continue;
+        if (!std::isfinite(x)) continue;  // Fallback por seguridad
         computed_linf = std::max(computed_linf, std::fabs(x));
         const double t = static_cast<double>(host_val_to_float(stored[i]));
-        if (!std::isfinite(t)) continue;
+        if (!std::isfinite(t)) continue;  // Fallback por seguridad
         max_abs = std::max(max_abs, std::fabs(x - t));
     }
-    return (computed_linf > 0.0) ? max_abs / computed_linf : 0.0;
+    return {(computed_linf > 0.0) ? max_abs / computed_linf : 0.0, iter_context};
 }
 
 // Encadenamiento genuino salida(i) -> entrada(i+1): el kernel WMMA ahora
@@ -942,7 +978,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  int& onset_iter,
                                                  int& first_nonfinite_iter,
                                                  double& t_wmma_ms_out,
-                                                 double& t_conv_ms_out) {
+                                                 double& t_conv_ms_out,
+                                                 int& storage_rel_eval_iter) {
     const size_t count = in.size();
     float* d_in_fp32 = nullptr;
     float* d_out_fp32 = nullptr;
@@ -1022,11 +1059,25 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     }
 
     // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
-    // costo) cuando el checkpointing esta desactivado.
+    // costo) cuando el checkpointing esta desactivado. Tambien se usa para
+    // guardar la ultima iteracion FINITA de d_out_fp32 (util para evaluar
+    // storage_rel sobre salida no-divergida).
     std::vector<float> checkpoint_host_buf;
-    if (ckpt.checkpoint_every > 0) {
-        checkpoint_host_buf.resize(count);
-    }
+    checkpoint_host_buf.resize(count);  // siempre, para guardar ultima finita
+
+    // Almacenan las salidas de la ultima iteracion finita (para evaluar
+    // storage_rel correctamente si la ruta diverge).
+    std::vector<float> out_last_finite(count);
+    std::vector<T> out_reduced_last_finite(count);
+    int last_finite_iter = 0;
+
+    // Helper: verifica si un buffer FP32 es completamente finito.
+    auto is_finite_buffer = [&](const std::vector<float>& buf) {
+        for (const auto& x : buf) {
+            if (!std::isfinite(x)) return false;
+        }
+        return true;
+    };
 
     // Pares de eventos por lanzamiento del kernel WMMA (iters), sin
     // sincronizar dentro del bucle: se graban en el stream con
@@ -1064,11 +1115,34 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                   count * sizeof(float), cudaMemcpyDeviceToHost));
             record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
         }
+
+        // Guarda la ultima iteracion finita de d_out_fp32 y tc_in (util para
+        // evaluar storage_rel sobre salida no-divergida incluso si la ruta
+        // diverge despues). Se copia para verificar finitud sin kernel extra.
+        if (write_fp32) {  // optimizacion: solo cuando es relevante
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out_fp32,
+                                  count * sizeof(float), cudaMemcpyDeviceToHost));
+            if (is_finite_buffer(checkpoint_host_buf)) {
+                out_last_finite = checkpoint_host_buf;
+                out_reduced_last_finite.resize(count);
+                CHECK_CUDA(cudaMemcpy(out_reduced_last_finite.data(), tc_in, count * sizeof(T),
+                                      cudaMemcpyDeviceToHost));
+                last_finite_iter = i + 1;
+            }
+        }
     }
     const float total_ms = timer.stop_and_elapsed_ms();
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Si la ruta divergo, sustituye out/out_reduced por la ultima iteracion
+    // finita (util para evaluar storage_rel correctamente). Conserva first_nonfinite_iter
+    // intacto para el diagnostico de n*.
+    if (first_nonfinite_iter != INT_MAX && last_finite_iter > 0) {
+        out = out_last_finite;
+        out_reduced = out_reduced_last_finite;
+    }
 
     double t_wmma_sum_ms = 0.0;
     for (int i = 0; i < iters; ++i) {
@@ -1084,12 +1158,31 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     t_wmma_ms_out = t_wmma_sum_ms / iters;
     t_conv_ms_out = 0.0;
 
+    // Registra en que iteracion se evaluo storage_rel (util para anotar si
+    // la ruta divergio antes de iters). Sentinela -1: la ruta divergio y
+    // ningun checkpoint (ni la iteracion final) alcanzo a capturar un estado
+    // COMPLETAMENTE finito antes de eso -- d_out_fp32 solo se escribe en
+    // iteraciones write_fp32 (checkpoints o la ultima), asi que sin
+    // --checkpoint-every no hay forma de recuperar un estado finito posterior
+    // a la divergencia; storage_rel no es evaluable de forma confiable en
+    // ese caso (ver StorageRelResult y el llamador, que debe mostrar
+    // "NO EVALUABLE" en vez de imprimir un numero calculado sobre datos
+    // parcialmente no finitos).
+    if (first_nonfinite_iter != INT_MAX && last_finite_iter == 0) {
+        storage_rel_eval_iter = -1;
+    } else {
+        storage_rel_eval_iter = (last_finite_iter > 0) ? last_finite_iter : iters;
+    }
+
     // El resultado T final ya quedo escrito por el kernel (float_to_tc<T>,
     // misma funcion que antes aplicaba convert_input_to_tc): tras el ultimo
     // swap, tc_in apunta al buffer con la salida mas reciente, sin necesidad
-    // de reconvertir por separado.
-    out_reduced.resize(count);
-    CHECK_CUDA(cudaMemcpy(out_reduced.data(), tc_in, count * sizeof(T), cudaMemcpyDeviceToHost));
+    // de reconvertir por separado. Si la ruta divergo, ya fue sustituido por
+    // out_reduced_last_finite arriba.
+    if (first_nonfinite_iter == INT_MAX || last_finite_iter == 0) {
+        out_reduced.resize(count);
+        CHECK_CUDA(cudaMemcpy(out_reduced.data(), tc_in, count * sizeof(T), cudaMemcpyDeviceToHost));
+    }
 
     CHECK_CUDA(cudaFree(d_in_fp32));
     CHECK_CUDA(cudaFree(d_out_fp32));
@@ -1217,8 +1310,16 @@ static void write_csv_row(std::ofstream& csv, const std::string& formato, int nx
 // no esta garantizado en compilacion host. BF16 comparte los 8 bits de
 // exponente de FP32 (mismo rango, distinta mantisa), por eso su umbral es
 // del mismo orden que el de FP32.
+// Constantes de overflow por formato: FMT_MAX y unidad de redondeo (u).
+// u_T es el piso de semilla debido al redondeo por formato en cada iteración.
 constexpr double kFp16Max = 65504.0;
+constexpr double kFp16Unit = 4.8828125e-4;     // 2^-11
 constexpr double kBf16Max = 3.38953139e38;
+constexpr double kBf16Unit = 3.90625e-3;       // 2^-8
+constexpr double kFp32Max = 3.4028235e38;
+constexpr double kFp32Unit = 5.9604645e-8;     // 2^-24
+constexpr double kFp64Max = 1.7976931348623157e308;
+constexpr double kFp64Unit = 1.1102230246251565e-16;  // 2^-53
 
 // Proyecta la condicion inicial u^0 (sin modificarla) sobre el modo de
 // Nyquist (pi,pi): a_nyq = |<u^0, e_nyq>| / N, con e_nyq(i,j) = (-1)^(i+j).
@@ -1228,6 +1329,9 @@ constexpr double kBf16Max = 3.38953139e38;
 // condicion inicial la componente Nyquist crece como a_nyq * 2^n hasta
 // desbordar el formato en n* = log2(fmt_max / a_nyq). Se calcula en FP64,
 // una sola vez, antes de cualquier region cronometrada.
+// NOTA: la proyeccion directa es grid-dependent (incluye bordes). Para
+// prediccion robusta de horizonte, se calibra desde la referencia FP64
+// (ver compute_overflow_horizon_from_reference).
 static double compute_nyquist_component(const std::vector<float>& u0, int nx, int ny) {
     double a_nyq = 0.0;
     for (int j = 0; j < ny; ++j) {
@@ -1236,6 +1340,90 @@ static double compute_nyquist_component(const std::vector<float>& u0, int nx, in
         }
     }
     return std::fabs(a_nyq) / (static_cast<double>(nx) * static_cast<double>(ny));
+}
+
+// Ajusta modelo log-lineal log2(||u^n||_inf) = log2(A) + n*log2(lambda)
+// sobre la referencia FP64 en el regimen asintotico (60%-90% de las iters finitas).
+// Retorna (A, lambda_medido). Si lambda se aleja >5% de 2.0, retorna (A, 0.0)
+// como centinela para advertir de divergencia del modelo.
+// Se calcula una sola vez, fuera de regiones cronometradas.
+static std::pair<double, double> fit_overflow_model(const std::vector<double>& linf_per_iter) {
+    if (linf_per_iter.size() < 3) {
+        return {0.0, 0.0};  // datos insuficientes
+    }
+
+    const size_t n_total = linf_per_iter.size();
+    const size_t idx_start = std::max(size_t(1), size_t(0.60 * n_total));
+    const size_t idx_end = std::max(idx_start + 1, size_t(0.90 * n_total));
+
+    if (idx_end - idx_start < 2) {
+        return {0.0, 0.0};  // region asintotica muy pequena
+    }
+
+    // Ajuste por minimos cuadrados en espacio log: sum_i (log2(u_i) - c - k*i)^2 minimo
+    // => c = log2(A), k = log2(lambda)
+    double sum_i = 0.0, sum_log_u = 0.0, sum_i2 = 0.0, sum_i_log_u = 0.0;
+    size_t count = 0;
+    for (size_t i = idx_start; i < idx_end; ++i) {
+        if (linf_per_iter[i] > 0.0) {
+            const double log_u = std::log2(linf_per_iter[i]);
+            const double n_iter = static_cast<double>(i + 1);
+            sum_i += n_iter;
+            sum_log_u += log_u;
+            sum_i2 += n_iter * n_iter;
+            sum_i_log_u += n_iter * log_u;
+            count++;
+        }
+    }
+
+    if (count < 2) {
+        return {0.0, 0.0};
+    }
+
+    const double n_dbl = static_cast<double>(count);
+    const double denom = n_dbl * sum_i2 - sum_i * sum_i;
+    if (std::fabs(denom) < 1e-12) {
+        return {0.0, 0.0};  // matriz singular
+    }
+
+    const double k = (n_dbl * sum_i_log_u - sum_i * sum_log_u) / denom;
+    const double c = (sum_log_u - k * sum_i) / n_dbl;
+    const double A = std::pow(2.0, c);
+    const double lambda = std::pow(2.0, k);
+
+    // Validacion: lambda debe estar dentro de ±5% de 2.0
+    if (std::fabs(lambda - 2.0) / 2.0 > 0.05) {
+        return {A, 0.0};  // centinela: modelo diverge demasiado
+    }
+
+    return {A, lambda};
+}
+
+// Calcula horizonte de overflow predicho para cada formato, basandose en el
+// ajuste de la referencia FP64. Modelo:
+//   semilla_T = max(a_nyq_IC, u_T * ||u0||_inf)
+//   n*_T = log2(FMT_MAX_T) - log2(semilla_T)
+// con u_T la unidad de redondeo del formato.
+// Retorna (n_fp16, n_bf16, n_fp32, n_fp64, A, lambda).
+// Imprime advertencias si lambda diverge del valor teorico 2.0.
+static std::tuple<double, double, double, double, double, double>
+compute_overflow_horizon_from_reference(const std::vector<double>& linf_per_iter,
+                                        double a_nyq_ic,
+                                        double u0_linf) {
+    auto [A, lambda] = fit_overflow_model(linf_per_iter);
+
+    double semilla_fp16 = std::max(a_nyq_ic, kFp16Unit * u0_linf);
+    double semilla_bf16 = std::max(a_nyq_ic, kBf16Unit * u0_linf);
+    double semilla_fp32 = std::max(a_nyq_ic, kFp32Unit * u0_linf);
+    double semilla_fp64 = std::max(a_nyq_ic, kFp64Unit * u0_linf);
+
+    // Calculos en espacio logaritmico, nunca divide (previene overflow en FP64).
+    double pred_fp16 = std::log2(kFp16Max) - std::log2(semilla_fp16);
+    double pred_bf16 = std::log2(kBf16Max) - std::log2(semilla_bf16);
+    double pred_fp32 = std::log2(kFp32Max) - std::log2(semilla_fp32);
+    double pred_fp64 = std::log2(kFp64Max) - std::log2(semilla_fp64);
+
+    return {pred_fp16, pred_bf16, pred_fp32, pred_fp64, A, lambda};
 }
 
 static std::string fmt_horizon_row(const char* label, double predicted, int measured_n) {
@@ -1247,21 +1435,35 @@ static std::string fmt_horizon_row(const char* label, double predicted, int meas
     return buf;
 }
 
-// Predicho (a partir de a_nyq, calculado antes de correr nada) vs medido
-// (primera iteracion no finita de cada ruta, INT_MAX si nunca diverguio).
-static void print_overflow_horizon(double a_nyq, int n_fp16, int n_bf16, int n_gpu_fp32, int n_fp64) {
-    const double pred_fp16 = std::log2(kFp16Max / a_nyq);
-    const double pred_bf16 = std::log2(kBf16Max / a_nyq);
-    const double pred_fp32 = std::log2(static_cast<double>(std::numeric_limits<float>::max()) / a_nyq);
-    const double pred_fp64 = std::log2(std::numeric_limits<double>::max() / a_nyq);
-
+// Predicho (calibrado desde la referencia FP64 mediante ajuste de mínimos cuadrados
+// del modo log-lineal) vs medido (primera iteracion no finita de cada ruta,
+// INT_MAX si nunca diverguio). Imprime advertencia si lambda_medido diverge >5% del
+// valor teorico 2.0 (exponente del operador en (pi,pi)).
+static void print_overflow_horizon(double pred_fp16, double pred_bf16,
+                                   double pred_fp32, double pred_fp64,
+                                   double a_nyq_ic, double A, double lambda,
+                                   double u0_linf,
+                                   int n_fp16, int n_bf16, int n_gpu_fp32, int n_fp64) {
     std::cout << "=========== HORIZONTE DE OVERFLOW (Fase 3) ===========\n";
     std::cout << "Horizonte de overflow (predicho / medido)\n";
     std::cout << fmt_horizon_row("FP16", pred_fp16, n_fp16);
     std::cout << fmt_horizon_row("BF16", pred_bf16, n_bf16);
     std::cout << fmt_horizon_row("FP32", pred_fp32, n_gpu_fp32);
     std::cout << fmt_horizon_row("FP64", pred_fp64, n_fp64);
-    std::cout << "  Componente Nyquist de u^0 : " << fmt_sci(a_nyq) << "\n";
+    std::cout << "  Semilla efectiva A (fit FP64)       : " << fmt_sci(A) << "\n";
+    std::cout << "  Factor de crecimiento medido        : " << std::fixed << std::setprecision(4) << lambda << "  (teorico: 2.0000)\n";
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "  Proyeccion Nyquist de u^0          : " << fmt_sci(a_nyq_ic) << "\n";
+    std::cout << "  Piso de redondeo por formato:\n";
+    std::cout << "    FP16                             : " << std::scientific << kFp16Unit << "\n";
+    std::cout << "    BF16                             : " << std::scientific << kBf16Unit << "\n";
+    std::cout << "    FP32                             : " << std::scientific << kFp32Unit << "\n";
+    std::cout << "    FP64                             : " << std::scientific << kFp64Unit << "\n";
+
+    if (lambda > 0.0 && std::fabs(lambda - 2.0) / 2.0 > 0.05) {
+        std::cout << "  ADVERTENCIA: lambda_medido diverge >5% del valor teorico 2.0\n"
+                  << "  Revisar condicion inicial o formula del stencil.\n";
+    }
     std::cout << "=======================================================\n\n";
 }
 
@@ -1340,6 +1542,7 @@ static void run_profile_only(const Options& opt) {
                                ckpt, "GPU_FP32", onset_gpu_fp32, first_nf_gpu_fp32);
 
     double t_wmma_ms_unused = 0.0, t_conv_ms_unused = 0.0;
+    int storage_rel_eval_iter_unused = 0;
     if (opt.tc_mode == TensorCoreMode::FP16) {
         std::vector<float> y_tc_fp16(count, 0.0f);
         std::vector<__half> y_tc_fp16_reduced;
@@ -1347,7 +1550,7 @@ static void run_profile_only(const Options& opt) {
         int first_nf_fp16 = INT_MAX;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
                                                   opt.iters, ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16,
-                                                  t_wmma_ms_unused, t_conv_ms_unused);
+                                                  t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused);
     } else {
         std::vector<float> y_tc_bf16(count, 0.0f);
         std::vector<__nv_bfloat16> y_tc_bf16_reduced;
@@ -1355,7 +1558,7 @@ static void run_profile_only(const Options& opt) {
         int first_nf_bf16 = INT_MAX;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
                                                          opt.iters, ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16,
-                                                         t_wmma_ms_unused, t_conv_ms_unused);
+                                                         t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused);
     }
 }
 
@@ -1414,6 +1617,13 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     // antes de cualquier CudaEventTimer/std::chrono de las rutas medidas.
     const double a_nyq = compute_nyquist_component(input, opt.nx, opt.ny);
 
+    // Norma infinito de la condicion inicial (usada en calibracion del modelo
+    // de overflow por formato: semilla_T = max(a_nyq, u_T * ||u0||_inf)).
+    double u0_linf = 0.0;
+    for (const auto& x : input) {
+        u0_linf = std::max(u0_linf, std::fabs(static_cast<double>(x)));
+    }
+
     // Referencia FP64 (ground truth): opt.iters aplicaciones encadenadas del
     // stencil en double sobre una copia en double del mismo input, mismo
     // numero de iteraciones que las rutas comparadas (ver comentario en
@@ -1427,9 +1637,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     // cada iteracion multiplo de K (ver compute_cpu_stencil_fp64); su tamano
     // final ya es el numero de checkpoints "validos" (referencia finita).
     std::vector<std::vector<double>> fp64_checkpoints;
+    std::vector<double> linf_per_iter;  // ||u^n||_inf para cada iteracion
     int first_nf_fp64_ref = INT_MAX;
     compute_cpu_stencil_fp64(input_fp64, y_ref, opt.nx, opt.ny, opt.iters,
-                             opt.checkpoint_every, fp64_checkpoints, first_nf_fp64_ref);
+                             opt.checkpoint_every, fp64_checkpoints, linf_per_iter,
+                             first_nf_fp64_ref);
 
     if (opt.checkpoint_every > 0) {
         const int got = static_cast<int>(fp64_checkpoints.size());
@@ -1490,12 +1702,23 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     if (opt.tc_mode == TensorCoreMode::FP16 || opt.tc_mode == TensorCoreMode::Both) {
         ran_fp16 = true;
         double t_wmma_ms_fp16 = 0.0, t_conv_ms_fp16 = 0.0;
+        int storage_rel_eval_iter_fp16 = 0;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters,
-            ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16);
+            ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
+            storage_rel_eval_iter_fp16);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
         const ErrorMetrics tc_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_fp16);
-        const double fp16_storage_rel = storage_roundtrip_rel_err<__half>(y_tc_fp16, y_tc_fp16_reduced);
+        // eval_iter == -1: la ruta divergio sin que ningun checkpoint
+        // capturara un estado finito antes (ver comentario en
+        // benchmark_gpu_tensor_core_stencil). y_tc_fp16/y_tc_fp16_reduced
+        // quedaron con la ultima iteracion medida cruda (parcialmente no
+        // finita): no se evalua storage_rel sobre eso.
+        const bool fp16_storage_evaluable = (storage_rel_eval_iter_fp16 != -1);
+        const StorageRelResult fp16_storage_result = fp16_storage_evaluable
+            ? storage_roundtrip_rel_err<__half>(y_tc_fp16, y_tc_fp16_reduced, storage_rel_eval_iter_fp16)
+            : StorageRelResult{0.0, -1};
+        const double fp16_storage_rel = fp16_storage_result.rel_err;
         // Sin instrumentar por separado el lector asume que el cuello de
         // botella es el Tensor Core; en realidad convert_float_to_half_kernel
         // (reconversion de d_out a T en cada iteracion) explica buena parte
@@ -1520,10 +1743,21 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
                             "Error rel Linf vs CPU FP32         : ", tc_fp16_vs_cpu_err, first_nf_fp16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_fp16, opt.iters);
-        std::cout << "Error relativo por guardar en FP16 (16 bits): " << fmt_sci(fp16_storage_rel) << "\n\n";
+        std::cout << "Error relativo por guardar en FP16 (16 bits): ";
+        if (fp16_storage_evaluable) {
+            std::cout << fmt_sci(fp16_storage_rel);
+            if (storage_rel_eval_iter_fp16 < opt.iters) {
+                std::cout << "  (eval. en iter " << storage_rel_eval_iter_fp16 << ")";
+            }
+        } else {
+            std::cout << "NO EVALUABLE (la ruta divergio antes de cualquier checkpoint finito;"
+                          " use --checkpoint-every para medir storage_rel de forma confiable)";
+        }
+        std::cout << "\n\n";
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.nx, opt.ny, opt.iters,
-                         tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16, fmt_sci(fp16_storage_rel),
+                         tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
+                         fp16_storage_evaluable ? fmt_sci(fp16_storage_rel) : "NO_EVALUABLE",
                          fmt_sci(t_wmma_ms_fp16), fmt_sci(t_conv_ms_fp16));
         }
     }
@@ -1531,12 +1765,19 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     if (opt.tc_mode == TensorCoreMode::BF16 || opt.tc_mode == TensorCoreMode::Both) {
         ran_bf16 = true;
         double t_wmma_ms_bf16 = 0.0, t_conv_ms_bf16 = 0.0;
+        int storage_rel_eval_iter_bf16 = 0;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters,
-            ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16);
+            ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
+            storage_rel_eval_iter_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
         const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
-        const double bf16_storage_rel = storage_roundtrip_rel_err<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced);
+        // Ver comentario analogo en el bloque FP16.
+        const bool bf16_storage_evaluable = (storage_rel_eval_iter_bf16 != -1);
+        const StorageRelResult bf16_storage_result = bf16_storage_evaluable
+            ? storage_roundtrip_rel_err<__nv_bfloat16>(y_tc_bf16, y_tc_bf16_reduced, storage_rel_eval_iter_bf16)
+            : StorageRelResult{0.0, -1};
+        const double bf16_storage_rel = bf16_storage_result.rel_err;
         // Ver comentario analogo en el bloque FP16: sin este desglose el
         // 2.3x de t/iter frente a GPU FP32 clasico se le atribuiria por
         // error al Tensor Core en vez de a convert_float_to_bfloat16_kernel.
@@ -1559,17 +1800,35 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
                             "Error rel Linf vs CPU FP32         : ", tc_bf16_vs_cpu_err, first_nf_bf16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_bf16, opt.iters);
-        std::cout << "Error relativo por guardar en BF16 (16 bits): " << fmt_sci(bf16_storage_rel) << "\n\n";
+        std::cout << "Error relativo por guardar en BF16 (16 bits): ";
+        if (bf16_storage_evaluable) {
+            std::cout << fmt_sci(bf16_storage_rel);
+            if (storage_rel_eval_iter_bf16 < opt.iters) {
+                std::cout << "  (eval. en iter " << storage_rel_eval_iter_bf16 << ")";
+            }
+        } else {
+            std::cout << "NO EVALUABLE (la ruta divergio antes de cualquier checkpoint finito;"
+                          " use --checkpoint-every para medir storage_rel de forma confiable)";
+        }
+        std::cout << "\n\n";
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.nx, opt.ny, opt.iters,
-                         tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16, fmt_sci(bf16_storage_rel),
+                         tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,
+                         bf16_storage_evaluable ? fmt_sci(bf16_storage_rel) : "NO_EVALUABLE",
                          fmt_sci(t_wmma_ms_bf16), fmt_sci(t_conv_ms_bf16));
         }
     }
 
     std::cout << "====================================================\n\n";
 
-    print_overflow_horizon(a_nyq, first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
+    // Calibracion del horizonte de overflow desde la referencia FP64: ajuste
+    // de modelo log-lineal en el regimen asintotico, retorna A y lambda_medido.
+    auto [pred_fp16, pred_bf16, pred_fp32, pred_fp64, A, lambda] =
+        compute_overflow_horizon_from_reference(linf_per_iter, a_nyq, u0_linf);
+
+    print_overflow_horizon(pred_fp16, pred_bf16, pred_fp32, pred_fp64,
+                          a_nyq, A, lambda, u0_linf,
+                          first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
 
     if (opt.checkpoint_every > 0) {
         std::cout << "=========== RESUMEN ONSET DE DIVERGENCIA ===========\n";
