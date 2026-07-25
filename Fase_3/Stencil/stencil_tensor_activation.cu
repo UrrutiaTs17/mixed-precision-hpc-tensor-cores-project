@@ -47,6 +47,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
