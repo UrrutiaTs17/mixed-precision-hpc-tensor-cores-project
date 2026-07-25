@@ -45,6 +45,22 @@ NY="${NY:-4096}"
 ITERS="${ITERS:-1200}"
 TC="${TC:-both}"
 
+# --checkpoint-every 20: unico modo de que storage_rel sea evaluable en esta
+# malla (sin checkpoints, si la ruta diverge no queda estado finito
+# recuperable, ver stencil_tensor_activation.cu). FP16 diverge en ~28, asi
+# que un checkpoint en la iteracion 20 lo captura con margen.
+#
+# Presupuesto de memoria de fp64_checkpoints (el unico consumo que escala con
+# ITERS/CHECKPOINT_EVERY): cada snapshot es NX*NY doubles = 4096*4096*8 =
+# 134217728 bytes (~134 MB / 128 MiB). La referencia FP64 se mantiene finita
+# hasta iter ~1045 (n* FP64 predicho 1040.6, ver bloque 3 de la correccion de
+# 2026-07-25), asi que con checkpoint_every=20 los snapshots validos van de
+# 20 a 1040 => 1040/20 = 52 checkpoints => 52 * 134217728 ~= 6.98 GB (~6.5
+# GiB). El job pide --mem=32G: 52 checkpoints caben con margen (~22% del
+# presupuesto), dejando espacio de sobra para los buffers O(NX*NY) de cada
+# ruta (unas pocas decenas de MB cada uno, no escalan con ITERS).
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -64,4 +80,5 @@ echo "============================================================"
 echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}"
 echo "============================================================"
 TIMEFORMAT=">>> Tiempo real de la corrida: %R s (user %U, sys %S)"
-{ time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}"; } 2>&1
+{ time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
+      --checkpoint-every "${CHECKPOINT_EVERY}"; } 2>&1
