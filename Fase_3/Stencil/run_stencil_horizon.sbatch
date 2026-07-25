@@ -7,7 +7,14 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --exclusive
-#SBATCH --time=01:00:00
+# Subido de 01:00:00 a 02:00:00 (bloque 5): la corrida ahora se duplica
+# (--kahan off y --kahan on, ver KAHAN_LIST mas abajo); Kahan no toca CPU
+# FP32/FP64 (las referencias, el costo dominante de esta corrida) asi que la
+# segunda pasada las recalcula de forma redundante -- el tiempo total sube
+# aprox. al doble del de una sola pasada. Sin datos de wall-time medidos de
+# esta corrida en PACCA para calibrar con precision, 02:00:00 da margen frente
+# a duplicar un limite que ya se asumia ajustado a una sola pasada.
+#SBATCH --time=02:00:00
 
 set -euo pipefail
 
@@ -61,6 +68,12 @@ TC="${TC:-both}"
 # ruta (unas pocas decenas de MB cada uno, no escalan con ITERS).
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
 
+# Diseno factorial {fp16,bf16} x {kahan off,on} (bloque 5): esta es la corrida
+# donde SI importa si Kahan extiende n* de FP16 mas alla de 28 (pregunta
+# explicita del bloque). --kahan off primero preserva el orden de no-regresion
+# de las cifras ya validadas (bloque de gates).
+KAHAN_LIST="${KAHAN_LIST:-off on}"
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -75,10 +88,12 @@ echo "Compilando stencil_tc (Fase_3/Stencil, incluye Fase_2/common.cuh por ruta 
     -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
     --allow-unsupported-compiler
 
-echo
-echo "============================================================"
-echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}"
-echo "============================================================"
 TIMEFORMAT=">>> Tiempo real de la corrida: %R s (user %U, sys %S)"
-{ time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-      --checkpoint-every "${CHECKPOINT_EVERY}"; } 2>&1
+for KAHAN in ${KAHAN_LIST}; do
+    echo
+    echo "============================================================"
+    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+    echo "============================================================"
+    { time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
+          --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"; } 2>&1
+done

@@ -45,8 +45,10 @@ NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-3}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 
 # Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
-# sola vez en Fase_2/common_ncu.sh y se reutiliza entre los .sbatch.
-for _common_ncu in "../common_ncu.sh" "./common_ncu.sh"; do
+# sola vez en tools/common_ncu.sh (fuera de cualquier Fase_N) y se reutiliza
+# entre los .sbatch de todas las fases; este script corre desde
+# Fase_2/Stencil, de ahi "../../tools/common_ncu.sh" como ruta principal.
+for _common_ncu in "../../tools/common_ncu.sh" "./common_ncu.sh"; do
     if [[ -f "${_common_ncu}" ]]; then
         # shellcheck source=/dev/null
         source "${_common_ncu}"

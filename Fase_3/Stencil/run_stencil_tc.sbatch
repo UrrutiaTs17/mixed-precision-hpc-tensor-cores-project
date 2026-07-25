@@ -67,16 +67,23 @@ ITERS_LIST="${ITERS_LIST:-10 50 100 120}"
 # formato que diverge mas temprano) cae en 25, bien dentro del rango finito.
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 # Restriccion de tiempo: NCU solo se corre para un valor de ITERS de la lista,
-# no para todos -- mantiene el numero de reportes NCU en 5 por corrida (WMMA
-# fp16/bf16, conversion fp16/bf16, FP32 clasico una sola vez).
+# no para todos -- mantiene el numero de reportes NCU en 5 (sin Kahan) o 7 (con
+# Kahan: +2 WMMA fp16/bf16 kahan=on) por corrida (WMMA fp16/bf16, conversion
+# fp16/bf16, FP32 clasico una sola vez).
 ITERS_NCU="${ITERS_NCU:-100}"
+# Diseno factorial {fp16,bf16} x {kahan off,on} x ITERS_LIST (bloque 5): cada
+# valor de ITERS_LIST corre completo con --kahan off y con --kahan on. Kahan
+# solo cambia las rutas WMMA (ver stencil_tensor_activation.cu); GPU FP32
+# clasico y las referencias CPU FP32/FP64 dan identico resultado en ambas
+# pasadas, pero se recalculan de todas formas (una invocacion == una corrida
+# completa) -- el costo extra es ese recalculo redundante, no trabajo nuevo.
+KAHAN_LIST="${KAHAN_LIST:-off on}"
 
 # Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
-# sola vez en Fase_2/common_ncu.sh y se reutiliza entre los .sbatch de todas
-# las fases; este script corre desde Fase_3/Stencil, asi que "../common_ncu.sh"
-# (Fase_3/common_ncu.sh) y "./common_ncu.sh" no existen aqui -- se agrega la
-# ruta real hacia Fase_2/common_ncu.sh como ultima alternativa.
-for _common_ncu in "../common_ncu.sh" "./common_ncu.sh" "../../Fase_2/common_ncu.sh"; do
+# sola vez en tools/common_ncu.sh (fuera de cualquier Fase_N) y se reutiliza
+# entre los .sbatch de todas las fases; este script corre desde
+# Fase_3/Stencil, de ahi "../../tools/common_ncu.sh" como ruta principal.
+for _common_ncu in "../../tools/common_ncu.sh" "./common_ncu.sh"; do
     if [[ -f "${_common_ncu}" ]]; then
         # shellcheck source=/dev/null
         source "${_common_ncu}"
@@ -162,12 +169,14 @@ fi
 # el binario: evita recalcular la referencia CPU FP32 (~742s) y la FP64
 # encadenada (~900s) antes de llegar al kernel bajo perfil (~1723s de pared
 # por llamada a ncu antes de este cambio). Usa NX/NY/ITERS/NCU_CAPTURE_ARGS
-# del ambito que la invoca (bucle principal, mas abajo).
+# del ambito que la invoca (bucle principal, mas abajo). kahan (5to arg,
+# "off"/"on") se pasa tal cual a --kahan; default "off" para los kernels que
+# Kahan no toca (FP32 clasico, conversion), que solo se perfilan una vez.
 ncu_profile_kernel() {
-    local label="$1" regex="$2" tc_type="$3" report_tag="$4"
+    local label="$1" regex="$2" tc_type="$3" report_tag="$4" kahan="${5:-off}"
     local report="logs/ncu_${report_tag}_nx${NX}_ny${NY}_job${SLURM_JOB_ID:-manual}"
     echo
-    echo "Perfilando ${label} con Nsight Compute (NCU_MODE=${NCU_MODE})..."
+    echo "Perfilando ${label} con Nsight Compute (NCU_MODE=${NCU_MODE}, kahan=${kahan})..."
     echo "Reporte: ${report}.ncu-rep"
     # `time` (y stderr de ncu) se redirigen al .out para correlacionar
     # duracion vs #SBATCH --time en corridas con --set full.
@@ -179,49 +188,62 @@ ncu_profile_kernel() {
         --export "${report}" \
         --force-overwrite \
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${tc_type}" \
-            --profile-only; } 2>&1
+            --kahan "${kahan}" --profile-only; } 2>&1
 }
 
 for run in "${RUNS[@]}"; do
     read -r NX NY ITERS TC <<< "${run}"
-    echo
-    echo "============================================================"
-    echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}"
-    echo "============================================================"
-    ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-        --checkpoint-every "${CHECKPOINT_EVERY}"
+    for KAHAN in ${KAHAN_LIST}; do
+        echo
+        echo "============================================================"
+        echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+        echo "============================================================"
+        ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
+            --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"
 
-    if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
-        # Con --tc both el binario lanza primero todos los kernels FP16 y luego
-        # los BF16; como --launch-skip cuenta lanzamientos que matchean el regex
-        # de forma global, un solo pase de ncu con skip=3 solo capturaria la
-        # instanciacion FP16. Se perfila cada tipo por separado (--tc fp16 /
-        # --tc bf16): un reporte por precision con skip/count deterministas.
-        # --profile-only exige --tc fp16|bf16 (nunca both), asi que este split
-        # ya es obligatorio, no solo una optimizacion de --launch-skip.
-        if [[ "${TC}" == "both" ]]; then
-            NCU_TC_TYPES=(fp16 bf16)
-        else
-            NCU_TC_TYPES=("${TC}")
+        if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
+            # Con --tc both el binario lanza primero todos los kernels FP16 y luego
+            # los BF16; como --launch-skip cuenta lanzamientos que matchean el regex
+            # de forma global, un solo pase de ncu con skip=3 solo capturaria la
+            # instanciacion FP16. Se perfila cada tipo por separado (--tc fp16 /
+            # --tc bf16): un reporte por precision con skip/count deterministas.
+            # --profile-only exige --tc fp16|bf16 (nunca both), asi que este split
+            # ya es obligatorio, no solo una optimizacion de --launch-skip.
+            if [[ "${TC}" == "both" ]]; then
+                NCU_TC_TYPES=(fp16 bf16)
+            else
+                NCU_TC_TYPES=("${TC}")
+            fi
+            if [[ "${NCU_MODE}" == "full" ]]; then
+                NCU_CAPTURE_ARGS=(--set "${NCU_SET}")
+            else
+                NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
+            fi
+
+            # GPU FP32 clasico y las conversiones no dependen de Kahan (no las
+            # toca, ver stencil_tensor_activation.cu): se perfilan UNA sola vez
+            # por corrida, en la pasada KAHAN=off, para no duplicar tiempo de
+            # pared sin informacion nueva. El valor de --tc que se le pasa al
+            # FP32 clasico es irrelevante para ese kernel; se usa el primero de
+            # NCU_TC_TYPES.
+            if [[ "${KAHAN}" == "off" ]]; then
+                ncu_profile_kernel "GPU FP32 clasico" "${NCU_KERNEL_REGEX_FP32}" \
+                    "${NCU_TC_TYPES[0]}" "fp32_stencil"
+            fi
+
+            for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
+                KAHAN_BIT=0
+                [[ "${KAHAN}" == "on" ]] && KAHAN_BIT=1
+                # El kernel WMMA SI depende de Kahan (cambia la escritura de
+                # out_tc): se perfila una vez por valor de KAHAN, con reporte
+                # distinguible por sufijo kahan{0,1}.
+                ncu_profile_kernel "WMMA ${TC_TYPE} kahan=${KAHAN}" "${NCU_KERNEL_REGEX_WMMA}" \
+                    "${TC_TYPE}" "wmma_stencil_${TC_TYPE}_kahan${KAHAN_BIT}" "${KAHAN}"
+                if [[ "${KAHAN}" == "off" ]]; then
+                    ncu_profile_kernel "conversion ${TC_TYPE}" "${NCU_KERNEL_REGEX_CONVERT}" \
+                        "${TC_TYPE}" "convert_${TC_TYPE}"
+                fi
+            done
         fi
-        if [[ "${NCU_MODE}" == "full" ]]; then
-            NCU_CAPTURE_ARGS=(--set "${NCU_SET}")
-        else
-            NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
-        fi
-
-        # GPU FP32 clasico no depende de la precision TC: perfilarlo una vez
-        # por corrida (no por TC_TYPE) evita duplicar tiempo de pared sin
-        # informacion nueva. El valor de --tc que se le pasa es irrelevante
-        # para ese kernel; se usa el primero de NCU_TC_TYPES.
-        ncu_profile_kernel "GPU FP32 clasico" "${NCU_KERNEL_REGEX_FP32}" \
-            "${NCU_TC_TYPES[0]}" "fp32_stencil"
-
-        for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
-            ncu_profile_kernel "WMMA ${TC_TYPE}" "${NCU_KERNEL_REGEX_WMMA}" \
-                "${TC_TYPE}" "wmma_stencil_${TC_TYPE}"
-            ncu_profile_kernel "conversion ${TC_TYPE}" "${NCU_KERNEL_REGEX_CONVERT}" \
-                "${TC_TYPE}" "convert_${TC_TYPE}"
-        done
-    fi
+    done
 done

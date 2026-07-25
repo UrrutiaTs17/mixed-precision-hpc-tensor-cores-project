@@ -88,6 +88,13 @@ struct Options {
     // referencias CPU/FP64 y metricas de error (ver run_profile_only) para
     // que ncu no pague su costo antes de llegar al kernel perfilado.
     bool profile_only = false;
+    // false (por defecto, "off") = sin compensacion, comportamiento identico
+    // al previo. true ("on"): suma compensada de Kahan del redondeo de
+    // ALMACENAMIENTO a 16 bits en las rutas WMMA (FP16/BF16); no aplica a GPU
+    // FP32 clasico (acumulador y almacenamiento son ambos FP32 ahi, la
+    // compensacion seria un no-op con puro overhead). Ver
+    // benchmark_gpu_tensor_core_stencil.
+    bool kahan = false;
 };
 
 __host__ __device__ inline int idx2d(int x, int y, int nx) {
@@ -103,6 +110,19 @@ static std::string fmt_sci(double v) {
     return buf;
 }
 
+// Marcador de telemetria para Fase 4: emite por stdout el limite de una
+// region cronometrada (begin/end) con timestamp de pared en ns desde epoch.
+// Se emite FUERA del par de eventos CUDA que mide t/iter (nunca dentro de lo
+// que build_metrics reporta): un muestreador NVML externo alinea ventanas de
+// potencia con estos marcadores sin que este archivo tenga que exponer nada
+// mas. Solo se usa en las rutas GPU con route_label (GPU_FP32, WMMA_FP16,
+// WMMA_BF16); CPU FP32 serial no tiene ventana de potencia GPU que alinear.
+static void emit_csv_region_marker(const char* route, const char* phase) {
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::cout << "CSV_REGION," << route << "," << phase << "," << ns << "\n";
+}
+
 // Un decimal para porcentajes (desglose WMMA/conversion/no atribuido): el
 // stream global usa std::fixed con 6 decimales, demasiados para un "%".
 static std::string fmt_pct1(double v) {
@@ -115,7 +135,7 @@ static void print_usage(const char* prog) {
     std::cout
         << "Uso:\n"
         << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
-           " [--checkpoint-every K] [--csv RUTA] [--profile-only]\n\n"
+           " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]\n\n"
         << "Descripcion:\n"
         << "  Compara CPU FP32, GPU CUDA FP32 y GPU WMMA Tensor Core para stencil 2D.\n"
         << "  La ruta Tensor Core usa operandos FP16/BF16 y acumulacion/salida FP32.\n\n"
@@ -132,11 +152,16 @@ static void print_usage(const char* prog) {
         << "  --profile-only ejecuta solo GPU FP32 clasico + la ruta TC de --tc (no\n"
         << "  admite --tc both), sin referencias CPU/FP64 ni metricas de error: para\n"
         << "  perfilar con ncu sin pagar su costo. Ausente (por defecto) no la activa.\n\n"
+        << "  --kahan off|on (por defecto off) activa suma compensada de Kahan del\n"
+        << "  redondeo de almacenamiento a 16 bits en las rutas WMMA (FP16/BF16); no\n"
+        << "  aplica a GPU FP32 clasico. off preserva el comportamiento previo byte a\n"
+        << "  byte.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n"
-        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --checkpoint-every 5\n";
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --checkpoint-every 5\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -153,6 +178,14 @@ static TensorCoreMode parse_tc_mode(const char* value) {
     if (std::strcmp(value, "both") == 0) return TensorCoreMode::Both;
 
     std::cerr << "Modo Tensor Core no reconocido: " << value << "\n";
+    std::exit(EXIT_FAILURE);
+}
+
+static bool parse_kahan_flag(const char* value) {
+    if (std::strcmp(value, "off") == 0) return false;
+    if (std::strcmp(value, "on") == 0) return true;
+
+    std::cerr << "Valor no reconocido para --kahan (use off|on): " << value << "\n";
     std::exit(EXIT_FAILURE);
 }
 
@@ -181,6 +214,12 @@ static Options parse_args(int argc, char** argv) {
             opt.csv_path = argv[++i];
         } else if (std::strcmp(argv[i], "--profile-only") == 0) {
             opt.profile_only = true;
+        } else if (std::strcmp(argv[i], "--kahan") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --kahan\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.kahan = parse_kahan_flag(argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -622,6 +661,8 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     CudaEventTimer timer;
     double total_ms = 0.0;
     double checkpoint_ms_total = 0.0;
+    // Marcador FUERA del par de eventos CUDA (ver emit_csv_region_marker).
+    emit_csv_region_marker(route_label, "begin");
     timer.start();
     // El cronometro se pausa/reanuda alrededor del bloque de checkpoint: sin
     // eso, el tiempo GPU ocioso mientras el host hace el D2H queda
@@ -647,6 +688,7 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
+    emit_csv_region_marker(route_label, "end");
     t_checkpoint_ms_out = checkpoint_ms_total / iters;
     CHECK_CUDA(cudaGetLastError());
     // Tras el ultimo swap, d_in apunta al buffer con la salida mas reciente.
@@ -701,6 +743,25 @@ __device__ inline __nv_bfloat16 float_to_tc<__nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
 
+// Suma compensada de Kahan del redondeo de ALMACENAMIENTO a 16 bits (no de la
+// suma de los 5 vecinos, ver metodologia 5.3/4.1.4 y el comentario de
+// benchmark_gpu_tensor_core_stencil): comp[idx] persiste en FP32 entre
+// iteraciones el residuo del redondeo anterior, indexado por celda. Cuando
+// kKahan es false, comp no se toca (puede ser nullptr) y esto colapsa a
+// float_to_tc<T> sin rama en tiempo de ejecucion (if constexpr, resuelto en
+// compilacion): la ruta --kahan off no paga costo alguno.
+template <typename T, bool kKahan>
+__device__ inline T compensated_store(float val, float* comp, int idx) {
+    if constexpr (kKahan) {
+        const float y = val - comp[idx];
+        const T s = float_to_tc<T>(y);
+        comp[idx] = tc_to_float(s) - y;
+        return s;
+    } else {
+        return float_to_tc<T>(val);
+    }
+}
+
 static __half make_tc_value_half(float x) {
     return __float2half(x);
 }
@@ -746,7 +807,12 @@ __host__ __device__ constexpr size_t wmma_warp_shared_bytes() {
     return wmma_tc_tiles_bytes<T>() + wmma_out_tile_bytes();
 }
 
-template <typename T>
+// kKahan (parametro de plantilla, no runtime): activa la compensacion de
+// Kahan del redondeo de almacenamiento (ver compensated_store). comp es
+// nullptr y no se toca cuando kKahan es false -- el llamador (benchmark_
+// gpu_tensor_core_stencil) elige la instanciacion en tiempo de compilacion
+// segun el flag --kahan, asi la ruta off no paga rama ni acceso a comp.
+template <typename T, bool kKahan>
 __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                                              float* __restrict__ out_fp32,
                                              T* __restrict__ out_tc,
@@ -756,7 +822,8 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                                              int ny,
                                              int iter,
                                              bool write_fp32,
-                                             int* __restrict__ first_nf) {
+                                             int* __restrict__ first_nf,
+                                             float* __restrict__ comp) {
     // Cada warp procesa un tile 16x16 propio e independiente (shared privada
     // por warp, ver smem_raw mas abajo): el bloque ya no es 1 warp = 1 tile,
     // es kWarpsPerBlock warps = kWarpsPerBlock tiles.
@@ -860,7 +927,7 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             const int local_y = linear / kTile;
             const float val = out_tile[linear];
             const int idx = idx2d(x0 + local_x, y0 + local_y, nx);
-            out_tc[idx] = float_to_tc<T>(val);
+            out_tc[idx] = compensated_store<T, kKahan>(val, comp, idx);
             if (write_fp32) out_fp32[idx] = val;
             if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
         }
@@ -890,7 +957,7 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                 const float center = tc_to_float(in[idx2d(x, y, nx)]);
                 const float val = 0.25f * (up + down + left + right) - center;
                 const int idx = idx2d(x, y, nx);
-                out_tc[idx] = float_to_tc<T>(val);
+                out_tc[idx] = compensated_store<T, kKahan>(val, comp, idx);
                 if (write_fp32) out_fp32[idx] = val;
                 if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
             }
@@ -931,17 +998,48 @@ void convert_input_to_tc<__nv_bfloat16>(const float* d_in_fp32,
 static inline float host_val_to_float(__half v) { return __half2float(v); }
 static inline float host_val_to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
 
+// Convierte el buffer T (formato de 16 bits) a un vector float elemento a
+// elemento, para poder compararlo contra la referencia FP64 con
+// compare_fp64_ref_vs_fp32. Se usa para medir el error del ESTADO PROPAGADO
+// (ver metrica rel_l2_prop/rel_linf_prop): a diferencia de out_fp32 (el
+// acumulador FP32 sin redondear, ancla de no-regresion), lo que realmente se
+// propaga entre iteraciones es este buffer en 16 bits.
+template <typename T>
+static std::vector<float> reduced_to_float(const std::vector<T>& reduced) {
+    std::vector<float> out(reduced.size());
+    for (size_t i = 0; i < reduced.size(); ++i) {
+        out[i] = host_val_to_float(reduced[i]);
+    }
+    return out;
+}
+
+// Minimo NORMAL representable por T (no el minimo subnormal). Por debajo de
+// este umbral T representa el valor como subnormal, donde la mantisa
+// efectiva se encoge a medida que el exponente se satura en cero: la
+// precision relativa del formato deja de estar acotada por una ULP fija, asi
+// que medir error relativo ahi no dice nada del formato "normal". Se usa
+// como umbral de exclusion en storage_roundtrip_rel_err, reemplazando el
+// umbral anterior (1e-30 * ||x||_inf, relativo al elemento mas grande del
+// buffer): ese umbral admitia subnormales, por lo que FP16 media
+// 4.544995e-03 (9.3x por encima de su unidad de redondeo 2^-11 = 4.8828e-4)
+// mientras BF16 (sin subnormales relevantes en este rango, minimo normal
+// 1.18e-38) media 3.891051e-03, 99.6% de su propia cota.
+template <typename T>
+constexpr double kMinNormalTc();
+template <>
+constexpr double kMinNormalTc<__half>() { return 6.103515625e-05; }  // 2^-14
+template <>
+constexpr double kMinNormalTc<__nv_bfloat16>() { return 1.17549435e-38; }  // 2^-126
+
 // Mide cuanto se pierde SOLO por el hecho de guardar el resultado WMMA (que
 // internamente ya vive en float, via el acumulador de Tensor Cores) en 16
 // bits, como error relativo POR ELEMENTO:
 //   storage_rel = max_i |x_i - float(T(x_i))| / |x_i|
-// sobre los i con |x_i| > 1e-30 * ||x||_inf (excluye elementos casi-cero,
-// donde el error relativo es numericamente inestable por el denominador ~0
-// sin decir nada sobre el formato de almacenamiento). A diferencia de la
-// version anterior (normalizada por ||x||_inf global), esta queda acotada de
-// forma deterministica por media ULP del formato T (redondeo al mas cercano),
-// no por un estadistico que depende de donde caigan los bits del elemento mas
-// grande del buffer.
+// sobre los i con |x_i| > kMinNormalTc<T>() (excluye elementos que T
+// representaria como subnormal, donde el error relativo del formato no esta
+// acotado por una ULP fija; ver comentario de kMinNormalTc). Queda acotado de
+// forma deterministica por media ULP del formato T (redondeo al mas
+// cercano) para todo elemento que sobrevive el filtro.
 // Siempre se evalua sobre la ULTIMA ITERACION FINITA de computed (incluso
 // si la ruta divergio despues), garantizando que todos los valores sean
 // finitos.
@@ -954,20 +1052,12 @@ template <typename T>
 static StorageRelResult storage_roundtrip_rel_err(const std::vector<float>& computed,
                                                   const std::vector<T>& stored,
                                                   int iter_context) {
-    double computed_linf = 0.0;
-    // computed ya esta garantizado que sea la ultima iteracion finita
-    // (ver benchmark_gpu_tensor_core_stencil), asi que todos sus valores
-    // deben ser finitos.
-    for (const auto& x : computed) {
-        const double v = static_cast<double>(x);
-        if (std::isfinite(v)) computed_linf = std::max(computed_linf, std::fabs(v));
-    }
-    const double threshold = 1e-30 * computed_linf;
+    const double threshold = kMinNormalTc<T>();
 
     double max_rel = 0.0;
     for (size_t i = 0; i < computed.size(); ++i) {
         const double x = static_cast<double>(computed[i]);
-        if (!std::isfinite(x) || std::fabs(x) <= threshold) continue;  // casi-cero: denominador inestable
+        if (!std::isfinite(x) || std::fabs(x) <= threshold) continue;  // subnormal en T: precision sin cota fija
         const double t = static_cast<double>(host_val_to_float(stored[i]));
         if (!std::isfinite(t)) continue;  // Fallback por seguridad
         max_rel = std::max(max_rel, std::fabs(x - t) / std::fabs(x));
@@ -998,6 +1088,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  int nx,
                                                  int ny,
                                                  int iters,
+                                                 bool kahan_enabled,
                                                  const CheckpointContext& ckpt,
                                                  const char* route_label,
                                                  int& onset_iter,
@@ -1016,6 +1107,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     T* d_identity_pos = nullptr;
     T* d_identity_neg = nullptr;
     int* d_first_nf = nullptr;
+    // d_comp: residuo de Kahan por celda, en FP32, persistente entre
+    // iteraciones (NO participa del ping-pong: se actualiza en sitio, ver
+    // compensated_store). Solo se reserva si --kahan on; nullptr en caso
+    // contrario (la instanciacion kKahan=false del kernel nunca lo toca).
+    float* d_comp = nullptr;
 
     CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_out_fp32, count * sizeof(float)));
@@ -1024,6 +1120,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMalloc(&d_identity_pos, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_neg, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
+    if (kahan_enabled) {
+        CHECK_CUDA(cudaMalloc(&d_comp, count * sizeof(float)));
+        CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
+    }
 
     CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
@@ -1060,12 +1160,27 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    // Elige la instanciacion kKahan={true,false} del kernel en tiempo de
+    // compilacion segun el flag runtime --kahan: kahan_enabled no cambia
+    // dentro de esta llamada, asi que el branch se resuelve una vez por
+    // benchmark, no por lanzamiento. Cuando kahan_enabled es false, d_comp es
+    // nullptr y la instanciacion kKahan=false nunca lo dereferencia.
+    auto launch_wmma = [&](T* in_buf, T* out_buf, int iter_num, bool write_fp32_flag) {
+        if (kahan_enabled) {
+            stencil2d_wmma_kernel<T, true><<<grid, block, shared_bytes>>>(
+                in_buf, d_out_fp32, out_buf, d_identity_pos, d_identity_neg,
+                nx, ny, iter_num, write_fp32_flag, d_first_nf, d_comp);
+        } else {
+            stencil2d_wmma_kernel<T, false><<<grid, block, shared_bytes>>>(
+                in_buf, d_out_fp32, out_buf, d_identity_pos, d_identity_neg,
+                nx, ny, iter_num, write_fp32_flag, d_first_nf, nullptr);
+        }
+    };
+
     T* tc_in = d_in_tc;
     T* tc_out = d_out_tc;
     for (int i = 0; i < kWarmupIters; ++i) {
-        stencil2d_wmma_kernel<T><<<grid, block, shared_bytes>>>(
-            tc_in, d_out_fp32, tc_out, d_identity_pos, d_identity_neg,
-            nx, ny, i + 1, /*write_fp32=*/false, d_first_nf);
+        launch_wmma(tc_in, tc_out, i + 1, /*write_fp32_flag=*/false);
         std::swap(tc_in, tc_out);
     }
     CHECK_CUDA(cudaGetLastError());
@@ -1084,6 +1199,12 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     {
         const int init_val = INT_MAX;
         CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
+    }
+    // Reinicia el residuo de Kahan tras el warm-up, igual que d_first_nf: sin
+    // esto los residuos del warm-up (descartable) contaminarian el bucle
+    // medido (ver bloque 2 del prompt de correccion).
+    if (kahan_enabled) {
+        CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
     }
 
     // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
@@ -1123,6 +1244,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CudaEventTimer timer;
     double total_ms = 0.0;
     double checkpoint_ms_total = 0.0;
+    // Marcador FUERA del par de eventos CUDA (ver emit_csv_region_marker):
+    // arranca justo antes del primer timer.start(), no antes (el reinicio de
+    // d_first_nf/d_comp tras el warm-up no es parte de la region medida).
+    emit_csv_region_marker(route_label, "begin");
     timer.start();
     // El cronometro se pausa/reanuda alrededor del bloque de checkpoint (ver
     // mas abajo): sin eso, el tiempo GPU ocioso mientras el host hace el D2H
@@ -1135,9 +1260,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         const bool write_fp32 = (i + 1 == iters) ||
                                 (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0);
         CHECK_CUDA(cudaEventRecord(wmma_start[i]));
-        stencil2d_wmma_kernel<T><<<grid, block, shared_bytes>>>(
-            tc_in, d_out_fp32, tc_out, d_identity_pos, d_identity_neg,
-            nx, ny, i + 1, write_fp32, d_first_nf);
+        launch_wmma(tc_in, tc_out, i + 1, write_fp32);
         CHECK_CUDA(cudaEventRecord(wmma_stop[i]));
         std::swap(tc_in, tc_out);
 
@@ -1177,6 +1300,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
+    emit_csv_region_marker(route_label, "end");
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
@@ -1236,6 +1360,9 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaFree(d_identity_pos));
     CHECK_CUDA(cudaFree(d_identity_neg));
     CHECK_CUDA(cudaFree(d_first_nf));
+    if (d_comp != nullptr) {
+        CHECK_CUDA(cudaFree(d_comp));
+    }
 
     return build_metrics(nx, ny, total_ms / iters);
 }
@@ -1266,6 +1393,31 @@ static void print_error_metrics(const char* label_max, const char* label_l2,
     std::cout << label_max  << fmt_sci(e.max_abs)  << "\n";
     std::cout << label_l2   << fmt_sci(e.rel_l2)   << "\n";
     std::cout << label_linf << fmt_sci(e.rel_linf) << "\n";
+}
+
+// Analogo a print_error_metrics pero solo para rel_l2/rel_linf del ESTADO
+// PROPAGADO (el buffer T en 16 bits, no el acumulador FP32 sin redondear que
+// ya reporta print_error_metrics contra out_fp32): responde si Kahan acerca
+// FP16/BF16 a la exactitud de FP32 en lo que realmente encadena la siguiente
+// iteracion (metodologia 5.3/4.1.4). Mismas guardas de finitud; sin
+// max_abs/linf_abs porque el bloque solo pide L2/Linf relativos aqui.
+static void print_propagated_error_metrics(const ErrorMetrics& e, int first_nf) {
+    if (!e.reference_finite) {
+        std::cout << "Error relativo L2 (estado propagado, 16 bits)   : "
+                     "REFERENCIA NO FINITA: la solucion diverguio; L2/Linf no medibles\n";
+        return;
+    }
+    if (!e.solution_finite) {
+        std::cout << "Error relativo L2 (estado propagado, 16 bits)   : "
+                     "SOLUCION NO FINITA: la ruta diverguio; L2/Linf no medibles";
+        if (first_nf != INT_MAX) {
+            std::cout << " (desbordamiento de exponente en iteracion " << first_nf << ")";
+        }
+        std::cout << "\n";
+        return;
+    }
+    std::cout << "Error relativo L2 (estado propagado, 16 bits)   : " << fmt_sci(e.rel_l2) << "\n";
+    std::cout << "Error rel Linf (estado propagado, 16 bits)      : " << fmt_sci(e.rel_linf) << "\n";
 }
 
 // n == INT_MAX (sentinel de "nunca se marco") se reporta como "ninguna".
@@ -1323,33 +1475,68 @@ static void print_fp64_reference_norms(const std::vector<double>& y_ref, int fir
 // Abre el CSV en modo append; escribe la cabecera solo si el archivo aun no
 // existe (probeado antes de abrir en modo append, que no trunca ni crea con
 // contenido previo visible al ifstream).
+// Cabecera CSV FINAL de Fase 3 (incluye placeholders de Fase 4: energy_j,
+// avg_power_w, edp quedan "NA" hasta que un muestreador NVML externo los
+// llene, alineado por los marcadores CSV_REGION -- ver emit_csv_region_marker
+// y bloque 3 del prompt de correccion). Este esquema no cambia mas dentro de
+// Fase 3: Fase 4 solo llena esas tres columnas, no agrega ni reordena las
+// demas.
+static const char* kCsvHeader =
+    "kernel,formato,kahan,nx,ny,iters,t_ms_iter,t_ms_total,t_ms_iter_wmma,t_ms_iter_conv,"
+    "t_ms_iter_ckpt,gflops_utiles,rel_l2,rel_linf,linf_abs,ref_linf,rel_l2_prop,"
+    "rel_linf_prop,n_star,storage_rel_err,energy_j,avg_power_w,edp\n";
+
+// Abre el CSV en modo append; escribe la cabecera solo si el archivo aun no
+// existe. Si el archivo YA existe con una cabecera distinta a kCsvHeader
+// (p.ej. el esquema anterior a este bloque, sin columna kahan/rel_l2_prop/
+// energia), aborta en vez de appendear: mezclar filas con esquemas de
+// columnas distintos corrompe el CSV sin ningun aviso visible.
 static std::ofstream open_csv(const std::string& path) {
     std::ifstream probe(path);
     const bool exists = probe.good();
+    std::string existing_header;
+    if (exists) {
+        std::getline(probe, existing_header);
+        existing_header += '\n';
+    }
     probe.close();
+    if (exists && existing_header != kCsvHeader) {
+        std::cerr << "ERROR: " << path << " ya existe con una cabecera CSV distinta al "
+                     "esquema vigente (ver bloque 3, esquema final de Fase 3). No se puede "
+                     "appendear filas con columnas desalineadas: use un archivo --csv nuevo.\n"
+                  << "  Cabecera esperada  : " << kCsvHeader
+                  << "  Cabecera encontrada: " << existing_header;
+        std::exit(EXIT_FAILURE);
+    }
     std::ofstream csv(path, std::ios::app);
     if (!exists) {
-        csv << "kernel,formato,nx,ny,iters,t_ms_iter,t_ms_total,gflops_utiles,rel_l2,rel_linf,"
-               "linf_abs,ref_linf,n_star,storage_rel_err,t_ms_iter_wmma,t_ms_iter_conv\n";
+        csv << kCsvHeader;
     }
     return csv;
 }
 
 // Una fila por ruta/configuracion. n_star es -1 cuando la ruta se mantuvo
-// finita; storage_rel_err, t_ms_iter_wmma y t_ms_iter_conv son "NA" en
-// cpu_fp32/gpu_fp32 (no aplica: esas rutas no pasan por 16 bits ni separan
-// kernel WMMA de conversion).
-static void write_csv_row(std::ofstream& csv, const std::string& formato, int nx, int ny,
+// finita; storage_rel_err, t_ms_iter_wmma, t_ms_iter_conv, rel_l2_prop y
+// rel_linf_prop son "NA" en cpu_fp32/gpu_fp32 (no aplica: esas rutas no pasan
+// por 16 bits ni separan kernel WMMA de conversion). t_ms_iter_ckpt es "NA"
+// solo en cpu_fp32 (unica ruta sin CheckpointContext). energy_j/avg_power_w/
+// edp son SIEMPRE "NA" en Fase 3: los llena Fase 4 desde el muestreador NVML,
+// alineado por los marcadores CSV_REGION (ver emit_csv_region_marker).
+static void write_csv_row(std::ofstream& csv, const std::string& formato, bool kahan, int nx, int ny,
                           int iters, double t_ms_iter, double gflops, const ErrorMetrics& e,
                           int first_nf, const std::string& storage_rel_err,
                           const std::string& t_ms_iter_wmma = "NA",
-                          const std::string& t_ms_iter_conv = "NA") {
+                          const std::string& t_ms_iter_conv = "NA",
+                          const std::string& t_ms_iter_ckpt = "NA",
+                          const std::string& rel_l2_prop = "NA",
+                          const std::string& rel_linf_prop = "NA") {
     const int n_star = (first_nf == INT_MAX) ? -1 : first_nf;
-    csv << "stencil," << formato << "," << nx << "," << ny << "," << iters << ","
-        << fmt_sci(t_ms_iter) << "," << fmt_sci(t_ms_iter * iters) << "," << fmt_sci(gflops) << ","
-        << fmt_sci(e.rel_l2) << "," << fmt_sci(e.rel_linf) << "," << fmt_sci(e.max_abs) << ","
-        << fmt_sci(e.ref_linf) << "," << n_star << "," << storage_rel_err << ","
-        << t_ms_iter_wmma << "," << t_ms_iter_conv << "\n";
+    csv << "stencil," << formato << "," << (kahan ? 1 : 0) << "," << nx << "," << ny << ","
+        << iters << "," << fmt_sci(t_ms_iter) << "," << fmt_sci(t_ms_iter * iters) << ","
+        << t_ms_iter_wmma << "," << t_ms_iter_conv << "," << t_ms_iter_ckpt << ","
+        << fmt_sci(gflops) << "," << fmt_sci(e.rel_l2) << "," << fmt_sci(e.rel_linf) << ","
+        << fmt_sci(e.max_abs) << "," << fmt_sci(e.ref_linf) << "," << rel_l2_prop << ","
+        << rel_linf_prop << "," << n_star << "," << storage_rel_err << ",NA,NA,NA\n";
 }
 
 // Umbral de overflow por formato (maximo valor finito representable), solo
@@ -1358,19 +1545,23 @@ static void write_csv_row(std::ofstream& csv, const std::string& formato, int nx
 // no esta garantizado en compilacion host. BF16 comparte los 8 bits de
 // exponente de FP32 (mismo rango, distinta mantisa), por eso su umbral es
 // del mismo orden que el de FP32.
-// Constantes de overflow por formato: FMT_MAX y media unidad en el ultimo
-// lugar (media ULP). Con redondeo al mas cercano el error maximo introducido
-// por representar un valor en el formato T es media ULP de T; kFmtHalfUlp_T
-// es ese piso, usado para acotar la semilla minima de cada formato en
-// compute_overflow_horizon_from_reference.
+// Piso de siembra por formato, usado para acotar la semilla minima de cada
+// formato en compute_overflow_horizon_from_reference (semilla_T = max(A,
+// piso_T * ||u0||_inf)). El valor es 1/4 de la ULP real de T (unidad de
+// redondeo/media ULP: 2^-11 FP16, 2^-8 BF16, 2^-24 FP32, 2^-53 FP64) -- NO es
+// "media ULP" pese al nombre historico de la constante: es una calibracion
+// empirica del modelo de siembra del ajuste log-lineal (fit_overflow_model),
+// no una cota derivada de redondeo. Se conserva en 1/4 de ULP porque ajusta
+// mejor la prediccion de n* contra el horizonte medido que la ULP completa
+// (-3.6% de error de prediccion vs -7.1%).
 constexpr double kFp16Max = 65504.0;
-constexpr double kFp16HalfUlp = 2.44140625e-4;        // 2^-12
+constexpr double kFp16SeedFloor = 2.44140625e-4;      // 2^-12 (calibrado, 0.5 x unidad de redondeo 2^-11)
 constexpr double kBf16Max = 3.38953139e38;
-constexpr double kBf16HalfUlp = 1.953125e-3;          // 2^-9
+constexpr double kBf16SeedFloor = 1.953125e-3;        // 2^-9  (calibrado, 0.5 x unidad de redondeo 2^-8)
 constexpr double kFp32Max = 3.4028235e38;
-constexpr double kFp32HalfUlp = 2.98023225e-8;        // 2^-25
+constexpr double kFp32SeedFloor = 2.98023225e-8;      // 2^-25 (calibrado, 0.5 x unidad de redondeo 2^-24)
 constexpr double kFp64Max = 1.7976931348623157e308;
-constexpr double kFp64HalfUlp = 5.5511151e-17;        // 2^-54
+constexpr double kFp64SeedFloor = 5.5511151e-17;      // 2^-54 (calibrado, 0.5 x unidad de redondeo 2^-53)
 
 // Proyecta la condicion inicial u^0 (sin modificarla) sobre el modo de
 // Nyquist (pi,pi): a_nyq = |<u^0, e_nyq>| / N, con e_nyq(i,j) = (-1)^(i+j).
@@ -1501,10 +1692,10 @@ static OverflowHorizonPrediction compute_overflow_horizon_from_reference(
     }
 
     const double A = result.fit.A;
-    const double semilla_fp16 = std::max(A, kFp16HalfUlp * u0_linf);
-    const double semilla_bf16 = std::max(A, kBf16HalfUlp * u0_linf);
-    const double semilla_fp32 = std::max(A, kFp32HalfUlp * u0_linf);
-    const double semilla_fp64 = std::max(A, kFp64HalfUlp * u0_linf);
+    const double semilla_fp16 = std::max(A, kFp16SeedFloor * u0_linf);
+    const double semilla_bf16 = std::max(A, kBf16SeedFloor * u0_linf);
+    const double semilla_fp32 = std::max(A, kFp32SeedFloor * u0_linf);
+    const double semilla_fp64 = std::max(A, kFp64SeedFloor * u0_linf);
 
     // Calculos en espacio logaritmico, nunca divide (previene overflow en FP64).
     // La formula asume implicitamente log2(lambda) = 1 (lambda = 2.0, el
@@ -1560,11 +1751,11 @@ static void print_overflow_horizon(const OverflowHorizonPrediction& horizon,
               << ", lambda=" << std::setprecision(4) << fit.lambda << "\n";
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "  Contenido Nyquist exacto de u^0 (~0 para CI suave) : " << fmt_sci(a_nyq_ic) << "\n";
-    std::cout << "  Piso de redondeo (media ULP) por formato:\n";
-    std::cout << "    FP16                             : " << std::scientific << kFp16HalfUlp << "\n";
-    std::cout << "    BF16                             : " << std::scientific << kBf16HalfUlp << "\n";
-    std::cout << "    FP32                             : " << std::scientific << kFp32HalfUlp << "\n";
-    std::cout << "    FP64                             : " << std::scientific << kFp64HalfUlp << "\n";
+    std::cout << "  Piso de siembra por formato (calibrado, 0.5 x unidad de redondeo):\n";
+    std::cout << "    FP16                             : " << std::scientific << kFp16SeedFloor << "\n";
+    std::cout << "    BF16                             : " << std::scientific << kBf16SeedFloor << "\n";
+    std::cout << "    FP32                             : " << std::scientific << kFp32SeedFloor << "\n";
+    std::cout << "    FP64                             : " << std::scientific << kFp64SeedFloor << "\n";
 
     if (std::fabs(fit.lambda - 2.0) / 2.0 > 0.05) {
         std::cout << "  ADVERTENCIA: lambda_medido diverge >5% del valor teorico 2.0\n"
@@ -1583,6 +1774,7 @@ static void print_configuration(const Options& opt) {
     std::cout << "Iteraciones                : " << opt.iters << "\n";
     std::cout << "Tile Tensor Core           : 16x16 con WMMA\n";
     std::cout << "Acumulacion TC             : FP32\n";
+    std::cout << "Kahan (residuo almacen.)   : " << (opt.kahan ? "on" : "off") << "\n";
     std::cout << "===================================================\n\n";
 }
 
@@ -1596,11 +1788,11 @@ static const char* tc_mode_to_string(TensorCoreMode mode) {
 }
 
 // Metricas y regex deben coincidir con NCU_QUICK_METRICS / NCU_KERNEL_REGEX_WMMA
-// en Fase_2/common_ncu.sh y run_stencil_tc.sbatch (antes este hint mostraba solo
+// en tools/common_ncu.sh y run_stencil_tc.sbatch (antes este hint mostraba solo
 // 2 metricas mientras la corrida real usa las 12 de NCU_QUICK_METRICS).
 // --launch-skip se deriva de kWarmupIters (no un literal) para no desincronizarse.
 static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters,
-                              TensorCoreMode tc_mode) {
+                              TensorCoreMode tc_mode, bool kahan) {
     std::cout << "Validacion Nsight Compute (coincide con NCU_QUICK_METRICS):\n";
     std::cout << "  ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \\\n";
     std::cout << "      --launch-skip " << kWarmupIters << " --launch-count 1 \\\n";
@@ -1614,10 +1806,14 @@ static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters,
                  "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,"
                  "dram__bytes_read.sum,dram__bytes_write.sum,"
                  "l1tex__t_sector_hit_rate.pct,"
-                 "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct \\\n";
+                 "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct,"
+                 "launch__registers_per_thread,"
+                 "sm__sass_thread_inst_executed_op_fadd_pred_on.sum,"
+                 "smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct,"
+                 "launch__occupancy_limit_registers \\\n";
     std::cout << "      " << exe_name << " --nx " << nx << " --ny " << ny
               << " --iters " << iters << " --tc " << tc_mode_to_string(tc_mode)
-              << " --profile-only\n";
+              << " --kahan " << (kahan ? "on" : "off") << " --profile-only\n";
 }
 
 // Modo --profile-only: los ~1723 s de pared por llamada a ncu eran, sobre
@@ -1659,7 +1855,7 @@ static void run_profile_only(const Options& opt) {
         int onset_fp16 = -1;
         int first_nf_fp16 = INT_MAX;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
-                                                  opt.iters, ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16,
+                                                  opt.iters, opt.kahan, ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16,
                                                   t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                   t_checkpoint_ms_unused, y_tc_fp16_last_finite_unused,
                                                   y_tc_fp16_reduced_last_finite_unused);
@@ -1671,7 +1867,7 @@ static void run_profile_only(const Options& opt) {
         int onset_bf16 = -1;
         int first_nf_bf16 = INT_MAX;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
-                                                         opt.iters, ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16,
+                                                         opt.iters, opt.kahan, ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16,
                                                          t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                          t_checkpoint_ms_unused, y_tc_bf16_last_finite_unused,
                                                          y_tc_bf16_reduced_last_finite_unused);
@@ -1798,15 +1994,16 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     print_first_nonfinite("Primera iteracion no finita : ", first_nf_cpu, opt.iters);
     std::cout << "\n";
     if (csv_enabled) {
-        write_csv_row(csv, under_ncu ? "NCU_cpu_fp32" : "cpu_fp32", opt.nx, opt.ny, opt.iters,
+        write_csv_row(csv, under_ncu ? "NCU_cpu_fp32" : "cpu_fp32", opt.kahan, opt.nx, opt.ny, opt.iters,
                      cpu.ms, cpu.gflops, cpu_err, first_nf_cpu, "NA");
     }
 
     print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err,
                                first_nf_gpu_fp32, opt.iters, t_checkpoint_ms_gpu_fp32);
     if (csv_enabled) {
-        write_csv_row(csv, under_ncu ? "NCU_gpu_fp32" : "gpu_fp32", opt.nx, opt.ny, opt.iters,
-                     gpu.ms, gpu.gflops, gpu_err, first_nf_gpu_fp32, "NA");
+        write_csv_row(csv, under_ncu ? "NCU_gpu_fp32" : "gpu_fp32", opt.kahan, opt.nx, opt.ny, opt.iters,
+                     gpu.ms, gpu.gflops, gpu_err, first_nf_gpu_fp32, "NA", "NA", "NA",
+                     fmt_sci(t_checkpoint_ms_gpu_fp32));
     }
 
     bool ran_fp16 = false;
@@ -1823,7 +2020,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<float> y_tc_fp16_last_finite;
         std::vector<__half> y_tc_fp16_reduced_last_finite;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
-            input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters,
+            input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
             ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
             storage_rel_eval_iter_fp16, t_checkpoint_ms_fp16, y_tc_fp16_last_finite,
             y_tc_fp16_reduced_last_finite);
@@ -1841,6 +2038,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                                                 storage_rel_eval_iter_fp16)
             : StorageRelResult{0.0, -1};
         const double fp16_storage_rel = fp16_storage_result.rel_err;
+        // Estado PROPAGADO (buffer T crudo, no out_fp32): responde si Kahan
+        // acerca lo que realmente se encadena entre iteraciones a la
+        // exactitud de FP32 (ver print_propagated_error_metrics/bloque 2).
+        const ErrorMetrics tc_fp16_prop_err =
+            compare_fp64_ref_vs_fp32(y_ref, reduced_to_float(y_tc_fp16_reduced));
         // Sin instrumentar por separado el lector asume que el cuello de
         // botella es el Tensor Core; en realidad convert_float_to_half_kernel
         // (reconversion de d_out a T en cada iteracion) explica buena parte
@@ -1864,6 +2066,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " ms  (excluido del t/iter reportado)\n";
         print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
                             "Error rel Linf vs FP64             : ", tc_fp16_err, first_nf_fp16);
+        print_propagated_error_metrics(tc_fp16_prop_err, first_nf_fp16);
         print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
                             "Error rel Linf vs CPU FP32         : ", tc_fp16_vs_cpu_err, first_nf_fp16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_fp16, opt.iters);
@@ -1879,10 +2082,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         }
         std::cout << "\n\n";
         if (csv_enabled) {
-            write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.nx, opt.ny, opt.iters,
+            write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
                          fp16_storage_evaluable ? fmt_sci(fp16_storage_rel) : "NO_EVALUABLE",
-                         fmt_sci(t_wmma_ms_fp16), fmt_sci(t_conv_ms_fp16));
+                         fmt_sci(t_wmma_ms_fp16), fmt_sci(t_conv_ms_fp16), fmt_sci(t_checkpoint_ms_fp16),
+                         fmt_sci(tc_fp16_prop_err.rel_l2), fmt_sci(tc_fp16_prop_err.rel_linf));
         }
     }
 
@@ -1893,7 +2097,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<float> y_tc_bf16_last_finite;
         std::vector<__nv_bfloat16> y_tc_bf16_reduced_last_finite;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
-            input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters,
+            input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
             ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
             storage_rel_eval_iter_bf16, t_checkpoint_ms_bf16, y_tc_bf16_last_finite,
             y_tc_bf16_reduced_last_finite);
@@ -1908,6 +2112,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                                                        storage_rel_eval_iter_bf16)
             : StorageRelResult{0.0, -1};
         const double bf16_storage_rel = bf16_storage_result.rel_err;
+        // Ver comentario analogo en el bloque FP16: estado PROPAGADO (buffer
+        // T crudo), no out_fp32.
+        const ErrorMetrics tc_bf16_prop_err =
+            compare_fp64_ref_vs_fp32(y_ref, reduced_to_float(y_tc_bf16_reduced));
         // Ver comentario analogo en el bloque FP16: sin este desglose el
         // 2.3x de t/iter frente a GPU FP32 clasico se le atribuiria por
         // error al Tensor Core en vez de a convert_float_to_bfloat16_kernel.
@@ -1929,6 +2137,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << " ms  (excluido del t/iter reportado)\n";
         print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
                             "Error rel Linf vs FP64             : ", tc_bf16_err, first_nf_bf16);
+        print_propagated_error_metrics(tc_bf16_prop_err, first_nf_bf16);
         print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
                             "Error rel Linf vs CPU FP32         : ", tc_bf16_vs_cpu_err, first_nf_bf16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_bf16, opt.iters);
@@ -1944,10 +2153,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         }
         std::cout << "\n\n";
         if (csv_enabled) {
-            write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.nx, opt.ny, opt.iters,
+            write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,
                          bf16_storage_evaluable ? fmt_sci(bf16_storage_rel) : "NO_EVALUABLE",
-                         fmt_sci(t_wmma_ms_bf16), fmt_sci(t_conv_ms_bf16));
+                         fmt_sci(t_wmma_ms_bf16), fmt_sci(t_conv_ms_bf16), fmt_sci(t_checkpoint_ms_bf16),
+                         fmt_sci(tc_bf16_prop_err.rel_l2), fmt_sci(tc_bf16_prop_err.rel_linf));
         }
     }
 
@@ -1973,7 +2183,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::cout << "=====================================================\n\n";
     }
 
-    print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters, opt.tc_mode);
+    print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters, opt.tc_mode, opt.kahan);
 }
 
 }  // namespace
