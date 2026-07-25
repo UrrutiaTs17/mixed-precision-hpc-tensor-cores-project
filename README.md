@@ -46,10 +46,11 @@ mixed-precision-hpc-tensor-cores-project/
 │   ├── GEMM/
 │   ├── Convolution/
 │   ├── Stencil/
-│   ├── common.cuh           # Utilidades compartidas (CHECK_CUDA, timer, métricas)
-│   └── common_ncu.sh        # Definiciones compartidas de perfilado con Nsight Compute
+│   └── common.cuh           # Utilidades compartidas (CHECK_CUDA, timer, métricas)
 ├── Fase_3/                  # Cuantificación del drift numérico (encadenamiento genuino)
 │   └── Stencil/
+├── tools/
+│   └── common_ncu.sh        # Definiciones compartidas de perfilado con Nsight Compute
 ├── README.md
 └── .gitignore
 ```
