@@ -50,10 +50,10 @@
 #include <tuple>
 #include <vector>
 
-// A nivel global (NO dentro del namespace anonimo de abajo): ver el
-// comentario "IMPORTANT" en telemetry.cuh sobre por que <nvml.h>/<dirent.h>
-// necesitan quedar fuera de cualquier namespace anonimo.
-#include "../../Fase_2/telemetry.cuh"
+// El header de telemetria queda a nivel global porque incluye <nvml.h> cuando
+// el sbatch habilita NVML; las declaraciones C de NVML no deben caer dentro
+// del namespace anonimo de este archivo.
+#include "tools/power_sampling.h"
 
 namespace {
 
@@ -113,6 +113,22 @@ static std::string fmt_sci(double v) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.6e", v);
     return buf;
+}
+
+static std::string fmt_csv_num(double v) {
+    return std::isfinite(v) ? fmt_sci(v) : "NaN";
+}
+
+static std::string fmt_csv_error_num(const ErrorMetrics& e, double v) {
+    return (e.reference_finite && e.solution_finite && std::isfinite(v)) ? fmt_sci(v) : "NaN";
+}
+
+static const char* kahan_label(bool kahan) {
+    return kahan ? "on" : "off";
+}
+
+static std::string csv_first_nonfinite_field(int first_nf) {
+    return std::to_string((first_nf == INT_MAX) ? -1 : first_nf);
 }
 
 // Marcador de telemetria para Fase 4: emite por stdout el limite de una
@@ -351,7 +367,8 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
                                      int nx,
                                      int ny,
                                      int iters,
-                                     int& first_nonfinite_iter) {
+                                     int& first_nonfinite_iter,
+                                     EnergyMeasurement& out_energy) {
     // first_nf == nullptr durante el warm-up: esas iteraciones son descartables
     // y no deben contaminar la medicion (se reinicia antes del bucle medido).
     auto apply = [&](const std::vector<float>& src, std::vector<float>& dst,
@@ -377,6 +394,7 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
         }
     };
 
+    const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
     {
         std::vector<float> warm_a = in;
         std::vector<float> warm_b = in;
@@ -394,6 +412,8 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
     std::vector<float>* dst = &buf_b;
 
     first_nonfinite_iter = INT_MAX;
+    const RAEnergySnapshot rapl_before = rapl_snapshot_now();
+    (void)rapl_warmup_before;
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iters; ++i) {
         apply(*src, *dst, i + 1, &first_nonfinite_iter);
@@ -402,6 +422,20 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
     auto end = std::chrono::high_resolution_clock::now();
 
     const double avg_ms = std::chrono::duration<double, std::milli>(end - start).count() / iters;
+    const RAEnergySnapshot rapl_after = rapl_snapshot_now();
+    out_energy = EnergyMeasurement{};
+    out_energy.time_total_s = std::chrono::duration<double>(end - start).count();
+    out_energy.gpu_valid = true;  // La ruta CPU no requiere una lectura NVML.
+    out_energy.cpu_valid = rapl_before.valid && rapl_after.valid &&
+                           rapl_after.energy_j >= rapl_before.energy_j;
+    if (out_energy.cpu_valid) {
+        out_energy.energy_cpu_j = rapl_energy_delta(rapl_before, rapl_after);
+        out_energy.energy_total_j = out_energy.energy_cpu_j;
+        out_energy.edp_j_s = out_energy.energy_total_j * out_energy.time_total_s;
+        const double flops_total = 9.0 * static_cast<double>(nx - 2) *
+                                   static_cast<double>(ny - 2) * iters;
+        out_energy.joules_per_gflop = out_energy.energy_total_j / (flops_total / 1e9);
+    }
     out = *src;
     return build_metrics(nx, ny, avg_ms);
 }
@@ -411,6 +445,13 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
 // de checkpoints; ver compute_cpu_stencil_fp64).
 static bool all_finite_fp64(const std::vector<double>& v) {
     for (double x : v) {
+        if (!std::isfinite(x)) return false;
+    }
+    return true;
+}
+
+static bool all_finite_fp32(const std::vector<float>& v) {
+    for (float x : v) {
         if (!std::isfinite(x)) return false;
     }
     return true;
@@ -568,14 +609,17 @@ struct CheckpointContext {
 };
 
 // Emite una fila CSV_DRIFT parseable para (ruta, checkpoint). Reutiliza las
-// guardas de finitud de ErrorMetrics: si la ruta diverge en este checkpoint
-// (solution_finite == false) imprime NONFINITE en los tres campos de error
-// en vez de un numero, para nunca imprimir "0.000000" ante inf/NaN. La
-// norma de referencia (ref_l2_norm) es siempre finita aqui porque
-// record_checkpoint solo llama a esta funcion para checkpoints con
-// referencia FP64 finita.
+// guardas de finitud de ErrorMetrics: si la referencia FP64 o la ruta divergen
+// en este checkpoint, imprime NONFINITE en los campos afectados en vez de un
+// numero, para nunca retener una norma finita obsoleta ante inf/NaN.
 static void emit_csv_drift_row(const char* route, int iter_number, const ErrorMetrics& e) {
-    std::cout << "CSV_DRIFT," << route << "," << iter_number << "," << fmt_sci(e.ref_l2_norm) << ",";
+    std::cout << "CSV_DRIFT," << route << "," << iter_number << ",";
+    if (!e.reference_finite) {
+        std::cout << "NONFINITE,NONFINITE,NONFINITE,NONFINITE\n";
+        return;
+    }
+
+    std::cout << fmt_sci(e.ref_l2_norm) << ",";
     if (!e.solution_finite) {
         std::cout << "NONFINITE,NONFINITE,NONFINITE\n";
     } else {
@@ -583,21 +627,34 @@ static void emit_csv_drift_row(const char* route, int iter_number, const ErrorMe
     }
 }
 
+static void emit_csv_drift_nonfinite_reference_row(const char* route, int iter_number) {
+    std::cout << "CSV_DRIFT," << route << "," << iter_number
+              << ",NONFINITE,NONFINITE,NONFINITE,NONFINITE\n";
+}
+
 // Precondicion (garantizada por los llamadores, ver mas abajo): ckpt.checkpoint_every > 0
 // y iter_number % ckpt.checkpoint_every == 0. Si el checkpoint cae fuera del
-// rango con referencia finita (ver compute_cpu_stencil_fp64), no emite nada
-// (asi se "deja de emitir la curva" una vez la referencia FP64 diverge).
-// Si no, compara host_buf (ya copiado D2H por el llamador, sin copia extra)
-// contra el snapshot FP64 correspondiente, emite CSV_DRIFT y registra en
-// onset_iter el PRIMER checkpoint en que la ruta (no la referencia) deja de
-// ser finita.
+// rango con referencia finita (ver compute_cpu_stencil_fp64), emite CSV_DRIFT
+// con ref_l2=NONFINITE y propaga esa no-finitud al resto de columnas de error
+// sin cambiar el esquema historico del token. Si no, compara host_buf (ya
+// copiado D2H por el llamador, sin copia extra) contra el snapshot FP64
+// correspondiente. En ambos casos registra en onset_iter el PRIMER checkpoint
+// en que la ruta (no la referencia) deja de ser finita.
 static void record_checkpoint(const CheckpointContext& ckpt,
                               const char* route,
                               int iter_number,
                               const std::vector<float>& host_buf,
                               int& onset_iter) {
     const int ckpt_idx = iter_number / ckpt.checkpoint_every - 1;
-    if (ckpt_idx < 0 || ckpt_idx >= static_cast<int>(ckpt.fp64_checkpoints.size())) return;
+    if (ckpt_idx < 0) return;
+
+    if (ckpt_idx >= static_cast<int>(ckpt.fp64_checkpoints.size())) {
+        emit_csv_drift_nonfinite_reference_row(route, iter_number);
+        if (!all_finite_fp32(host_buf) && onset_iter < 0) {
+            onset_iter = iter_number;
+        }
+        return;
+    }
 
     const ErrorMetrics e = compare_fp64_ref_vs_fp32(ckpt.fp64_checkpoints[ckpt_idx], host_buf);
     emit_csv_drift_row(route, iter_number, e);
@@ -616,7 +673,7 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
                                           int& onset_iter,
                                           int& first_nonfinite_iter,
                                           double& t_checkpoint_ms_out,
-                                          EnergySample& out_energy) {
+                                          EnergyMeasurement& out_energy) {
     const size_t count = in.size();
     float* d_a = nullptr;
     float* d_b = nullptr;
@@ -629,6 +686,10 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     // en cualquier buffer que llegue a jugar el rol de d_out.
     CHECK_CUDA(cudaMemcpy(d_a, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_b, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+
+    PowerBuffer* power_buffer = power_buffer_create(0);
+    const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
+    power_buffer_start_sampling(power_buffer);
 
     dim3 block(16, 16);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
@@ -654,6 +715,10 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         const int init_val = INT_MAX;
         CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
     }
+    power_buffer_stop_sampling(power_buffer);
+    power_buffer_samples_clear(power_buffer);
+    const RAEnergySnapshot rapl_before = rapl_snapshot_now();
+    (void)rapl_warmup_before;
 
     // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
     // costo) cuando el checkpointing esta desactivado.
@@ -667,12 +732,10 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     CudaEventTimer timer;
     double total_ms = 0.0;
     double checkpoint_ms_total = 0.0;
-    // Marcador FUERA del par de eventos CUDA (ver emit_csv_region_marker).
-    // EnergyProbe envuelve exactamente la misma ventana que el marcador: dos
-    // lecturas de contador (begin/end), sin sampling.
-    EnergyProbe energy_probe;
     emit_csv_region_marker(route_label, "begin");
-    energy_probe.begin();
+    const auto energy_t0 = std::chrono::steady_clock::now();
+    power_buffer_samples_clear(power_buffer);
+    power_buffer_start_sampling(power_buffer);
     timer.start();
     // El cronometro se pausa/reanuda alrededor del bloque de checkpoint: sin
     // eso, el tiempo GPU ocioso mientras el host hace el D2H queda
@@ -698,9 +761,16 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
-    energy_probe.end();
+    power_buffer_stop_sampling(power_buffer);
+    const RAEnergySnapshot rapl_after = rapl_snapshot_now();
+    const auto energy_t1 = std::chrono::steady_clock::now();
     emit_csv_region_marker(route_label, "end");
-    out_energy = energy_probe.result();
+    const double energy_wall_s = std::chrono::duration<double>(energy_t1 - energy_t0).count();
+    const double flops_total = 9.0 * static_cast<double>(nx - 2) *
+                               static_cast<double>(ny - 2) * iters;
+    out_energy = make_energy_measurement(power_buffer, rapl_before, rapl_after,
+                                         energy_wall_s, flops_total);
+    power_buffer_destroy(power_buffer);
     t_checkpoint_ms_out = checkpoint_ms_total / iters;
     CHECK_CUDA(cudaGetLastError());
     // Tras el ultimo swap, d_in apunta al buffer con la salida mas reciente.
@@ -1025,56 +1095,84 @@ static std::vector<float> reduced_to_float(const std::vector<T>& reduced) {
     return out;
 }
 
-// Minimo NORMAL representable por T (no el minimo subnormal). Por debajo de
-// este umbral T representa el valor como subnormal, donde la mantisa
-// efectiva se encoge a medida que el exponente se satura en cero: la
-// precision relativa del formato deja de estar acotada por una ULP fija, asi
-// que medir error relativo ahi no dice nada del formato "normal". Se usa
-// como umbral de exclusion en storage_roundtrip_rel_err, reemplazando el
-// umbral anterior (1e-30 * ||x||_inf, relativo al elemento mas grande del
-// buffer): ese umbral admitia subnormales, por lo que FP16 media
-// 4.544995e-03 (9.3x por encima de su unidad de redondeo 2^-11 = 4.8828e-4)
-// mientras BF16 (sin subnormales relevantes en este rango, minimo normal
-// 1.18e-38) media 3.891051e-03, 99.6% de su propia cota.
-template <typename T>
-constexpr double kMinNormalTc();
-template <>
-constexpr double kMinNormalTc<__half>() { return 6.103515625e-05; }  // 2^-14
-template <>
-constexpr double kMinNormalTc<__nv_bfloat16>() { return 1.17549435e-38; }  // 2^-126
+static inline __half host_float_to_tc_impl(float v, __half*) { return __float2half(v); }
+static inline __nv_bfloat16 host_float_to_tc_impl(float v, __nv_bfloat16*) { return __float2bfloat16(v); }
 
-// Mide cuanto se pierde SOLO por el hecho de guardar el resultado WMMA (que
-// internamente ya vive en float, via el acumulador de Tensor Cores) en 16
-// bits, como error relativo POR ELEMENTO:
-//   storage_rel = max_i |x_i - float(T(x_i))| / |x_i|
-// sobre los i con |x_i| > kMinNormalTc<T>() (excluye elementos que T
-// representaria como subnormal, donde el error relativo del formato no esta
-// acotado por una ULP fija; ver comentario de kMinNormalTc). Queda acotado de
-// forma deterministica por media ULP del formato T (redondeo al mas
-// cercano) para todo elemento que sobrevive el filtro.
-// Siempre se evalua sobre la ULTIMA ITERACION FINITA de computed (incluso
-// si la ruta divergio despues), garantizando que todos los valores sean
-// finitos.
+template <typename T>
+static T host_float_to_tc(float v) {
+    return host_float_to_tc_impl(v, static_cast<T*>(nullptr));
+}
+
+// Mide cuanto se pierde SOLO por aplicar el round-trip de almacenamiento
+// float -> T -> float al estado propagado u. Importante para --kahan on:
+// esto no lee el residuo de compensacion ni compara contra el valor realmente
+// desplazado por Kahan antes de almacenar; mide Q(u)-u sobre el estado FP32
+// finito que el stencil produjo en la iteracion evaluada.
 struct StorageRelResult {
-    double rel_err = 0.0;
+    double rel_norm = std::numeric_limits<double>::quiet_NaN();
+    double rel_max_guarded = std::numeric_limits<double>::quiet_NaN();
+    size_t excluded_count = 0;
     int eval_iter = 0;  // iter en que se evaluo (util para anotar)
+    bool evaluated = false;
 };
 
 template <typename T>
-static StorageRelResult storage_roundtrip_rel_err(const std::vector<float>& computed,
-                                                  const std::vector<T>& stored,
+static StorageRelResult storage_roundtrip_metrics(const std::vector<float>& state,
                                                   int iter_context) {
-    const double threshold = kMinNormalTc<T>();
+    StorageRelResult result;
+    result.eval_iter = iter_context;
 
-    double max_rel = 0.0;
-    for (size_t i = 0; i < computed.size(); ++i) {
-        const double x = static_cast<double>(computed[i]);
-        if (!std::isfinite(x) || std::fabs(x) <= threshold) continue;  // subnormal en T: precision sin cota fija
-        const double t = static_cast<double>(host_val_to_float(stored[i]));
-        if (!std::isfinite(t)) continue;  // Fallback por seguridad
-        max_rel = std::max(max_rel, std::fabs(x - t) / std::fabs(x));
+    double norm_inf = 0.0;
+    double sq_state = 0.0;
+    double sq_err = 0.0;
+    bool all_finite = true;
+    for (float xf : state) {
+        const double x = static_cast<double>(xf);
+        if (!std::isfinite(x)) {
+            all_finite = false;
+            break;
+        }
+        const double q = static_cast<double>(host_val_to_float(host_float_to_tc<T>(xf)));
+        if (!std::isfinite(q)) {
+            all_finite = false;
+            break;
+        }
+        const double diff = q - x;
+        norm_inf = std::max(norm_inf, std::fabs(x));
+        sq_state += x * x;
+        sq_err += diff * diff;
     }
-    return {max_rel, iter_context};
+
+    if (!all_finite || !std::isfinite(norm_inf) || !std::isfinite(sq_state) ||
+        !std::isfinite(sq_err) || sq_state <= 0.0) {
+        return result;
+    }
+
+    result.evaluated = true;
+    result.rel_norm = std::sqrt(sq_err / sq_state);
+
+    const double tau = 1.0e-6 * norm_inf;
+    bool any_included = false;
+    double max_rel = 0.0;
+    for (float xf : state) {
+        const double x = static_cast<double>(xf);
+        const double abs_x = std::fabs(x);
+        if (abs_x < tau) {
+            result.excluded_count++;
+            continue;
+        }
+        if (abs_x == 0.0) {
+            result.excluded_count++;
+            continue;
+        }
+        const double q = static_cast<double>(host_val_to_float(host_float_to_tc<T>(xf)));
+        max_rel = std::max(max_rel, std::fabs(q - x) / abs_x);
+        any_included = true;
+    }
+    if (any_included) {
+        result.rel_max_guarded = max_rel;
+    }
+    return result;
 }
 
 // Encadenamiento genuino salida(i) -> entrada(i+1): el kernel WMMA ahora
@@ -1111,7 +1209,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  double& t_checkpoint_ms_out,
                                                  std::vector<float>& out_last_finite_o,
                                                  std::vector<T>& out_reduced_last_finite_o,
-                                                 EnergySample& out_energy) {
+                                                 EnergyMeasurement& out_energy) {
     const size_t count = in.size();
     float* d_in_fp32 = nullptr;
     float* d_out_fp32 = nullptr;
@@ -1190,6 +1288,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         }
     };
 
+    PowerBuffer* power_buffer = power_buffer_create(0);
+    const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
+    power_buffer_start_sampling(power_buffer);
+
     T* tc_in = d_in_tc;
     T* tc_out = d_out_tc;
     for (int i = 0; i < kWarmupIters; ++i) {
@@ -1219,6 +1321,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     if (kahan_enabled) {
         CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
     }
+    power_buffer_stop_sampling(power_buffer);
+    power_buffer_samples_clear(power_buffer);
+    const RAEnergySnapshot rapl_before = rapl_snapshot_now();
+    (void)rapl_warmup_before;
 
     // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
     // costo) cuando el checkpointing esta desactivado. Tambien se usa para
@@ -1257,13 +1363,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CudaEventTimer timer;
     double total_ms = 0.0;
     double checkpoint_ms_total = 0.0;
-    // Marcador FUERA del par de eventos CUDA (ver emit_csv_region_marker):
-    // arranca justo antes del primer timer.start(), no antes (el reinicio de
-    // d_first_nf/d_comp tras el warm-up no es parte de la region medida).
-    // EnergyProbe envuelve exactamente la misma ventana que el marcador.
-    EnergyProbe energy_probe;
     emit_csv_region_marker(route_label, "begin");
-    energy_probe.begin();
+    const auto energy_t0 = std::chrono::steady_clock::now();
+    power_buffer_samples_clear(power_buffer);
+    power_buffer_start_sampling(power_buffer);
     timer.start();
     // El cronometro se pausa/reanuda alrededor del bloque de checkpoint (ver
     // mas abajo): sin eso, el tiempo GPU ocioso mientras el host hace el D2H
@@ -1316,9 +1419,16 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
-    energy_probe.end();
+    power_buffer_stop_sampling(power_buffer);
+    const RAEnergySnapshot rapl_after = rapl_snapshot_now();
+    const auto energy_t1 = std::chrono::steady_clock::now();
     emit_csv_region_marker(route_label, "end");
-    out_energy = energy_probe.result();
+    const double energy_wall_s = std::chrono::duration<double>(energy_t1 - energy_t0).count();
+    const double flops_total = 9.0 * static_cast<double>(nx - 2) *
+                               static_cast<double>(ny - 2) * iters;
+    out_energy = make_energy_measurement(power_buffer, rapl_before, rapl_after,
+                                         energy_wall_s, flops_total);
+    power_buffer_destroy(power_buffer);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
@@ -1448,6 +1558,161 @@ static void print_first_nonfinite(const char* label, int first_nf, int iters) {
     }
 }
 
+constexpr double kFp16StorageUlp = 4.8828125e-4;  // 2^-11
+constexpr double kBf16StorageUlp = 3.90625e-3;    // 2^-8
+
+static void append_storage_eval_annotation(const StorageRelResult& storage, int iters) {
+    if (storage.eval_iter > 0 && storage.eval_iter < iters) {
+        std::cout << "  (eval. en iter " << storage.eval_iter << ")";
+    }
+}
+
+static void print_storage_metrics(const char* format_label,
+                                  const StorageRelResult& storage,
+                                  bool storage_evaluable,
+                                  int iters,
+                                  double warning_threshold) {
+    const std::string prefix = std::string(" en ") + format_label;
+    if (!storage_evaluable || !storage.evaluated) {
+        const char* msg = storage_evaluable
+            ? "NO EVALUABLE (estado de evaluacion no finito o norma nula)"
+            : "NO EVALUABLE (la ruta divergio antes de cualquier checkpoint finito;"
+              " use --checkpoint-every para medir store_rel de forma confiable)";
+        std::cout << "Error relativo L2 al guardar" << prefix
+                  << " (store_rel_norm)      : " << msg << "\n";
+        std::cout << "Error relativo max por elemento al guardar" << prefix
+                  << " (store_rel_max_guarded): " << msg << "\n";
+        std::cout << "Elementos excluidos al guardar" << prefix
+                  << " (store_excluded_count): " << msg << "\n";
+        return;
+    }
+
+    std::cout << "Error relativo L2 al guardar" << prefix
+              << " (store_rel_norm)      : " << fmt_csv_num(storage.rel_norm);
+    append_storage_eval_annotation(storage, iters);
+    std::cout << "\n";
+
+    std::cout << "Error relativo max por elemento al guardar" << prefix
+              << " (store_rel_max_guarded): " << fmt_csv_num(storage.rel_max_guarded);
+    append_storage_eval_annotation(storage, iters);
+    std::cout << "\n";
+
+    std::cout << "Elementos excluidos al guardar" << prefix
+              << " (store_excluded_count): " << storage.excluded_count;
+    append_storage_eval_annotation(storage, iters);
+    std::cout << "\n";
+
+    if (std::isfinite(storage.rel_max_guarded) && storage.rel_max_guarded > warning_threshold) {
+        std::cout << "ADVERTENCIA: store_rel_max_guarded=" << fmt_sci(storage.rel_max_guarded)
+                  << " supera 2 ulp en iter " << storage.eval_iter << "\n";
+    }
+}
+
+static std::string storage_num_field(const StorageRelResult& storage,
+                                     bool storage_evaluable,
+                                     double value) {
+    return (storage_evaluable && storage.evaluated && std::isfinite(value)) ? fmt_sci(value) : "NaN";
+}
+
+static std::string storage_count_field(const StorageRelResult& storage, bool storage_evaluable) {
+    return (storage_evaluable && storage.evaluated) ? std::to_string(storage.excluded_count) : "NaN";
+}
+
+static std::string storage_eval_iter_field(const StorageRelResult& storage, bool storage_evaluable) {
+    return (storage_evaluable && storage.evaluated && storage.eval_iter >= 0)
+           ? std::to_string(storage.eval_iter) : "NaN";
+}
+
+static std::string energy_csv_field(bool valid, double value) {
+    return (valid && std::isfinite(value)) ? fmt_sci(value) : "NaN";
+}
+
+static void print_energy_metrics(const EnergyMeasurement& energy) {
+    std::cout << "Energy GPU    : " << energy_csv_field(energy.gpu_valid, energy.energy_gpu_j) << " J\n";
+    std::cout << "Energy CPU    : " << energy_csv_field(energy.cpu_valid, energy.energy_cpu_j) << " J\n";
+    const bool total_valid = energy.gpu_valid && energy.cpu_valid;
+    std::cout << "Energy total  : " << energy_csv_field(total_valid, energy.energy_total_j) << " J\n";
+    std::cout << "EDP           : " << energy_csv_field(total_valid, energy.edp_j_s) << " J s\n";
+    std::cout << "Joules/GFLOP  : " << energy_csv_field(total_valid, energy.joules_per_gflop) << "\n";
+}
+
+static void emit_csv_energy_row(const char* route,
+                                int nx,
+                                int ny,
+                                int iters,
+                                bool kahan,
+                                const EnergyMeasurement& energy,
+                                double flops_total) {
+    const bool total_valid = energy.gpu_valid && energy.cpu_valid;
+    std::cout << "CSV_ENERGY," << route << "," << nx << "," << ny << "," << iters << ","
+              << kahan_label(kahan) << ","
+              << energy_csv_field(energy.gpu_valid, energy.energy_gpu_j) << ","
+              << energy_csv_field(energy.cpu_valid, energy.energy_cpu_j) << ","
+              << energy_csv_field(total_valid, energy.energy_total_j) << ","
+              << energy_csv_field(total_valid, energy.edp_j_s) << ","
+              << energy_csv_field(total_valid, energy.joules_per_gflop) << ","
+              << energy_csv_field(std::isfinite(energy.time_total_s), energy.time_total_s) << ","
+              << energy_csv_field(std::isfinite(flops_total), flops_total / 1e9) << "\n";
+}
+
+static void emit_csv_summary_row(const char* route,
+                                 int nx,
+                                 int ny,
+                                 int iters,
+                                 bool kahan,
+                                 double t_iter_ms,
+                                 double gflops,
+                                 const std::string& speedup_cpu,
+                                 const std::string& speedup_fp32,
+                                 const std::string& t_kernel_ms,
+                                 const std::string& t_convert_ms,
+                                 const std::string& t_checkpoint_ms,
+                                 const ErrorMetrics& err,
+                                 int first_nf,
+                                 const std::string& rel_l2_prop,
+                                 const std::string& rel_linf_prop,
+                                 const std::string& store_rel_norm,
+                                 const std::string& store_rel_max_guarded,
+                                 const std::string& store_excluded_count,
+                                 const std::string& store_eval_iter,
+                                 const EnergyMeasurement& energy) {
+    std::cout << "CSV_SUMMARY," << route << "," << nx << "," << ny << "," << iters << ","
+              << kahan_label(kahan) << "," << fmt_csv_num(t_iter_ms) << ","
+              << fmt_csv_num(t_iter_ms * iters) << "," << fmt_csv_num(gflops) << ","
+              << speedup_cpu << "," << speedup_fp32 << "," << t_kernel_ms << ","
+              << t_convert_ms << "," << t_checkpoint_ms << ","
+              << fmt_csv_error_num(err, err.rel_l2) << ","
+              << fmt_csv_error_num(err, err.rel_linf) << ","
+              << fmt_csv_error_num(err, err.max_abs) << ","
+              << rel_l2_prop << "," << rel_linf_prop << ","
+              << csv_first_nonfinite_field(first_nf) << ","
+              << store_rel_norm << "," << store_rel_max_guarded << ","
+              << store_excluded_count << "," << store_eval_iter << ","
+              << energy_csv_field(energy.gpu_valid, energy.energy_gpu_j) << ","
+              << energy_csv_field(energy.cpu_valid, energy.energy_cpu_j) << ","
+              << energy_csv_field(energy.gpu_valid && energy.cpu_valid, energy.energy_total_j) << ","
+              << energy_csv_field(energy.gpu_valid && energy.cpu_valid, energy.edp_j_s) << ","
+              << energy_csv_field(energy.gpu_valid && energy.cpu_valid, energy.joules_per_gflop)
+              << "\n";
+}
+
+static void emit_csv_store_row(const char* route,
+                               int nx,
+                               int ny,
+                               int iters,
+                               bool kahan,
+                               const StorageRelResult& storage,
+                               bool storage_evaluable,
+                               double format_ulp) {
+    std::cout << "CSV_STORE," << route << "," << nx << "," << ny << "," << iters << ","
+              << kahan_label(kahan) << ","
+              << storage_num_field(storage, storage_evaluable, storage.rel_norm) << ","
+              << storage_num_field(storage, storage_evaluable, storage.rel_max_guarded) << ","
+              << storage_count_field(storage, storage_evaluable) << ","
+              << storage_eval_iter_field(storage, storage_evaluable) << ","
+              << fmt_csv_num(format_ulp) << "\n";
+}
+
 static void print_reference_comparison(const char* label,
                                        const Metrics& m,
                                        double ref_ms,
@@ -1494,12 +1759,10 @@ static void print_fp64_reference_norms(const std::vector<double>& y_ref, int fir
 // existe (probeado antes de abrir en modo append, que no trunca ni crea con
 // contenido previo visible al ifstream).
 // Cabecera CSV FINAL de Fase 3 (incluye las 3 columnas de Fase 4: energy_j,
-// avg_power_w, edp -- llenadas in-process por EnergyProbe/telemetry.cuh en
-// la misma ventana begin/end que emit_csv_region_marker delimita; "NA" si
-// -DUSE_NVML_TELEMETRY no esta activo o si la ruta no tiene sonda de GPU
-// aplicable, ver write_csv_row). Este esquema no cambia mas dentro de
-// Fase 3: Fase 4 solo llena esas tres columnas, no agrega ni reordena las
-// demas.
+// avg_power_w, edp -- llenadas in-process por PowerBuffer/RAPL en la misma
+// ventana begin/end que emit_csv_region_marker delimita; "NA" si la sonda
+// no es valida para la ruta. Este CSV opcional conserva su esquema historico;
+// el stdout parseable de Fase 3 usa CSV_SUMMARY y CSV_ENERGY.
 static const char* kCsvHeader =
     "kernel,formato,kahan,nx,ny,iters,t_ms_iter,t_ms_total,t_ms_iter_wmma,t_ms_iter_conv,"
     "t_ms_iter_ckpt,gflops_utiles,rel_l2,rel_linf,linf_abs,ref_linf,rel_l2_prop,"
@@ -1789,6 +2052,55 @@ static void print_overflow_horizon(const OverflowHorizonPrediction& horizon,
     std::cout << "=======================================================\n\n";
 }
 
+static std::string csv_measured_horizon_field(int measured_n) {
+    return std::to_string((measured_n == INT_MAX) ? -1 : measured_n);
+}
+
+static void emit_csv_horizon_row(const char* format,
+                                 int nx,
+                                 int ny,
+                                 int iters,
+                                 bool kahan,
+                                 double predicted,
+                                 int measured_n,
+                                 const OverflowFitResult& fit,
+                                 double a_nyq_ic,
+                                 double seed_floor) {
+    const bool fit_ok = fit.valid;
+    std::cout << "CSV_HORIZON," << format << "," << nx << "," << ny << "," << iters << ","
+              << kahan_label(kahan) << ","
+              << (fit_ok ? fmt_csv_num(predicted) : "NaN") << ","
+              << csv_measured_horizon_field(measured_n) << ","
+              << (fit_ok ? fmt_csv_num(fit.lambda) : "NaN") << ","
+              << (fit_ok ? fmt_csv_num(fit.r_squared) : "NaN") << ","
+              << fit.n_points << ","
+              << (fit_ok ? fmt_csv_num(fit.A) : "NaN") << ","
+              << fmt_csv_num(a_nyq_ic) << ","
+              << fmt_csv_num(seed_floor) << ","
+              << (fit_ok ? "ok" : "insufficient_points") << "\n";
+}
+
+static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
+                                  double a_nyq_ic,
+                                  int nx,
+                                  int ny,
+                                  int iters,
+                                  bool kahan,
+                                  int n_fp16,
+                                  int n_bf16,
+                                  int n_gpu_fp32,
+                                  int n_fp64) {
+    const OverflowFitResult& fit = horizon.fit;
+    emit_csv_horizon_row("FP16", nx, ny, iters, kahan, horizon.pred_fp16, n_fp16,
+                         fit, a_nyq_ic, kFp16SeedFloor);
+    emit_csv_horizon_row("BF16", nx, ny, iters, kahan, horizon.pred_bf16, n_bf16,
+                         fit, a_nyq_ic, kBf16SeedFloor);
+    emit_csv_horizon_row("FP32", nx, ny, iters, kahan, horizon.pred_fp32, n_gpu_fp32,
+                         fit, a_nyq_ic, kFp32SeedFloor);
+    emit_csv_horizon_row("FP64", nx, ny, iters, kahan, horizon.pred_fp64, n_fp64,
+                         fit, a_nyq_ic, kFp64SeedFloor);
+}
+
 static void print_configuration(const Options& opt) {
     std::cout << "================== CONFIGURACION ==================\n";
     std::cout << "Stencil                    : 2D 5-puntos\n";
@@ -1866,7 +2178,7 @@ static void run_profile_only(const Options& opt) {
     int onset_gpu_fp32 = -1;
     int first_nf_gpu_fp32 = INT_MAX;
     double t_checkpoint_ms_unused_fp32 = 0.0;
-    EnergySample e_unused_fp32;
+    EnergyMeasurement e_unused_fp32;
     benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters,
                                ckpt, "GPU_FP32", onset_gpu_fp32, first_nf_gpu_fp32,
                                t_checkpoint_ms_unused_fp32, e_unused_fp32);
@@ -1880,7 +2192,7 @@ static void run_profile_only(const Options& opt) {
         std::vector<__half> y_tc_fp16_reduced_last_finite_unused;
         int onset_fp16 = -1;
         int first_nf_fp16 = INT_MAX;
-        EnergySample e_unused_fp16;
+        EnergyMeasurement e_unused_fp16;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
                                                   opt.iters, opt.kahan, ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16,
                                                   t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
@@ -1893,7 +2205,7 @@ static void run_profile_only(const Options& opt) {
         std::vector<__nv_bfloat16> y_tc_bf16_reduced_last_finite_unused;
         int onset_bf16 = -1;
         int first_nf_bf16 = INT_MAX;
-        EnergySample e_unused_bf16;
+        EnergyMeasurement e_unused_bf16;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
                                                          opt.iters, opt.kahan, ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16,
                                                          t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
@@ -1989,18 +2301,21 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         if (got < expected) {
             const int divergence_iter = (got + 1) * opt.checkpoint_every;
             std::cout << "Referencia FP64 no finita desde iter " << divergence_iter
-                      << "; CSV_DRIFT se detiene ahi para todas las rutas ("
-                      << got << " de " << expected << " checkpoints validos).\n\n";
+                      << "; CSV_DRIFT marcara NONFINITE desde ese checkpoint "
+                      << "para todas las rutas (" << got << " de " << expected
+                      << " checkpoints validos).\n\n";
         }
     }
     const CheckpointContext ckpt{opt.checkpoint_every, fp64_checkpoints};
 
     int first_nf_cpu = INT_MAX;
-    const Metrics cpu = benchmark_cpu_stencil(input, y_cpu, opt.nx, opt.ny, opt.iters, first_nf_cpu);
+    EnergyMeasurement e_cpu;
+    const Metrics cpu = benchmark_cpu_stencil(input, y_cpu, opt.nx, opt.ny, opt.iters,
+                                              first_nf_cpu, e_cpu);
     int onset_gpu_fp32 = -1;
     int first_nf_gpu_fp32 = INT_MAX;
     double t_checkpoint_ms_gpu_fp32 = 0.0;
-    EnergySample e_gpu_fp32;
+    EnergyMeasurement e_gpu_fp32;
     const Metrics gpu = benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters,
                                                     ckpt, "GPU_FP32", onset_gpu_fp32,
                                                     first_nf_gpu_fp32, t_checkpoint_ms_gpu_fp32,
@@ -2022,7 +2337,15 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ",
                         "Error rel Linf vs FP64     : ", cpu_err, first_nf_cpu);
     print_first_nonfinite("Primera iteracion no finita : ", first_nf_cpu, opt.iters);
+    print_energy_metrics(e_cpu);
     std::cout << "\n";
+    emit_csv_summary_row("CPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan,
+                         cpu.ms, cpu.gflops, fmt_csv_num(1.0), "NaN",
+                         "NaN", "NaN", "NaN", cpu_err, first_nf_cpu,
+                         "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_cpu);
+    emit_csv_energy_row("CPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan, e_cpu,
+                        9.0 * static_cast<double>(opt.nx - 2) *
+                        static_cast<double>(opt.ny - 2) * opt.iters);
     if (csv_enabled) {
         write_csv_row(csv, under_ncu ? "NCU_cpu_fp32" : "cpu_fp32", opt.kahan, opt.nx, opt.ny, opt.iters,
                      cpu.ms, cpu.gflops, cpu_err, first_nf_cpu, "NA");
@@ -2030,6 +2353,15 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err,
                                first_nf_gpu_fp32, opt.iters, t_checkpoint_ms_gpu_fp32);
+    emit_csv_summary_row("GPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan,
+                         gpu.ms, gpu.gflops, fmt_csv_num(cpu.ms / gpu.ms), fmt_csv_num(1.0),
+                         "NaN", "NaN", fmt_csv_num(t_checkpoint_ms_gpu_fp32),
+                         gpu_err, first_nf_gpu_fp32,
+                         "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_gpu_fp32);
+    print_energy_metrics(e_gpu_fp32);
+    emit_csv_energy_row("GPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan, e_gpu_fp32,
+                        9.0 * static_cast<double>(opt.nx - 2) *
+                        static_cast<double>(opt.ny - 2) * opt.iters);
     if (csv_enabled) {
         // under_ncu fuerza "NA" en las 3 columnas de energia igual que ya
         // fuerza el prefijo NCU_ en el nombre de ruta: bajo el perfilador
@@ -2056,7 +2388,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         int storage_rel_eval_iter_fp16 = 0;
         std::vector<float> y_tc_fp16_last_finite;
         std::vector<__half> y_tc_fp16_reduced_last_finite;
-        EnergySample e_fp16;
+        EnergyMeasurement e_fp16;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
             ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
@@ -2068,14 +2400,12 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         // capturara un estado finito antes (ver comentario en
         // benchmark_gpu_tensor_core_stencil). y_tc_fp16/y_tc_fp16_reduced son
         // SIEMPRE la ultima iteracion cruda (pueden contener inf/NaN, ver
-        // bloque 1); storage_rel se evalua sobre y_tc_fp16_last_finite /
-        // y_tc_fp16_reduced_last_finite, el estado recuperable mas reciente.
+        // bloque 1); store_rel se evalua con Q(u)-u sobre
+        // y_tc_fp16_last_finite, el estado FP32 recuperable mas reciente.
         const bool fp16_storage_evaluable = (storage_rel_eval_iter_fp16 != -1);
         const StorageRelResult fp16_storage_result = fp16_storage_evaluable
-            ? storage_roundtrip_rel_err<__half>(y_tc_fp16_last_finite, y_tc_fp16_reduced_last_finite,
-                                                storage_rel_eval_iter_fp16)
-            : StorageRelResult{0.0, -1};
-        const double fp16_storage_rel = fp16_storage_result.rel_err;
+            ? storage_roundtrip_metrics<__half>(y_tc_fp16_last_finite, storage_rel_eval_iter_fp16)
+            : StorageRelResult{};
         // Estado PROPAGADO (buffer T crudo, no out_fp32): responde si Kahan
         // acerca lo que realmente se encadena entre iteraciones a la
         // exactitud de FP32 (ver print_propagated_error_metrics/bloque 2).
@@ -2108,21 +2438,33 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
                             "Error rel Linf vs CPU FP32         : ", tc_fp16_vs_cpu_err, first_nf_fp16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_fp16, opt.iters);
-        std::cout << "Error relativo max por elemento al guardar en FP16: ";
-        if (fp16_storage_evaluable) {
-            std::cout << fmt_sci(fp16_storage_rel);
-            if (storage_rel_eval_iter_fp16 < opt.iters) {
-                std::cout << "  (eval. en iter " << storage_rel_eval_iter_fp16 << ")";
-            }
-        } else {
-            std::cout << "NO EVALUABLE (la ruta divergio antes de cualquier checkpoint finito;"
-                          " use --checkpoint-every para medir storage_rel de forma confiable)";
-        }
+        print_storage_metrics("FP16", fp16_storage_result, fp16_storage_evaluable,
+                              opt.iters, 1.0e-3);
         std::cout << "\n\n";
+        emit_csv_summary_row("WMMA_FP16", opt.nx, opt.ny, opt.iters, opt.kahan,
+                             tc_fp16.ms, tc_fp16.gflops,
+                             fmt_csv_num(cpu.ms / tc_fp16.ms), fmt_csv_num(gpu.ms / tc_fp16.ms),
+                             fmt_csv_num(t_wmma_ms_fp16), fmt_csv_num(t_conv_ms_fp16),
+                             fmt_csv_num(t_checkpoint_ms_fp16), tc_fp16_err, first_nf_fp16,
+                             fmt_csv_error_num(tc_fp16_prop_err, tc_fp16_prop_err.rel_l2),
+                             fmt_csv_error_num(tc_fp16_prop_err, tc_fp16_prop_err.rel_linf),
+                             storage_num_field(fp16_storage_result, fp16_storage_evaluable,
+                                               fp16_storage_result.rel_norm),
+                             storage_num_field(fp16_storage_result, fp16_storage_evaluable,
+                                               fp16_storage_result.rel_max_guarded),
+                             storage_count_field(fp16_storage_result, fp16_storage_evaluable),
+                             storage_eval_iter_field(fp16_storage_result, fp16_storage_evaluable), e_fp16);
+        emit_csv_store_row("WMMA_FP16", opt.nx, opt.ny, opt.iters, opt.kahan,
+                           fp16_storage_result, fp16_storage_evaluable, kFp16StorageUlp);
+        print_energy_metrics(e_fp16);
+        emit_csv_energy_row("WMMA_FP16", opt.nx, opt.ny, opt.iters, opt.kahan, e_fp16,
+                            9.0 * static_cast<double>(opt.nx - 2) *
+                            static_cast<double>(opt.ny - 2) * opt.iters);
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
-                         fp16_storage_evaluable ? fmt_sci(fp16_storage_rel) : "NO_EVALUABLE",
+                         storage_num_field(fp16_storage_result, fp16_storage_evaluable,
+                                           fp16_storage_result.rel_max_guarded),
                          fmt_sci(t_wmma_ms_fp16), fmt_sci(t_conv_ms_fp16), fmt_sci(t_checkpoint_ms_fp16),
                          fmt_sci(tc_fp16_prop_err.rel_l2), fmt_sci(tc_fp16_prop_err.rel_linf),
                          energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.energy_j),
@@ -2137,7 +2479,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         int storage_rel_eval_iter_bf16 = 0;
         std::vector<float> y_tc_bf16_last_finite;
         std::vector<__nv_bfloat16> y_tc_bf16_reduced_last_finite;
-        EnergySample e_bf16;
+        EnergyMeasurement e_bf16;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
             ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
@@ -2145,15 +2487,13 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
             y_tc_bf16_reduced_last_finite, e_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
         const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
-        // Ver comentario analogo en el bloque FP16: storage_rel se evalua
-        // sobre y_tc_bf16_last_finite/y_tc_bf16_reduced_last_finite, no sobre
-        // y_tc_bf16/y_tc_bf16_reduced (que son la ultima iteracion cruda).
+        // Ver comentario analogo en el bloque FP16: store_rel se evalua con
+        // Q(u)-u sobre y_tc_bf16_last_finite, no sobre y_tc_bf16/y_tc_bf16_reduced
+        // (que son la ultima iteracion cruda).
         const bool bf16_storage_evaluable = (storage_rel_eval_iter_bf16 != -1);
         const StorageRelResult bf16_storage_result = bf16_storage_evaluable
-            ? storage_roundtrip_rel_err<__nv_bfloat16>(y_tc_bf16_last_finite, y_tc_bf16_reduced_last_finite,
-                                                       storage_rel_eval_iter_bf16)
-            : StorageRelResult{0.0, -1};
-        const double bf16_storage_rel = bf16_storage_result.rel_err;
+            ? storage_roundtrip_metrics<__nv_bfloat16>(y_tc_bf16_last_finite, storage_rel_eval_iter_bf16)
+            : StorageRelResult{};
         // Ver comentario analogo en el bloque FP16: estado PROPAGADO (buffer
         // T crudo), no out_fp32.
         const ErrorMetrics tc_bf16_prop_err =
@@ -2183,21 +2523,33 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
                             "Error rel Linf vs CPU FP32         : ", tc_bf16_vs_cpu_err, first_nf_bf16);
         print_first_nonfinite("Primera iteracion no finita        : ", first_nf_bf16, opt.iters);
-        std::cout << "Error relativo max por elemento al guardar en BF16: ";
-        if (bf16_storage_evaluable) {
-            std::cout << fmt_sci(bf16_storage_rel);
-            if (storage_rel_eval_iter_bf16 < opt.iters) {
-                std::cout << "  (eval. en iter " << storage_rel_eval_iter_bf16 << ")";
-            }
-        } else {
-            std::cout << "NO EVALUABLE (la ruta divergio antes de cualquier checkpoint finito;"
-                          " use --checkpoint-every para medir storage_rel de forma confiable)";
-        }
+        print_storage_metrics("BF16", bf16_storage_result, bf16_storage_evaluable,
+                              opt.iters, 8.0e-3);
         std::cout << "\n\n";
+        emit_csv_summary_row("WMMA_BF16", opt.nx, opt.ny, opt.iters, opt.kahan,
+                             tc_bf16.ms, tc_bf16.gflops,
+                             fmt_csv_num(cpu.ms / tc_bf16.ms), fmt_csv_num(gpu.ms / tc_bf16.ms),
+                             fmt_csv_num(t_wmma_ms_bf16), fmt_csv_num(t_conv_ms_bf16),
+                             fmt_csv_num(t_checkpoint_ms_bf16), tc_bf16_err, first_nf_bf16,
+                             fmt_csv_error_num(tc_bf16_prop_err, tc_bf16_prop_err.rel_l2),
+                             fmt_csv_error_num(tc_bf16_prop_err, tc_bf16_prop_err.rel_linf),
+                             storage_num_field(bf16_storage_result, bf16_storage_evaluable,
+                                               bf16_storage_result.rel_norm),
+                             storage_num_field(bf16_storage_result, bf16_storage_evaluable,
+                                               bf16_storage_result.rel_max_guarded),
+                             storage_count_field(bf16_storage_result, bf16_storage_evaluable),
+                             storage_eval_iter_field(bf16_storage_result, bf16_storage_evaluable), e_bf16);
+        emit_csv_store_row("WMMA_BF16", opt.nx, opt.ny, opt.iters, opt.kahan,
+                           bf16_storage_result, bf16_storage_evaluable, kBf16StorageUlp);
+        print_energy_metrics(e_bf16);
+        emit_csv_energy_row("WMMA_BF16", opt.nx, opt.ny, opt.iters, opt.kahan, e_bf16,
+                            9.0 * static_cast<double>(opt.nx - 2) *
+                            static_cast<double>(opt.ny - 2) * opt.iters);
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,
-                         bf16_storage_evaluable ? fmt_sci(bf16_storage_rel) : "NO_EVALUABLE",
+                         storage_num_field(bf16_storage_result, bf16_storage_evaluable,
+                                           bf16_storage_result.rel_max_guarded),
                          fmt_sci(t_wmma_ms_bf16), fmt_sci(t_conv_ms_bf16), fmt_sci(t_checkpoint_ms_bf16),
                          fmt_sci(tc_bf16_prop_err.rel_l2), fmt_sci(tc_bf16_prop_err.rel_linf),
                          energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.energy_j),
@@ -2214,6 +2566,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         compute_overflow_horizon_from_reference(linf_per_iter, u0_linf);
 
     print_overflow_horizon(horizon, a_nyq,
+                          first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
+    emit_csv_horizon_rows(horizon, a_nyq, opt.nx, opt.ny, opt.iters, opt.kahan,
                           first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
 
     if (opt.checkpoint_every > 0) {
@@ -2236,6 +2590,14 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 int main(int argc, char** argv) {
     const Options opt = parse_args(argc, argv);
     print_gpu_info();
+    // La comprobacion ocurre despues de cudaGetDeviceProperties (dentro de
+    // print_gpu_info), antes de iniciar cualquier benchmark.
+    telemetry_nvml_initialize(0);
+    if (!rapl_available()) {
+        std::fprintf(stderr,
+                     "ADVERTENCIA: RAPL no esta disponible o no es legible en "
+                     "/sys/class/powercap. Energia CPU sera NaN.\n");
+    }
     run_benchmark(opt, argv[0]);
     return 0;
 }
