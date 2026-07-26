@@ -50,6 +50,11 @@
 #include <tuple>
 #include <vector>
 
+// A nivel global (NO dentro del namespace anonimo de abajo): ver el
+// comentario "IMPORTANT" en telemetry.cuh sobre por que <nvml.h>/<dirent.h>
+// necesitan quedar fuera de cualquier namespace anonimo.
+#include "../../Fase_2/telemetry.cuh"
+
 namespace {
 
 #include "../../Fase_2/common.cuh"
@@ -610,7 +615,8 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
                                           const char* route_label,
                                           int& onset_iter,
                                           int& first_nonfinite_iter,
-                                          double& t_checkpoint_ms_out) {
+                                          double& t_checkpoint_ms_out,
+                                          EnergySample& out_energy) {
     const size_t count = in.size();
     float* d_a = nullptr;
     float* d_b = nullptr;
@@ -662,7 +668,11 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     double total_ms = 0.0;
     double checkpoint_ms_total = 0.0;
     // Marcador FUERA del par de eventos CUDA (ver emit_csv_region_marker).
+    // EnergyProbe envuelve exactamente la misma ventana que el marcador: dos
+    // lecturas de contador (begin/end), sin sampling.
+    EnergyProbe energy_probe;
     emit_csv_region_marker(route_label, "begin");
+    energy_probe.begin();
     timer.start();
     // El cronometro se pausa/reanuda alrededor del bloque de checkpoint: sin
     // eso, el tiempo GPU ocioso mientras el host hace el D2H queda
@@ -688,7 +698,9 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
+    energy_probe.end();
     emit_csv_region_marker(route_label, "end");
+    out_energy = energy_probe.result();
     t_checkpoint_ms_out = checkpoint_ms_total / iters;
     CHECK_CUDA(cudaGetLastError());
     // Tras el ultimo swap, d_in apunta al buffer con la salida mas reciente.
@@ -1098,7 +1110,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  int& storage_rel_eval_iter,
                                                  double& t_checkpoint_ms_out,
                                                  std::vector<float>& out_last_finite_o,
-                                                 std::vector<T>& out_reduced_last_finite_o) {
+                                                 std::vector<T>& out_reduced_last_finite_o,
+                                                 EnergySample& out_energy) {
     const size_t count = in.size();
     float* d_in_fp32 = nullptr;
     float* d_out_fp32 = nullptr;
@@ -1247,7 +1260,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // Marcador FUERA del par de eventos CUDA (ver emit_csv_region_marker):
     // arranca justo antes del primer timer.start(), no antes (el reinicio de
     // d_first_nf/d_comp tras el warm-up no es parte de la region medida).
+    // EnergyProbe envuelve exactamente la misma ventana que el marcador.
+    EnergyProbe energy_probe;
     emit_csv_region_marker(route_label, "begin");
+    energy_probe.begin();
     timer.start();
     // El cronometro se pausa/reanuda alrededor del bloque de checkpoint (ver
     // mas abajo): sin eso, el tiempo GPU ocioso mientras el host hace el D2H
@@ -1300,7 +1316,9 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
+    energy_probe.end();
     emit_csv_region_marker(route_label, "end");
+    out_energy = energy_probe.result();
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
@@ -1475,10 +1493,11 @@ static void print_fp64_reference_norms(const std::vector<double>& y_ref, int fir
 // Abre el CSV en modo append; escribe la cabecera solo si el archivo aun no
 // existe (probeado antes de abrir en modo append, que no trunca ni crea con
 // contenido previo visible al ifstream).
-// Cabecera CSV FINAL de Fase 3 (incluye placeholders de Fase 4: energy_j,
-// avg_power_w, edp quedan "NA" hasta que un muestreador NVML externo los
-// llene, alineado por los marcadores CSV_REGION -- ver emit_csv_region_marker
-// y bloque 3 del prompt de correccion). Este esquema no cambia mas dentro de
+// Cabecera CSV FINAL de Fase 3 (incluye las 3 columnas de Fase 4: energy_j,
+// avg_power_w, edp -- llenadas in-process por EnergyProbe/telemetry.cuh en
+// la misma ventana begin/end que emit_csv_region_marker delimita; "NA" si
+// -DUSE_NVML_TELEMETRY no esta activo o si la ruta no tiene sonda de GPU
+// aplicable, ver write_csv_row). Este esquema no cambia mas dentro de
 // Fase 3: Fase 4 solo llena esas tres columnas, no agrega ni reordena las
 // demas.
 static const char* kCsvHeader =
@@ -1520,8 +1539,10 @@ static std::ofstream open_csv(const std::string& path) {
 // rel_linf_prop son "NA" en cpu_fp32/gpu_fp32 (no aplica: esas rutas no pasan
 // por 16 bits ni separan kernel WMMA de conversion). t_ms_iter_ckpt es "NA"
 // solo en cpu_fp32 (unica ruta sin CheckpointContext). energy_j/avg_power_w/
-// edp son SIEMPRE "NA" en Fase 3: los llena Fase 4 desde el muestreador NVML,
-// alineado por los marcadores CSV_REGION (ver emit_csv_region_marker).
+// edp llegan ya formateados (energy_field(), "NA" si la sonda no es valida
+// para esa ruta) porque el llamador es quien decide, por ruta, si corresponde
+// medir GPU (cpu_fp32 no tiene sonda; NCU_* la fuerza a "NA" porque el
+// perfilador infla tiempos y energia igual que ya hace con t_ms_iter).
 static void write_csv_row(std::ofstream& csv, const std::string& formato, bool kahan, int nx, int ny,
                           int iters, double t_ms_iter, double gflops, const ErrorMetrics& e,
                           int first_nf, const std::string& storage_rel_err,
@@ -1529,14 +1550,18 @@ static void write_csv_row(std::ofstream& csv, const std::string& formato, bool k
                           const std::string& t_ms_iter_conv = "NA",
                           const std::string& t_ms_iter_ckpt = "NA",
                           const std::string& rel_l2_prop = "NA",
-                          const std::string& rel_linf_prop = "NA") {
+                          const std::string& rel_linf_prop = "NA",
+                          const std::string& energy_j = "NA",
+                          const std::string& avg_power_w = "NA",
+                          const std::string& edp = "NA") {
     const int n_star = (first_nf == INT_MAX) ? -1 : first_nf;
     csv << "stencil," << formato << "," << (kahan ? 1 : 0) << "," << nx << "," << ny << ","
         << iters << "," << fmt_sci(t_ms_iter) << "," << fmt_sci(t_ms_iter * iters) << ","
         << t_ms_iter_wmma << "," << t_ms_iter_conv << "," << t_ms_iter_ckpt << ","
         << fmt_sci(gflops) << "," << fmt_sci(e.rel_l2) << "," << fmt_sci(e.rel_linf) << ","
         << fmt_sci(e.max_abs) << "," << fmt_sci(e.ref_linf) << "," << rel_l2_prop << ","
-        << rel_linf_prop << "," << n_star << "," << storage_rel_err << ",NA,NA,NA\n";
+        << rel_linf_prop << "," << n_star << "," << storage_rel_err << ","
+        << energy_j << "," << avg_power_w << "," << edp << "\n";
 }
 
 // Umbral de overflow por formato (maximo valor finito representable), solo
@@ -1841,9 +1866,10 @@ static void run_profile_only(const Options& opt) {
     int onset_gpu_fp32 = -1;
     int first_nf_gpu_fp32 = INT_MAX;
     double t_checkpoint_ms_unused_fp32 = 0.0;
+    EnergySample e_unused_fp32;
     benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters,
                                ckpt, "GPU_FP32", onset_gpu_fp32, first_nf_gpu_fp32,
-                               t_checkpoint_ms_unused_fp32);
+                               t_checkpoint_ms_unused_fp32, e_unused_fp32);
 
     double t_wmma_ms_unused = 0.0, t_conv_ms_unused = 0.0, t_checkpoint_ms_unused = 0.0;
     int storage_rel_eval_iter_unused = 0;
@@ -1854,11 +1880,12 @@ static void run_profile_only(const Options& opt) {
         std::vector<__half> y_tc_fp16_reduced_last_finite_unused;
         int onset_fp16 = -1;
         int first_nf_fp16 = INT_MAX;
+        EnergySample e_unused_fp16;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
                                                   opt.iters, opt.kahan, ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16,
                                                   t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                   t_checkpoint_ms_unused, y_tc_fp16_last_finite_unused,
-                                                  y_tc_fp16_reduced_last_finite_unused);
+                                                  y_tc_fp16_reduced_last_finite_unused, e_unused_fp16);
     } else {
         std::vector<float> y_tc_bf16(count, 0.0f);
         std::vector<__nv_bfloat16> y_tc_bf16_reduced;
@@ -1866,11 +1893,12 @@ static void run_profile_only(const Options& opt) {
         std::vector<__nv_bfloat16> y_tc_bf16_reduced_last_finite_unused;
         int onset_bf16 = -1;
         int first_nf_bf16 = INT_MAX;
+        EnergySample e_unused_bf16;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
                                                          opt.iters, opt.kahan, ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16,
                                                          t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                          t_checkpoint_ms_unused, y_tc_bf16_last_finite_unused,
-                                                         y_tc_bf16_reduced_last_finite_unused);
+                                                         y_tc_bf16_reduced_last_finite_unused, e_unused_bf16);
     }
 }
 
@@ -1972,9 +2000,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     int onset_gpu_fp32 = -1;
     int first_nf_gpu_fp32 = INT_MAX;
     double t_checkpoint_ms_gpu_fp32 = 0.0;
+    EnergySample e_gpu_fp32;
     const Metrics gpu = benchmark_gpu_fp32_stencil(input, y_gpu, opt.nx, opt.ny, opt.iters,
                                                     ckpt, "GPU_FP32", onset_gpu_fp32,
-                                                    first_nf_gpu_fp32, t_checkpoint_ms_gpu_fp32);
+                                                    first_nf_gpu_fp32, t_checkpoint_ms_gpu_fp32,
+                                                    e_gpu_fp32);
     // Metrica primaria: contra el ground truth FP64 (objetivo especifico #3);
     // secundaria: contra la CPU FP32 (trazabilidad con corridas previas).
     const ErrorMetrics cpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
@@ -2001,9 +2031,16 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     print_reference_comparison("GPU CUDA FP32 clasico", gpu, cpu.ms, gpu_err, gpu_vs_cpu_err,
                                first_nf_gpu_fp32, opt.iters, t_checkpoint_ms_gpu_fp32);
     if (csv_enabled) {
+        // under_ncu fuerza "NA" en las 3 columnas de energia igual que ya
+        // fuerza el prefijo NCU_ en el nombre de ruta: bajo el perfilador
+        // t_ms_iter (y por tanto energia*tiempo) esta inflado y no es
+        // comparable con una corrida limpia.
         write_csv_row(csv, under_ncu ? "NCU_gpu_fp32" : "gpu_fp32", opt.kahan, opt.nx, opt.ny, opt.iters,
                      gpu.ms, gpu.gflops, gpu_err, first_nf_gpu_fp32, "NA", "NA", "NA",
-                     fmt_sci(t_checkpoint_ms_gpu_fp32));
+                     fmt_sci(t_checkpoint_ms_gpu_fp32), "NA", "NA",
+                     energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.energy_j),
+                     energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.avg_power_w),
+                     energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.edp));
     }
 
     bool ran_fp16 = false;
@@ -2019,11 +2056,12 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         int storage_rel_eval_iter_fp16 = 0;
         std::vector<float> y_tc_fp16_last_finite;
         std::vector<__half> y_tc_fp16_reduced_last_finite;
+        EnergySample e_fp16;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
             ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
             storage_rel_eval_iter_fp16, t_checkpoint_ms_fp16, y_tc_fp16_last_finite,
-            y_tc_fp16_reduced_last_finite);
+            y_tc_fp16_reduced_last_finite, e_fp16);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
         const ErrorMetrics tc_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_fp16);
         // eval_iter == -1: la ruta divergio sin que ningun checkpoint
@@ -2086,7 +2124,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
                          fp16_storage_evaluable ? fmt_sci(fp16_storage_rel) : "NO_EVALUABLE",
                          fmt_sci(t_wmma_ms_fp16), fmt_sci(t_conv_ms_fp16), fmt_sci(t_checkpoint_ms_fp16),
-                         fmt_sci(tc_fp16_prop_err.rel_l2), fmt_sci(tc_fp16_prop_err.rel_linf));
+                         fmt_sci(tc_fp16_prop_err.rel_l2), fmt_sci(tc_fp16_prop_err.rel_linf),
+                         energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.energy_j),
+                         energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.avg_power_w),
+                         energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.edp));
         }
     }
 
@@ -2096,11 +2137,12 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         int storage_rel_eval_iter_bf16 = 0;
         std::vector<float> y_tc_bf16_last_finite;
         std::vector<__nv_bfloat16> y_tc_bf16_reduced_last_finite;
+        EnergySample e_bf16;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
             ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
             storage_rel_eval_iter_bf16, t_checkpoint_ms_bf16, y_tc_bf16_last_finite,
-            y_tc_bf16_reduced_last_finite);
+            y_tc_bf16_reduced_last_finite, e_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
         const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
         // Ver comentario analogo en el bloque FP16: storage_rel se evalua
@@ -2157,7 +2199,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,
                          bf16_storage_evaluable ? fmt_sci(bf16_storage_rel) : "NO_EVALUABLE",
                          fmt_sci(t_wmma_ms_bf16), fmt_sci(t_conv_ms_bf16), fmt_sci(t_checkpoint_ms_bf16),
-                         fmt_sci(tc_bf16_prop_err.rel_l2), fmt_sci(tc_bf16_prop_err.rel_linf));
+                         fmt_sci(tc_bf16_prop_err.rel_l2), fmt_sci(tc_bf16_prop_err.rel_linf),
+                         energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.energy_j),
+                         energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.avg_power_w),
+                         energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.edp));
         }
     }
 
