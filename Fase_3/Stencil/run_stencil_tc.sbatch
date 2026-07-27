@@ -101,6 +101,9 @@ ITERS_NCU="${ITERS_NCU:-100}"
 # completa) -- el costo extra es ese recalculo redundante, no trabajo nuevo.
 KAHAN_LIST="${KAHAN_LIST:-off on}"
 
+NX="${NX:-16384}"
+NY="${NY:-16384}"
+
 # Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
 # sola vez en tools/common_ncu.sh (fuera de cualquier Fase_N) y se reutiliza
 # entre los .sbatch de todas las fases; este script corre desde
@@ -181,9 +184,12 @@ else
     # Dimensiones de referencia del proyecto (mismas del hint Nsight en el .cu),
     # barridas sobre ITERS_LIST dentro de la ventana finita (10..120): todas
     # las metricas (L2/Linf/gflops/etc.) quedan comparables entre corridas.
+    # NX/NY son configurables via variables de entorno (mismo mecanismo que
+    # ITERS_LIST); el valor por defecto (16384) se conserva por compatibilidad
+    # con las corridas de diagnostico ya hechas a ese tamano.
     declare -a RUNS=()
     for ITERS_VAL in ${ITERS_LIST}; do
-        RUNS+=("16384 16384 ${ITERS_VAL} both")
+        RUNS+=("${NX} ${NY} ${ITERS_VAL} both")
     done
 fi
 
