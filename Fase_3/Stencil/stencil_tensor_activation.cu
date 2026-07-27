@@ -663,6 +663,40 @@ static void record_checkpoint(const CheckpointContext& ckpt,
     }
 }
 
+// Construye la medicion de energia a partir de escalares YA depurados del
+// consumo de los bloques de checkpoint. make_energy_measurement (en
+// tools/power_sampling.h) integra el buffer de muestras COMPLETO, incluido el
+// hueco entre parada y reanudacion del muestreo, asi que no puede descontar
+// esos tramos; las formulas de aqui son exactamente las suyas, solo cambian
+// las entradas. Ver acumulacion por tramos en las rutas GPU de abajo.
+static EnergyMeasurement make_energy_measurement_from_segments(bool gpu_valid,
+                                                               double energy_gpu_j,
+                                                               bool cpu_valid,
+                                                               double energy_cpu_j,
+                                                               double time_total_s,
+                                                               double flops_total) {
+    EnergyMeasurement result;
+    result.time_total_s = time_total_s;
+    result.gpu_valid = gpu_valid;
+    result.cpu_valid = cpu_valid;
+    if (result.gpu_valid) {
+        result.energy_gpu_j = energy_gpu_j;
+        result.avg_power_w = (time_total_s > 0.0) ? result.energy_gpu_j / time_total_s : 0.0;
+        result.energy_j = result.energy_gpu_j;
+    }
+    if (result.cpu_valid) {
+        result.energy_cpu_j = energy_cpu_j;
+    }
+    if (result.gpu_valid && result.cpu_valid) {
+        result.energy_total_j = result.energy_gpu_j + result.energy_cpu_j;
+        result.edp_j_s = result.energy_total_j * time_total_s;
+        result.joules_per_gflop = (flops_total > 0.0)
+            ? result.energy_total_j / (flops_total / 1e9) : 0.0;
+    }
+    result.edp = result.energy_gpu_j * time_total_s;
+    return result;
+}
+
 static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
                                           std::vector<float>& out,
                                           int nx,
@@ -732,6 +766,23 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     CudaEventTimer timer;
     double total_ms = 0.0;
     double checkpoint_ms_total = 0.0;
+    // La ventana de energia se mide por TRAMOS, con los mismos cortes que el
+    // cronometro: cada bloque de checkpoint cierra el tramo vigente (integra y
+    // vacia el buffer de muestras) y abre uno nuevo al terminar. No basta con
+    // parar y reanudar el muestreo, porque power_buffer_energy_joules integra
+    // el buffer completo y el trapecio que une la ultima muestra de un tramo
+    // con la primera del siguiente reintroduciria justamente la energia del
+    // checkpoint que se quiere excluir.
+    double gpu_energy_j = 0.0;
+    bool gpu_energy_valid = true;
+    double checkpoint_cpu_energy_j = 0.0;
+    double checkpoint_pause_s = 0.0;
+    auto close_energy_segment = [&]() {
+        power_buffer_stop_sampling(power_buffer);
+        gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
+        gpu_energy_j += power_buffer_energy_joules(power_buffer);
+        power_buffer_samples_clear(power_buffer);
+    };
     emit_csv_region_marker(route_label, "begin");
     const auto energy_t0 = std::chrono::steady_clock::now();
     power_buffer_samples_clear(power_buffer);
@@ -748,6 +799,13 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         // no altera el ping-pong.
         if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
             total_ms += timer.stop_and_elapsed_ms();
+            // Misma pausa que el cronometro, ahora tambien para la energia: el
+            // D2H y el escaneo del host dejan la GPU ociosa y, sin excluirlos,
+            // energy_gpu_j/edp_j_s medirian sobre todo la instrumentacion (con
+            // CHECKPOINT_EVERY=5 llegaba a ~97% de la ventana).
+            close_energy_segment();
+            const auto pause_t0 = std::chrono::steady_clock::now();
+            const RAEnergySnapshot rapl_ckpt_before = rapl_snapshot_now();
 
             const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
             CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_in,
@@ -757,19 +815,34 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
             checkpoint_ms_total +=
                 std::chrono::duration<double, std::milli>(ckpt_t1 - ckpt_t0).count();
 
+            const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
+            checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
+            power_buffer_start_sampling(power_buffer);
+            checkpoint_pause_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pause_t0).count();
+
             timer.start();
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
-    power_buffer_stop_sampling(power_buffer);
+    close_energy_segment();
     const RAEnergySnapshot rapl_after = rapl_snapshot_now();
     const auto energy_t1 = std::chrono::steady_clock::now();
     emit_csv_region_marker(route_label, "end");
-    const double energy_wall_s = std::chrono::duration<double>(energy_t1 - energy_t0).count();
+    // Tiempo de la ventana de energia = pared total menos los tramos de
+    // checkpoint, para que avg_power_w/edp_j_s usen el mismo intervalo sobre
+    // el que se integro gpu_energy_j.
+    const double energy_wall_s = std::max(
+        0.0, std::chrono::duration<double>(energy_t1 - energy_t0).count() - checkpoint_pause_s);
     const double flops_total = 9.0 * static_cast<double>(nx - 2) *
                                static_cast<double>(ny - 2) * iters;
-    out_energy = make_energy_measurement(power_buffer, rapl_before, rapl_after,
-                                         energy_wall_s, flops_total);
+    const bool cpu_energy_valid = rapl_before.valid && rapl_after.valid &&
+                                  rapl_after.energy_j >= rapl_before.energy_j;
+    const double cpu_energy_j = std::max(
+        0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
+    out_energy = make_energy_measurement_from_segments(
+        gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
+        energy_wall_s, flops_total);
     power_buffer_destroy(power_buffer);
     t_checkpoint_ms_out = checkpoint_ms_total / iters;
     CHECK_CUDA(cudaGetLastError());
@@ -1363,6 +1436,22 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CudaEventTimer timer;
     double total_ms = 0.0;
     double checkpoint_ms_total = 0.0;
+    // Igual que en la ruta GPU_FP32: energia acumulada por tramos, con cortes
+    // en los mismos bloques que pausan el cronometro (ver comentario alli
+    // sobre por que no basta con parar/reanudar el muestreo). La exclusion
+    // solo se activa con checkpointing encendido; con checkpoint_every<=0 el
+    // bucle recorre un unico tramo y el resultado es identico al anterior.
+    const bool exclude_checkpoint_energy = (ckpt.checkpoint_every > 0);
+    double gpu_energy_j = 0.0;
+    bool gpu_energy_valid = true;
+    double checkpoint_cpu_energy_j = 0.0;
+    double checkpoint_pause_s = 0.0;
+    auto close_energy_segment = [&]() {
+        power_buffer_stop_sampling(power_buffer);
+        gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
+        gpu_energy_j += power_buffer_energy_joules(power_buffer);
+        power_buffer_samples_clear(power_buffer);
+    };
     emit_csv_region_marker(route_label, "begin");
     const auto energy_t0 = std::chrono::steady_clock::now();
     power_buffer_samples_clear(power_buffer);
@@ -1388,6 +1477,18 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             // cudaMemcpy/is_finite_buffer (REGLA CRITICA: nada de eso puede
             // quedar dentro de la region que mide t/iter).
             total_ms += timer.stop_and_elapsed_ms();
+            // Misma pausa que el cronometro, ahora tambien para la energia.
+            // Cubre TODO bloque write_fp32 (no solo los multiplos de
+            // checkpoint_every): el D2H y el escaneo del host son identicos en
+            // ambos casos, y dejar el ultimo fuera haria que energy_gpu_j
+            // dependiera de si iters es multiplo de la cadencia.
+            std::chrono::steady_clock::time_point pause_t0;
+            RAEnergySnapshot rapl_ckpt_before{};
+            if (exclude_checkpoint_energy) {
+                close_energy_segment();
+                pause_t0 = std::chrono::steady_clock::now();
+                rapl_ckpt_before = rapl_snapshot_now();
+            }
 
             const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
             // Una sola copia D2H de d_out_fp32, reutilizada tanto para
@@ -1415,19 +1516,36 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             checkpoint_ms_total +=
                 std::chrono::duration<double, std::milli>(ckpt_t1 - ckpt_t0).count();
 
+            if (exclude_checkpoint_energy) {
+                const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
+                checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
+                power_buffer_start_sampling(power_buffer);
+                checkpoint_pause_s += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - pause_t0).count();
+            }
+
             timer.start();
         }
     }
     total_ms += timer.stop_and_elapsed_ms();
-    power_buffer_stop_sampling(power_buffer);
+    close_energy_segment();
     const RAEnergySnapshot rapl_after = rapl_snapshot_now();
     const auto energy_t1 = std::chrono::steady_clock::now();
     emit_csv_region_marker(route_label, "end");
-    const double energy_wall_s = std::chrono::duration<double>(energy_t1 - energy_t0).count();
+    // Tiempo de la ventana de energia = pared total menos los tramos de
+    // checkpoint, para que avg_power_w/edp_j_s usen el mismo intervalo sobre
+    // el que se integro gpu_energy_j.
+    const double energy_wall_s = std::max(
+        0.0, std::chrono::duration<double>(energy_t1 - energy_t0).count() - checkpoint_pause_s);
     const double flops_total = 9.0 * static_cast<double>(nx - 2) *
                                static_cast<double>(ny - 2) * iters;
-    out_energy = make_energy_measurement(power_buffer, rapl_before, rapl_after,
-                                         energy_wall_s, flops_total);
+    const bool cpu_energy_valid = rapl_before.valid && rapl_after.valid &&
+                                  rapl_after.energy_j >= rapl_before.energy_j;
+    const double cpu_energy_j = std::max(
+        0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
+    out_energy = make_energy_measurement_from_segments(
+        gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
+        energy_wall_s, flops_total);
     power_buffer_destroy(power_buffer);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
