@@ -112,8 +112,10 @@ struct ErrorMetrics {
     double l2_abs      = 0.0;
     double ref_l2_norm = 0.0;
     // NUEVO (Fase 3, error relativo en norma infinito): ref_linf es ||ref||_inf
-    // (max abs sobre los mismos elementos que contribuyen a max_abs/sq_ref);
-    // rel_linf = max_abs / ref_linf, el analogo en L-infinito de rel_l2.
+    // sobre TODOS los elementos finitos de la referencia (no solo aquellos
+    // donde la solucion tambien es finita: ver comentario en el bucle de
+    // compare_fp64_ref_vs_fp32); rel_linf = max_abs / ref_linf, el analogo en
+    // L-infinito de rel_l2.
     double ref_linf = 0.0;
     double rel_linf = 0.0;
     bool   reference_finite = true;  // false si algun valor de la referencia no es finito
@@ -134,12 +136,20 @@ static ErrorMetrics compare_fp64_ref_vs_fp32(const std::vector<double>& ref_fp64
         const double r = ref_fp64[i];
         const double t = static_cast<double>(test_fp32[i]);
         if (!std::isfinite(r)) { out.reference_finite = false; continue; }
+
+        // La norma de la REFERENCIA se acumula antes de mirar la solucion: si
+        // se saltara junto con el elemento divergente, ref_l2_norm/ref_linf
+        // dependerian de cuantos puntos de la ruta evaluada siguen finitos y
+        // no de la referencia FP64 (dos rutas con el mismo snapshot FP64
+        // reportarian normas distintas en CSV_DRIFT tras la divergencia).
+        sq_ref += r * r;
+        ref_linf = std::max(ref_linf, std::abs(r));
+
         if (!std::isfinite(t)) { out.solution_finite = false; continue; }
+
         const double diff = r - t;
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
-        sq_ref += r * r;
-        ref_linf = std::max(ref_linf, std::abs(r));
     }
     out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
                  ? std::sqrt(sq_err / sq_ref) : 0.0;
@@ -162,12 +172,17 @@ static ErrorMetrics compare_float_vectors(const std::vector<float>& ref,
         const double r = static_cast<double>(ref[i]);
         const double t = static_cast<double>(test[i]);
         if (!std::isfinite(r)) { out.reference_finite = false; continue; }
+
+        // Misma regla que en compare_fp64_ref_vs_fp32: la norma de `ref` no
+        // depende de la finitud de `test`.
+        sq_ref += r * r;
+        ref_linf = std::max(ref_linf, std::abs(r));
+
         if (!std::isfinite(t)) { out.solution_finite = false; continue; }
+
         const double diff = r - t;
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
-        sq_ref += r * r;
-        ref_linf = std::max(ref_linf, std::abs(r));
     }
     out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
                  ? std::sqrt(sq_err / sq_ref) : 0.0;
@@ -187,12 +202,17 @@ static ErrorMetrics compare_double_vectors(const std::vector<double>& ref,
         const double r = ref[i];
         const double t = test[i];
         if (!std::isfinite(r)) { out.reference_finite = false; continue; }
+
+        // Misma regla que en compare_fp64_ref_vs_fp32: la norma de `ref` no
+        // depende de la finitud de `test`.
+        sq_ref += r * r;
+        ref_linf = std::max(ref_linf, std::abs(r));
+
         if (!std::isfinite(t)) { out.solution_finite = false; continue; }
+
         const double diff = r - t;
         out.max_abs = std::max(out.max_abs, std::abs(diff));
         sq_err += diff * diff;
-        sq_ref += r * r;
-        ref_linf = std::max(ref_linf, std::abs(r));
     }
     out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
                  ? std::sqrt(sq_err / sq_ref) : 0.0;
