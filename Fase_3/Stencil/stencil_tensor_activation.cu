@@ -803,8 +803,13 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
             // D2H y el escaneo del host dejan la GPU ociosa y, sin excluirlos,
             // energy_gpu_j/edp_j_s medirian sobre todo la instrumentacion (con
             // CHECKPOINT_EVERY=5 llegaba a ~97% de la ventana).
-            close_energy_segment();
+            // pause_t0 se toma ANTES de close_energy_segment(): esa llamada
+            // hace pthread_join sobre el hilo de muestreo y puede esperar hasta
+            // un intervalo completo (~10 ms). Medirlo despues dejaba esa espera
+            // dentro de energy_wall_s pese a estar fuera de la energia
+            // integrada, inflando el denominador de avg_power_w/edp_j_s.
             const auto pause_t0 = std::chrono::steady_clock::now();
+            close_energy_segment();
             const RAEnergySnapshot rapl_ckpt_before = rapl_snapshot_now();
 
             const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
@@ -1485,8 +1490,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             std::chrono::steady_clock::time_point pause_t0;
             RAEnergySnapshot rapl_ckpt_before{};
             if (exclude_checkpoint_energy) {
-                close_energy_segment();
+                // pause_t0 antes de close_energy_segment(), por el pthread_join
+                // que esa llamada hace sobre el hilo de muestreo (ver la misma
+                // nota en benchmark_gpu_fp32_stencil).
                 pause_t0 = std::chrono::steady_clock::now();
+                close_energy_segment();
                 rapl_ckpt_before = rapl_snapshot_now();
             }
 
