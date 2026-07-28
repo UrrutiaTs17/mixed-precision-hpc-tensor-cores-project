@@ -139,6 +139,24 @@ echo "Compilando stencil_tc (Fase_3/Stencil, incluye Fase_2/common.cuh por ruta 
     -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
     --allow-unsupported-compiler "${NVML_FLAGS[@]}"
 
+# Procedencia del binario/corrida: permite auditar de que commit/flags/hash
+# salio cada CSV, sin depender de que el usuario recuerde como se compilo.
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo desconocido)"
+if git diff --quiet 2>/dev/null; then
+    GIT_STATUS="limpio"
+else
+    GIT_STATUS="sucio"
+fi
+BUILD_DATE="$(date -Iseconds)"
+NVCC_FLAGS="-std=c++17 -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} -Xcompiler \"-O3 -funroll-loops -ffp-contract=off\" --allow-unsupported-compiler ${NVML_FLAGS[*]}"
+BIN_SHA256="$(sha256sum stencil_tc | awk '{print $1}')"
+echo "GIT_COMMIT=${GIT_COMMIT}"
+echo "GIT_STATUS=${GIT_STATUS}"
+echo "BUILD_DATE=${BUILD_DATE}"
+echo "NVCC_FLAGS=${NVCC_FLAGS}"
+echo "BIN_SHA256=${BIN_SHA256}"
+echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST}"
+
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no
 # generaron codigo Tensor Core y perfilar seria inutil. CUOBJDUMP se busca por

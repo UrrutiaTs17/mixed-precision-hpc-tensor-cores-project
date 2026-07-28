@@ -225,17 +225,37 @@ static void power_buffer_start_sampling(PowerBuffer* pb) {
 
 static void power_buffer_stop_sampling(PowerBuffer* pb) {
     if (pb == nullptr || !pb->nvml_enabled || !pb->sampling_active) return;
+    // cut_ns se toma ANTES del pthread_join: el hilo de muestreo duerme
+    // nanosleep(10 ms) entre muestras, asi que el join puede bloquear hasta
+    // un intervalo completo. Tomar la muestra final en ese instante de corte
+    // (no despues del join) evita que esa espera meta potencia ociosa en la
+    // integral de energia. Tras el join se descarta, de forma defensiva,
+    // cualquier muestra que el hilo haya podido anexar despues del corte.
+    const unsigned long long cut_ns = power_sampling_now_ns();
+    power_buffer_sample_once(pb);
     pb->stop_sampling = true;
     if (pb->sampling_thread_started) {
         pthread_join(pb->sampling_thread, nullptr);
         pb->sampling_thread_started = false;
     }
-    power_buffer_sample_once(pb);
+    while (!pb->samples.empty() && pb->samples.back().timestamp_ns > cut_ns) {
+        pb->samples.pop_back();
+    }
     pb->sampling_active = false;
 }
 
 static bool power_buffer_capture_valid(const PowerBuffer* pb) {
     return pb != nullptr && pb->nvml_enabled && !pb->sampling_failed && pb->samples.size() >= 2;
+}
+
+// Duracion de la ventana efectivamente muestreada, con los mismos timestamps
+// que integra power_buffer_energy_joules: permite que el tiempo usado como
+// denominador de avg_power_w/edp_j_s provenga del mismo intervalo que la
+// energia, en vez de un reloj de pared aparte.
+static double power_buffer_window_seconds(const PowerBuffer* pb) {
+    if (!power_buffer_capture_valid(pb)) return 0.0;
+    return static_cast<double>(pb->samples.back().timestamp_ns - pb->samples.front().timestamp_ns) /
+           1e9;
 }
 
 static double power_buffer_energy_joules(const PowerBuffer* pb) {
