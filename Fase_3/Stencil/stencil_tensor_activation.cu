@@ -432,8 +432,7 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
         out_energy.energy_cpu_j = rapl_energy_delta(rapl_before, rapl_after);
         out_energy.energy_total_j = out_energy.energy_cpu_j;
         out_energy.edp_j_s = out_energy.energy_total_j * out_energy.time_total_s;
-        const double flops_total = 9.0 * static_cast<double>(nx - 2) *
-                                   static_cast<double>(ny - 2) * iters;
+        const double flops_total = stencil_flops(nx, ny) * static_cast<double>(iters);
         out_energy.joules_per_gflop = out_energy.energy_total_j / (flops_total / 1e9);
     }
     out = *src;
@@ -774,6 +773,7 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     // con la primera del siguiente reintroduciria justamente la energia del
     // checkpoint que se quiere excluir.
     double gpu_energy_j = 0.0;
+    double gpu_window_s = 0.0;
     bool gpu_energy_valid = true;
     double checkpoint_cpu_energy_j = 0.0;
     double checkpoint_pause_s = 0.0;
@@ -781,6 +781,7 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         power_buffer_stop_sampling(power_buffer);
         gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
         gpu_energy_j += power_buffer_energy_joules(power_buffer);
+        gpu_window_s += power_buffer_window_seconds(power_buffer);
         power_buffer_samples_clear(power_buffer);
     };
     emit_csv_region_marker(route_label, "begin");
@@ -834,13 +835,13 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     const RAEnergySnapshot rapl_after = rapl_snapshot_now();
     const auto energy_t1 = std::chrono::steady_clock::now();
     emit_csv_region_marker(route_label, "end");
-    // Tiempo de la ventana de energia = pared total menos los tramos de
-    // checkpoint, para que avg_power_w/edp_j_s usen el mismo intervalo sobre
-    // el que se integro gpu_energy_j.
-    const double energy_wall_s = std::max(
-        0.0, std::chrono::duration<double>(energy_t1 - energy_t0).count() - checkpoint_pause_s);
-    const double flops_total = 9.0 * static_cast<double>(nx - 2) *
-                               static_cast<double>(ny - 2) * iters;
+    // energy_wall_s proviene de los mismos timestamps de muestreo que se
+    // integraron en gpu_energy_j (power_buffer_window_seconds acumulado por
+    // tramo en close_energy_segment), no de un reloj de pared aparte: asi
+    // avg_power_w/edp_j_s quedan derivados del mismo intervalo que la
+    // energia.
+    const double energy_wall_s = gpu_window_s;
+    const double flops_total = stencil_flops(nx, ny) * static_cast<double>(iters);
     const bool cpu_energy_valid = rapl_before.valid && rapl_after.valid &&
                                   rapl_after.energy_j >= rapl_before.energy_j;
     const double cpu_energy_j = std::max(
@@ -1448,6 +1449,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // bucle recorre un unico tramo y el resultado es identico al anterior.
     const bool exclude_checkpoint_energy = (ckpt.checkpoint_every > 0);
     double gpu_energy_j = 0.0;
+    double gpu_window_s = 0.0;
     bool gpu_energy_valid = true;
     double checkpoint_cpu_energy_j = 0.0;
     double checkpoint_pause_s = 0.0;
@@ -1455,6 +1457,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         power_buffer_stop_sampling(power_buffer);
         gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
         gpu_energy_j += power_buffer_energy_joules(power_buffer);
+        gpu_window_s += power_buffer_window_seconds(power_buffer);
         power_buffer_samples_clear(power_buffer);
     };
     emit_csv_region_marker(route_label, "begin");
@@ -1540,13 +1543,13 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     const RAEnergySnapshot rapl_after = rapl_snapshot_now();
     const auto energy_t1 = std::chrono::steady_clock::now();
     emit_csv_region_marker(route_label, "end");
-    // Tiempo de la ventana de energia = pared total menos los tramos de
-    // checkpoint, para que avg_power_w/edp_j_s usen el mismo intervalo sobre
-    // el que se integro gpu_energy_j.
-    const double energy_wall_s = std::max(
-        0.0, std::chrono::duration<double>(energy_t1 - energy_t0).count() - checkpoint_pause_s);
-    const double flops_total = 9.0 * static_cast<double>(nx - 2) *
-                               static_cast<double>(ny - 2) * iters;
+    // energy_wall_s proviene de los mismos timestamps de muestreo que se
+    // integraron en gpu_energy_j (power_buffer_window_seconds acumulado por
+    // tramo en close_energy_segment), no de un reloj de pared aparte: asi
+    // avg_power_w/edp_j_s quedan derivados del mismo intervalo que la
+    // energia.
+    const double energy_wall_s = gpu_window_s;
+    const double flops_total = stencil_flops(nx, ny) * static_cast<double>(iters);
     const bool cpu_energy_valid = rapl_before.valid && rapl_after.valid &&
                                   rapl_after.energy_j >= rapl_before.energy_j;
     const double cpu_energy_j = std::max(
@@ -2470,8 +2473,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          "NaN", "NaN", "NaN", cpu_err, first_nf_cpu,
                          "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_cpu);
     emit_csv_energy_row("CPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan, e_cpu,
-                        9.0 * static_cast<double>(opt.nx - 2) *
-                        static_cast<double>(opt.ny - 2) * opt.iters);
+                        stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
     if (csv_enabled) {
         write_csv_row(csv, under_ncu ? "NCU_cpu_fp32" : "cpu_fp32", opt.kahan, opt.nx, opt.ny, opt.iters,
                      cpu.ms, cpu.gflops, cpu_err, first_nf_cpu, "NA");
@@ -2486,8 +2488,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_gpu_fp32);
     print_energy_metrics(e_gpu_fp32);
     emit_csv_energy_row("GPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan, e_gpu_fp32,
-                        9.0 * static_cast<double>(opt.nx - 2) *
-                        static_cast<double>(opt.ny - 2) * opt.iters);
+                        stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
     if (csv_enabled) {
         // under_ncu fuerza "NA" en las 3 columnas de energia igual que ya
         // fuerza el prefijo NCU_ en el nombre de ruta: bajo el perfilador
@@ -2584,8 +2585,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                            fp16_storage_result, fp16_storage_evaluable, kFp16StorageUlp);
         print_energy_metrics(e_fp16);
         emit_csv_energy_row("WMMA_FP16", opt.nx, opt.ny, opt.iters, opt.kahan, e_fp16,
-                            9.0 * static_cast<double>(opt.nx - 2) *
-                            static_cast<double>(opt.ny - 2) * opt.iters);
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
@@ -2669,8 +2669,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                            bf16_storage_result, bf16_storage_evaluable, kBf16StorageUlp);
         print_energy_metrics(e_bf16);
         emit_csv_energy_row("WMMA_BF16", opt.nx, opt.ny, opt.iters, opt.kahan, e_bf16,
-                            9.0 * static_cast<double>(opt.nx - 2) *
-                            static_cast<double>(opt.ny - 2) * opt.iters);
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,
