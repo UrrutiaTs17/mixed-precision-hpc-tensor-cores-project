@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
-#include <pthread.h>
 #include <string>
 #include <vector>
 
@@ -18,20 +17,26 @@
 typedef void* nvmlDevice_t;
 #endif
 
-struct PowerSample {
-    unsigned long long timestamp_ns;
-    unsigned int power_mw;
-};
-
+// GPU energy is measured via two point-in-time reads of NVML's monotonic
+// energy counter (nvmlDeviceGetTotalEnergyConsumption) at segment begin/end,
+// not via periodic power sampling: a background sampler needs at least two
+// wakeups inside the measured window to integrate anything, and at these
+// grid sizes the window (0.2-2.1 ms) is routinely shorter than a single
+// sampling interval, so the old thread-based sampler produced NaN in the
+// large majority of runs. A counter delta needs no samples "inside" the
+// window -- one read before, one read after, subtract -- so it is exact
+// regardless of how short the window is. See Fase_2/telemetry.cuh
+// (EnergyProbe) for the same technique applied to a different CSV schema.
 struct PowerBuffer {
-    std::vector<PowerSample> samples;
     nvmlDevice_t device;
     bool nvml_enabled;
-    pthread_t sampling_thread;
-    volatile bool stop_sampling;
-    bool sampling_active;
-    bool sampling_thread_started;
-    bool sampling_failed;
+    bool segment_active;       // true between start_sampling and stop_sampling
+    bool capture_failed;       // a read failed or the monotonicity guard tripped since the last clear
+    bool capture_has_data;     // at least one begin/end delta was accumulated since the last clear
+    unsigned long long segment_begin_mj;  // energy counter value latched by start_sampling
+    unsigned long long segment_begin_ns;  // wall-clock instant latched by start_sampling
+    double accumulated_j;      // running total of closed-segment energy deltas since the last clear
+    double accumulated_window_s;  // running total of closed-segment wall-clock durations since the last clear
 };
 
 struct RAEnergySnapshot {
@@ -145,52 +150,17 @@ static bool telemetry_nvml_initialize(int) {
 
 #endif
 
-static void power_buffer_append_sample(PowerBuffer* pb, unsigned long long timestamp_ns,
-                                       unsigned int power_mw) {
-    pb->samples.push_back(PowerSample{timestamp_ns, power_mw});
-}
-
-static void power_buffer_sample_once(PowerBuffer* pb) {
-    const unsigned long long timestamp_ns = power_sampling_now_ns();
-    unsigned int power_mw = 0;
-#ifdef USE_NVML_TELEMETRY
-    if (pb->nvml_enabled &&
-        nvmlDeviceGetPowerUsage(pb->device, &power_mw) != NVML_SUCCESS) {
-        static bool warned = false;
-        if (!warned) {
-            std::fprintf(stderr,
-                         "ADVERTENCIA: nvmlDeviceGetPowerUsage fallo; "
-                         "energia GPU sera NaN.\n");
-            warned = true;
-        }
-        pb->sampling_failed = true;
-        power_mw = 0;
-    }
-#else
-    (void)pb;
-#endif
-    power_buffer_append_sample(pb, timestamp_ns, power_mw);
-}
-
-static void* power_buffer_sampling_main(void* opaque) {
-    PowerBuffer* pb = static_cast<PowerBuffer*>(opaque);
-    const struct timespec interval = {0, 10000000L};
-    while (!pb->stop_sampling) {
-        power_buffer_sample_once(pb);
-        nanosleep(&interval, nullptr);
-    }
-    return nullptr;
-}
-
 static PowerBuffer* power_buffer_create(int device_id) {
     PowerBuffer* pb = new PowerBuffer();
     pb->device = nullptr;
     pb->nvml_enabled = false;
-    pb->sampling_thread = pthread_t();
-    pb->stop_sampling = true;
-    pb->sampling_active = false;
-    pb->sampling_thread_started = false;
-    pb->sampling_failed = false;
+    pb->segment_active = false;
+    pb->capture_failed = false;
+    pb->capture_has_data = false;
+    pb->segment_begin_mj = 0;
+    pb->segment_begin_ns = 0;
+    pb->accumulated_j = 0.0;
+    pb->accumulated_window_s = 0.0;
 #ifdef USE_NVML_TELEMETRY
     if (telemetry_nvml_enabled() && device_id == 0) {
         pb->device = telemetry_nvml_device();
@@ -206,71 +176,105 @@ static PowerBuffer* power_buffer_create(int device_id) {
     return pb;
 }
 
+// Reinicia el acumulado corriente (energia y ventana) y cualquier estado de
+// invalidez previo. Se llama tras el warm-up y entre tramos de energia (ver
+// close_energy_segment en stencil_tensor_activation.cu) para que cada tramo
+// arranque desde cero.
 static void power_buffer_samples_clear(PowerBuffer* pb) {
     if (pb == nullptr) return;
-    pb->samples.clear();
-    pb->sampling_failed = false;
+    pb->accumulated_j = 0.0;
+    pb->accumulated_window_s = 0.0;
+    pb->capture_failed = false;
+    pb->capture_has_data = false;
 }
 
+// Abre un segmento medido: lee el contador de energia acumulada de NVML y el
+// reloj de pared una sola vez cada uno, y los guarda como marca de inicio.
+// No hay hilo que arrancar; el segmento se cierra con una segunda lectura
+// puntual de ambos en power_buffer_stop_sampling.
 static void power_buffer_start_sampling(PowerBuffer* pb) {
     if (pb == nullptr || !pb->nvml_enabled) return;
-    if (pb->sampling_active) return;
-    pb->stop_sampling = false;
-    pb->sampling_active = true;
-    power_buffer_sample_once(pb);
-    if (pthread_create(&pb->sampling_thread, nullptr, power_buffer_sampling_main, pb) == 0) {
-        pb->sampling_thread_started = true;
+    if (pb->segment_active) return;
+    pb->segment_active = true;
+    pb->segment_begin_ns = power_sampling_now_ns();
+#ifdef USE_NVML_TELEMETRY
+    unsigned long long energy_mj = 0;
+    if (nvmlDeviceGetTotalEnergyConsumption(pb->device, &energy_mj) == NVML_SUCCESS) {
+        pb->segment_begin_mj = energy_mj;
+    } else {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                         "ADVERTENCIA: nvmlDeviceGetTotalEnergyConsumption fallo al abrir "
+                         "el segmento; energia GPU sera NaN.\n");
+            warned = true;
+        }
+        pb->capture_failed = true;
     }
+#endif
 }
 
+// Cierra el segmento medido: lee el contador y el reloj de pared una segunda
+// vez, calcula los deltas contra las marcas de inicio de ESTE segmento y los
+// acumula. Guarda de monotonia sobre el contador de energia: si la lectura
+// final es menor que la inicial, el segmento se marca invalido en vez de
+// acumular un delta negativo. La duracion de la ventana se acumula siempre
+// (es un reloj de pared real, no depende de NVML) pero
+// power_buffer_window_seconds solo la expone cuando la captura es valida,
+// igual que power_buffer_energy_joules.
 static void power_buffer_stop_sampling(PowerBuffer* pb) {
-    if (pb == nullptr || !pb->nvml_enabled || !pb->sampling_active) return;
-    // cut_ns se toma ANTES del pthread_join: el hilo de muestreo duerme
-    // nanosleep(10 ms) entre muestras, asi que el join puede bloquear hasta
-    // un intervalo completo. Tomar la muestra final en ese instante de corte
-    // (no despues del join) evita que esa espera meta potencia ociosa en la
-    // integral de energia. Tras el join se descarta, de forma defensiva,
-    // cualquier muestra que el hilo haya podido anexar despues del corte.
-    const unsigned long long cut_ns = power_sampling_now_ns();
-    power_buffer_sample_once(pb);
-    pb->stop_sampling = true;
-    if (pb->sampling_thread_started) {
-        pthread_join(pb->sampling_thread, nullptr);
-        pb->sampling_thread_started = false;
+    if (pb == nullptr || !pb->nvml_enabled || !pb->segment_active) return;
+    pb->segment_active = false;
+    const unsigned long long end_ns = power_sampling_now_ns();
+    if (end_ns > pb->segment_begin_ns) {
+        pb->accumulated_window_s +=
+            static_cast<double>(end_ns - pb->segment_begin_ns) / 1e9;
     }
-    while (!pb->samples.empty() && pb->samples.back().timestamp_ns > cut_ns) {
-        pb->samples.pop_back();
+#ifdef USE_NVML_TELEMETRY
+    unsigned long long energy_mj = 0;
+    if (nvmlDeviceGetTotalEnergyConsumption(pb->device, &energy_mj) != NVML_SUCCESS) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                         "ADVERTENCIA: nvmlDeviceGetTotalEnergyConsumption fallo al cerrar "
+                         "el segmento; energia GPU sera NaN.\n");
+            warned = true;
+        }
+        pb->capture_failed = true;
+        return;
     }
-    pb->sampling_active = false;
+    if (energy_mj < pb->segment_begin_mj) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                         "ADVERTENCIA: el contador de energia NVML no fue monotono "
+                         "dentro del segmento; energia GPU sera NaN para ese tramo.\n");
+            warned = true;
+        }
+        pb->capture_failed = true;
+        return;
+    }
+    pb->accumulated_j += static_cast<double>(energy_mj - pb->segment_begin_mj) / 1000.0;
+    pb->capture_has_data = true;
+#endif
 }
 
 static bool power_buffer_capture_valid(const PowerBuffer* pb) {
-    return pb != nullptr && pb->nvml_enabled && !pb->sampling_failed && pb->samples.size() >= 2;
+    return pb != nullptr && pb->nvml_enabled && !pb->capture_failed && pb->capture_has_data;
 }
 
-// Duracion de la ventana efectivamente muestreada, con los mismos timestamps
-// que integra power_buffer_energy_joules: permite que el tiempo usado como
+// Duracion de la ventana efectivamente medida, con las mismas marcas
+// begin/end que power_buffer_energy_joules: permite que el tiempo usado como
 // denominador de avg_power_w/edp_j_s provenga del mismo intervalo que la
 // energia, en vez de un reloj de pared aparte.
 static double power_buffer_window_seconds(const PowerBuffer* pb) {
     if (!power_buffer_capture_valid(pb)) return 0.0;
-    return static_cast<double>(pb->samples.back().timestamp_ns - pb->samples.front().timestamp_ns) /
-           1e9;
+    return pb->accumulated_window_s;
 }
 
 static double power_buffer_energy_joules(const PowerBuffer* pb) {
     if (!power_buffer_capture_valid(pb)) return 0.0;
-    double energy_j = 0.0;
-    for (size_t i = 1; i < pb->samples.size(); ++i) {
-        const PowerSample& a = pb->samples[i - 1];
-        const PowerSample& b = pb->samples[i];
-        if (b.timestamp_ns <= a.timestamp_ns) continue;
-        const double dt_s = static_cast<double>(b.timestamp_ns - a.timestamp_ns) / 1e9;
-        const double p0_w = static_cast<double>(a.power_mw) / 1000.0;
-        const double p1_w = static_cast<double>(b.power_mw) / 1000.0;
-        energy_j += 0.5 * (p0_w + p1_w) * dt_s;
-    }
-    return std::isfinite(energy_j) ? energy_j : 0.0;
+    return std::isfinite(pb->accumulated_j) ? pb->accumulated_j : 0.0;
 }
 
 static void power_buffer_destroy(PowerBuffer* pb) {
