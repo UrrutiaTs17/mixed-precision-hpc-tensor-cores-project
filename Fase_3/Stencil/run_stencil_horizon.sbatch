@@ -111,16 +111,20 @@ echo "Compilando stencil_tc (Fase_3/Stencil, incluye Fase_2/common.cuh por ruta 
     --allow-unsupported-compiler "${NVML_FLAGS[@]}"
 
 TIMEFORMAT=">>> Tiempo real de la corrida: %R s (user %U, sys %S)"
+# Una sola invocacion de tee envuelve TODO el bucle de KAHAN_LIST, en vez de
+# reabrirse por cada pasada: mismo fix aplicado en run_stencil_tc.sbatch (ver
+# comentario ahi) para que ninguna pasada dependa de que su propia invocacion
+# de tee sobreviva intacta.
+{
 for KAHAN in ${KAHAN_LIST}; do
-    {
-        echo
-        echo "============================================================"
-        echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
-        echo "============================================================"
-        { time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-              --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"; } 2>&1
-    } | tee -a "${RESULTS_LOG}"
+    echo
+    echo "============================================================"
+    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+    echo "============================================================"
+    time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
+          --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"
 done
+} 2>&1 | tee -a "${RESULTS_LOG}"
 
 echo
 echo "Extrayendo CSVs desde ${RESULTS_LOG}..."
