@@ -237,17 +237,23 @@ ncu_profile_kernel() {
             --kahan "${kahan}" --profile-only; } 2>&1
 }
 
+# Una sola invocacion de tee envuelve TODO el bucle (todas las combinaciones
+# de RUNS x KAHAN_LIST) en vez de reabrirse por cada pasada de KAHAN: mismo
+# patron ya usado para el .out de SLURM (una unica redireccion persistente
+# durante toda la corrida, que nunca perdio datos). Reabrir un proceso tee
+# por pasada dejaba a cada pasada dependiendo de que ESA invocacion puntual
+# sobreviviera intacta; con una sola invocacion para todo el bucle, ninguna
+# pasada individual puede perderse sin que se pierdan todas.
+{
 for run in "${RUNS[@]}"; do
     read -r NX NY ITERS TC <<< "${run}"
     for KAHAN in ${KAHAN_LIST}; do
-        {
-            echo
-            echo "============================================================"
-            echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
-            echo "============================================================"
-            ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-                --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"
-        } 2>&1 | tee -a "${RESULTS_LOG}"
+        echo
+        echo "============================================================"
+        echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+        echo "============================================================"
+        ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
+            --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"
 
         if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego
@@ -295,6 +301,7 @@ for run in "${RUNS[@]}"; do
         fi
     done
 done
+} 2>&1 | tee -a "${RESULTS_LOG}"
 
 echo
 echo "Extrayendo CSVs desde ${RESULTS_LOG}..."
