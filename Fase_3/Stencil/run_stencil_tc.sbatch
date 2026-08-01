@@ -100,6 +100,12 @@ ITERS_NCU="${ITERS_NCU:-100}"
 # pasadas, pero se recalculan de todas formas (una invocacion == una corrida
 # completa) -- el costo extra es ese recalculo redundante, no trabajo nuevo.
 KAHAN_LIST="${KAHAN_LIST:-off on}"
+# Ruta de diagnostico FP32IN_FP16OUT/FP32IN_BF16OUT (ver stencil_tensor_activation.cu,
+# rama fase3-diagnostico-kahan-truncacion): off por defecto, no cambia el
+# comportamiento de ninguna corrida existente si no se especifica. Solo se
+# pasa a la corrida principal (sin --profile-only); ncu_profile_kernel no la
+# consulta (opt.fp32in_mode no aplica bajo --profile-only).
+DIAG_FP32IN="${DIAG_FP32IN:-off}"
 
 NX="${NX:-16384}"
 NY="${NY:-16384}"
@@ -253,7 +259,8 @@ for run in "${RUNS[@]}"; do
         echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
         echo "============================================================"
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-            --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"
+            --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
+            --diag-fp32in "${DIAG_FP32IN}"
 
         if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego
