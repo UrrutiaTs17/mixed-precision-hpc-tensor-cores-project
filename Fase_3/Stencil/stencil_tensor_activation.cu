@@ -1671,29 +1671,42 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
 // (ver Fp32InMode / comentario de Options::fp32in_mode). Objetivo: separar
 // cuanto del error de WMMA_FP16/BF16 viene de truncar los 4 vecinos+centro a
 // T ANTES de sumar (restriccion de HMMA, ver stencil2d_wmma_kernel) de cuanto
-// viene de truncar SOLO el resultado al guardarlo. A diferencia de
-// stencil2d_wmma_kernel, este kernel nunca alimenta un operando pre-truncado
-// a la suma: sube in (T) a float con tc_to_float y computa 0.25*(suma)-centro
-// enteramente en FP32, exactamente como stencil2d_fp32_kernel (no se llama a
-// ese kernel porque su firma no puede alterarse para truncar la salida, pero
-// la formula es identica). Solo entonces trunca val a T via
-// compensated_store<T,kKahan> (mismo mecanismo de Kahan que WMMA, sin tocar
-// su codigo) para escribir out_tc, que es lo que realmente encadena la
-// siguiente iteracion. out_fp32 (crudo, sin redondear) sigue el mismo patron
-// que en stencil2d_wmma_kernel: solo se escribe cuando write_fp32
-// (checkpoint o ultima iteracion), como ancla para CSV_DRIFT/storage_rel. Las
-// celdas de borde (!active) nunca se escriben aqui: igual que en
-// stencil2d_wmma_kernel, ya quedaron correctas desde la conversion inicial
-// completa del buffer (ver benchmark_gpu_fp32in_tcout_stencil) y no cambian
-// de valor entre iteraciones.
+// viene de truncar SOLO el resultado al guardarlo.
+//
+// INVARIANTE CRITICO: in/out son float* y la cadena que se propaga entre
+// iteraciones (el ping-pong que benchmark_gpu_fp32in_tcout_stencil hace sobre
+// ellos) NUNCA pasa por T -- es bit a bit la misma trayectoria que
+// stencil2d_fp32_kernel/GPU_FP32 (val = 0.25*(suma)-centro en FP32 puro,
+// sobre vecinos que a su vez nunca fueron truncados). Si en cambio in/out
+// fueran T* (con tc_to_float() subiendo cada vecino antes de sumar, como una
+// primera version de este kernel hacia), el resultado seria numericamente
+// identico a WMMA_FP16/BF16 pese a no usar Tensor Cores: los escalares del
+// stencil (0.25, -1.0) son potencias de dos exactas en FP16/BF16, asi que
+// HMMA sobre operandos T reproduce, termino a termino, la misma aritmetica
+// que sumar en FP32 esos MISMOS operandos ya truncados -- la ruta dejaria de
+// aislar nada, solo reimplementaria WMMA en otra unidad de ejecucion (ALU en
+// vez de Tensor Core). Por eso "leer los vecinos en FP32" significa que NUNCA
+// llegaron a pasar por una representacion de 16 bits, no solo que el tipo del
+// registro sea float.
+//
+// out_tc es una cadena SOMBRA, calculada cada iteracion a partir del val
+// exacto de ESA iteracion (nunca del out_tc de la iteracion anterior) via
+// compensated_store<T,kKahan> -- mismo mecanismo de Kahan que WMMA (comp
+// persiste entre iteraciones), pero aqui el residuo compensa unicamente el
+// redondeo de ALMACENAR un val que en si mismo nunca estuvo corrompido por
+// truncacion previa. out_tc jamas realimenta el computo (no hay tc_to_float
+// en ningun lado de este archivo aplicado a datos de esta ruta): sirve solo
+// para reportar (out_reduced -> rel_l2_prop / CSV_STORE), que es donde
+// R1/R2 del diagnostico deben leerse -- no en rel_l2 "primario" (columna que
+// compara out, la cadena FP32 nunca truncada, y por construccion coincide
+// con GPU_FP32 sin importar --kahan).
 template <typename T, bool kKahan>
-__global__ static void stencil2d_fp32in_tcout_kernel(const T* __restrict__ in,
-                                                      float* __restrict__ out_fp32,
+__global__ static void stencil2d_fp32in_tcout_kernel(const float* __restrict__ in,
+                                                      float* __restrict__ out,
                                                       T* __restrict__ out_tc,
                                                       int nx,
                                                       int ny,
                                                       int iter,
-                                                      bool write_fp32,
                                                       int* __restrict__ first_nf,
                                                       float* __restrict__ comp) {
     __shared__ int blk_bad;
@@ -1705,35 +1718,43 @@ __global__ static void stencil2d_fp32in_tcout_kernel(const T* __restrict__ in,
     const bool in_range = (x < nx && y < ny);
     const bool active = in_range && !(x == 0 || y == 0 || x == nx - 1 || y == ny - 1);
 
-    if (active) {
-        const float up = tc_to_float(in[idx2d(x, y - 1, nx)]);
-        const float down = tc_to_float(in[idx2d(x, y + 1, nx)]);
-        const float left = tc_to_float(in[idx2d(x - 1, y, nx)]);
-        const float right = tc_to_float(in[idx2d(x + 1, y, nx)]);
-        const float center = tc_to_float(in[idx2d(x, y, nx)]);
-        const float val = 0.25f * (up + down + left + right) - center;
-        if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
-        const int idx = idx2d(x, y, nx);
-        out_tc[idx] = compensated_store<T, kKahan>(val, comp, idx);
-        if (write_fp32) out_fp32[idx] = val;
+    float val = 0.0f;
+    if (in_range) {
+        if (active) {
+            const float up = in[idx2d(x, y - 1, nx)];
+            const float down = in[idx2d(x, y + 1, nx)];
+            const float left = in[idx2d(x - 1, y, nx)];
+            const float right = in[idx2d(x + 1, y, nx)];
+            const float center = in[idx2d(x, y, nx)];
+            val = 0.25f * (up + down + left + right) - center;
+            if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
+        } else {
+            val = in[idx2d(x, y, nx)];
+        }
     }
-
     __syncthreads();
+
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         reduce_and_mark_first_nonfinite(first_nf, iter, blk_bad);
     }
+    if (in_range) {
+        const int idx = idx2d(x, y, nx);
+        out[idx] = val;
+        out_tc[idx] = compensated_store<T, kKahan>(val, comp, idx);
+    }
 }
 
-// Host de la ruta de diagnostico: analogo a benchmark_gpu_tensor_core_stencil
-// (mismo manejo de Kahan/d_comp, checkpoint/energia por tramos y storage_rel
-// via out_fp32 como ancla cruda, para que R1/R2 del diagnostico sean
-// comparables sin inventar un mecanismo de medicion nuevo) pero SIN
-// maquinaria WMMA: ni tiles de warp, ni fragmentos, ni matrices identidad, ni
-// shared dinamica -- el kernel usa el mismo grid/bloque 16x16 plano que
-// stencil2d_fp32_kernel/benchmark_gpu_fp32_stencil. No hay kernel de
-// conversion separado (igual que WMMA ya no lo tiene), asi que t_kernel_ms_out
-// es el t/iter completo y no existe un t_convert_ms_out que reportar aparte
-// (el llamador pasa 0.0 al emitir CSV_SUMMARY, igual que WMMA ya hace).
+// Host de la ruta de diagnostico: el ping-pong de computo (d_a/d_b, float)
+// reproduce exactamente el patron de benchmark_gpu_fp32_stencil (mismo
+// grid/bloque 16x16, mismo checkpoint/energia por tramos) porque la cadena
+// que propaga es, por invariante del kernel, identica a GPU_FP32. Encima de
+// eso se lleva un unico buffer T sombra (d_out_tc, SIN ping-pong: cada
+// iteracion lo sobreescribe entero a partir del val exacto de esa iteracion,
+// nunca de su propio contenido anterior) mas d_comp para el residuo
+// persistente de Kahan, igual mecanismo que benchmark_gpu_tensor_core_stencil
+// pero desacoplado del computo real. No hay kernel de conversion separado ni
+// necesidad de convert_input_to_tc: d_out_tc no requiere semilla (el kernel
+// lo reescribe completo, borde incluido, cada lanzamiento).
 template <typename T>
 static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
                                                    std::vector<float>& out,
@@ -1753,9 +1774,8 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
                                                    std::vector<T>& out_reduced_last_finite_o,
                                                    EnergyMeasurement& out_energy) {
     const size_t count = in.size();
-    float* d_in_fp32 = nullptr;
-    float* d_out_fp32 = nullptr;
-    T* d_in_tc = nullptr;
+    float* d_a = nullptr;
+    float* d_b = nullptr;
     T* d_out_tc = nullptr;
     int* d_first_nf = nullptr;
     // d_comp: residuo de Kahan por celda, en FP32, persistente entre
@@ -1763,9 +1783,8 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
     // Solo se reserva si --kahan on; nullptr en caso contrario.
     float* d_comp = nullptr;
 
-    CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_out_fp32, count * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_in_tc, count * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_a, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_b, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_out_tc, count * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
     if (kahan_enabled) {
@@ -1773,26 +1792,23 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
         CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
     }
 
-    CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    // Ambos buffers arrancan como copia completa del input, igual que
+    // benchmark_gpu_fp32_stencil: el kernel nunca escribe las celdas de borde
+    // fuera de active, asi que deben preservarse desde el inicio en cualquier
+    // buffer que llegue a jugar el rol de "out".
+    CHECK_CUDA(cudaMemcpy(d_a, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 
     dim3 block(16, 16);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
-    // Ambos buffers del ping-pong T arrancan como conversion completa (borde
-    // incluido) del input pristino: el kernel nunca escribe las celdas de
-    // borde (ver comentario de stencil2d_fp32in_tcout_kernel).
-    convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
-    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    auto launch_kernel = [&](T* in_buf, T* out_buf, int iter_num, bool write_fp32_flag) {
+    auto launch_kernel = [&](float* in_buf, float* out_buf, int iter_num) {
         if (kahan_enabled) {
             stencil2d_fp32in_tcout_kernel<T, true><<<grid, block>>>(
-                in_buf, d_out_fp32, out_buf, nx, ny, iter_num, write_fp32_flag, d_first_nf, d_comp);
+                in_buf, out_buf, d_out_tc, nx, ny, iter_num, d_first_nf, d_comp);
         } else {
             stencil2d_fp32in_tcout_kernel<T, false><<<grid, block>>>(
-                in_buf, d_out_fp32, out_buf, nx, ny, iter_num, write_fp32_flag, d_first_nf, nullptr);
+                in_buf, out_buf, d_out_tc, nx, ny, iter_num, d_first_nf, nullptr);
         }
     };
 
@@ -1800,27 +1816,28 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
     const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
     power_buffer_start_sampling(power_buffer);
 
-    T* tc_in = d_in_tc;
-    T* tc_out = d_out_tc;
+    // Warm-up encadenado y descartable (ver comentario analogo en
+    // benchmark_gpu_fp32_stencil): al terminar se restauran d_a/d_b a una
+    // copia fresca del input para que el bucle medido arranque desde el
+    // estado original.
+    float* warm_in = d_a;
+    float* warm_out = d_b;
     for (int i = 0; i < kWarmupIters; ++i) {
-        launch_kernel(tc_in, tc_out, i + 1, /*write_fp32_flag=*/false);
-        std::swap(tc_in, tc_out);
+        launch_kernel(warm_in, warm_out, i + 1);
+        std::swap(warm_in, warm_out);
     }
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
-
-    // Reinicia d_in_tc, d_out_tc y d_out_fp32 al estado original tras el
-    // warm-up descartable (ver comentario analogo en
-    // benchmark_gpu_tensor_core_stencil).
-    convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
-    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
-    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(d_a, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 
     {
         const int init_val = INT_MAX;
         CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
     }
+    // Reinicia el residuo de Kahan tras el warm-up, igual que d_first_nf: sin
+    // esto los residuos del warm-up (descartable) contaminarian el bucle
+    // medido.
     if (kahan_enabled) {
         CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
     }
@@ -1829,8 +1846,7 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
     const RAEnergySnapshot rapl_before = rapl_snapshot_now();
     (void)rapl_warmup_before;
 
-    std::vector<float> checkpoint_host_buf;
-    checkpoint_host_buf.resize(count);  // siempre, para guardar ultima finita
+    std::vector<float> checkpoint_host_buf(count);
 
     std::vector<float> out_last_finite(count);
     std::vector<T> out_reduced_last_finite(count);
@@ -1869,15 +1885,25 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
     power_buffer_samples_clear(power_buffer);
     power_buffer_start_sampling(power_buffer);
     timer.start();
-    for (int i = 0; i < iters; ++i) {
-        const bool write_fp32 = (i + 1 == iters) ||
-                                (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0);
-        CHECK_CUDA(cudaEventRecord(kernel_start[i]));
-        launch_kernel(tc_in, tc_out, i + 1, write_fp32);
-        CHECK_CUDA(cudaEventRecord(kernel_stop[i]));
-        std::swap(tc_in, tc_out);
 
-        if (write_fp32) {
+    float* d_in = d_a;
+    float* d_out = d_b;
+    for (int i = 0; i < iters; ++i) {
+        // Punto de registro: ultima iteracion medida o multiplo de
+        // checkpoint_every (mismo criterio que benchmark_gpu_tensor_core_stencil
+        // usaba para write_fp32; aqui no hay flag que pasar al kernel -- out y
+        // out_tc siempre quedan al dia, esto solo decide cuando el HOST copia
+        // y evalua).
+        const bool snapshot = (i + 1 == iters) ||
+                              (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0);
+        CHECK_CUDA(cudaEventRecord(kernel_start[i]));
+        launch_kernel(d_in, d_out, i + 1);
+        CHECK_CUDA(cudaEventRecord(kernel_stop[i]));
+        std::swap(d_in, d_out);
+
+        if (snapshot) {
+            // Cierra el tramo cronometrado antes de tocar el host (REGLA
+            // CRITICA, ver benchmark_gpu_fp32_stencil).
             total_ms += timer.stop_and_elapsed_ms();
             std::chrono::steady_clock::time_point pause_t0;
             RAEnergySnapshot rapl_ckpt_before{};
@@ -1888,15 +1914,14 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
             }
 
             const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
-            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out_fp32,
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_in,
                                   count * sizeof(float), cudaMemcpyDeviceToHost));
             if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
                 record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
             }
             if (is_finite_buffer(checkpoint_host_buf)) {
                 std::swap(out_last_finite, checkpoint_host_buf);
-                out_reduced_last_finite.resize(count);
-                CHECK_CUDA(cudaMemcpy(out_reduced_last_finite.data(), tc_in, count * sizeof(T),
+                CHECK_CUDA(cudaMemcpy(out_reduced_last_finite.data(), d_out_tc, count * sizeof(T),
                                       cudaMemcpyDeviceToHost));
                 last_finite_iter = i + 1;
             }
@@ -1930,7 +1955,9 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
         energy_wall_s, flops_total);
     power_buffer_destroy(power_buffer);
     CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
+    // Tras el ultimo swap, d_in apunta al buffer con la salida FP32 mas
+    // reciente (nunca truncada, ver invariante del kernel).
+    CHECK_CUDA(cudaMemcpy(out.data(), d_in, count * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
 
     out_last_finite_o = std::move(out_last_finite);
@@ -1953,12 +1980,13 @@ static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
         storage_rel_eval_iter = (last_finite_iter > 0) ? last_finite_iter : iters;
     }
 
+    // out_reduced (cadena sombra T) se toma de d_out_tc, escrito por el mismo
+    // ultimo lanzamiento que produjo out (d_in): misma iteracion en ambos.
     out_reduced.resize(count);
-    CHECK_CUDA(cudaMemcpy(out_reduced.data(), tc_in, count * sizeof(T), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(out_reduced.data(), d_out_tc, count * sizeof(T), cudaMemcpyDeviceToHost));
 
-    CHECK_CUDA(cudaFree(d_in_fp32));
-    CHECK_CUDA(cudaFree(d_out_fp32));
-    CHECK_CUDA(cudaFree(d_in_tc));
+    CHECK_CUDA(cudaFree(d_a));
+    CHECK_CUDA(cudaFree(d_b));
     CHECK_CUDA(cudaFree(d_out_tc));
     CHECK_CUDA(cudaFree(d_first_nf));
     if (d_comp != nullptr) {
