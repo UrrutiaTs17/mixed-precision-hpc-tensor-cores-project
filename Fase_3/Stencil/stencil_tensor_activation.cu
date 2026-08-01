@@ -78,6 +78,20 @@ enum class TensorCoreMode {
     Both
 };
 
+// Ruta de DIAGNOSTICO (no toca WMMA_FP16/BF16 ni GPU_FP32, ver
+// stencil2d_fp32in_tcout_kernel/benchmark_gpu_fp32in_tcout_stencil): aisla
+// "truncar solo la salida" de "truncar la entrada antes de la suma" (esto
+// ultimo es lo que hace WMMA via HMMA). Off (por defecto) no la activa,
+// comportamiento identico al previo. Independiente de --tc: se controla con
+// --diag-fp32in aparte para poder correr ambas rutas en la misma invocacion
+// y comparar (R2 del prompt de diagnostico).
+enum class Fp32InMode {
+    Off,
+    FP16,
+    BF16,
+    Both
+};
+
 struct Options {
     int nx = 2048;
     int ny = 2048;
@@ -100,6 +114,9 @@ struct Options {
     // compensacion seria un no-op con puro overhead). Ver
     // benchmark_gpu_tensor_core_stencil.
     bool kahan = false;
+    // Off (por defecto) = sin ruta de diagnostico, comportamiento identico al
+    // previo. Ver Fp32InMode.
+    Fp32InMode fp32in_mode = Fp32InMode::Off;
 };
 
 __host__ __device__ inline int idx2d(int x, int y, int nx) {
@@ -156,7 +173,8 @@ static void print_usage(const char* prog) {
     std::cout
         << "Uso:\n"
         << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
-           " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]\n\n"
+           " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]"
+           " [--diag-fp32in off|fp16|bf16|both]\n\n"
         << "Descripcion:\n"
         << "  Compara CPU FP32, GPU CUDA FP32 y GPU WMMA Tensor Core para stencil 2D.\n"
         << "  La ruta Tensor Core usa operandos FP16/BF16 y acumulacion/salida FP32.\n\n"
@@ -177,12 +195,21 @@ static void print_usage(const char* prog) {
         << "  redondeo de almacenamiento a 16 bits en las rutas WMMA (FP16/BF16); no\n"
         << "  aplica a GPU FP32 clasico. off preserva el comportamiento previo byte a\n"
         << "  byte.\n\n"
+        << "  --diag-fp32in off|fp16|bf16|both (por defecto off) agrega la(s) ruta(s)\n"
+        << "  de diagnostico FP32IN_FP16OUT/FP32IN_BF16OUT: stencil clasico en FP32\n"
+        << "  (mismos vecinos/centro que GPU FP32, sin Tensor Cores) truncando SOLO el\n"
+        << "  resultado a 16 bits antes de guardarlo, para aislar el efecto de esa\n"
+        << "  truncacion de salida del de la truncacion de entrada que hace WMMA.\n"
+        << "  Independiente de --tc; respeta --kahan. off preserva el comportamiento\n"
+        << "  previo byte a byte.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --checkpoint-every 5\n"
-        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n";
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --diag-fp32in both"
+                             " --kahan on\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -207,6 +234,16 @@ static bool parse_kahan_flag(const char* value) {
     if (std::strcmp(value, "on") == 0) return true;
 
     std::cerr << "Valor no reconocido para --kahan (use off|on): " << value << "\n";
+    std::exit(EXIT_FAILURE);
+}
+
+static Fp32InMode parse_fp32in_mode(const char* value) {
+    if (std::strcmp(value, "off") == 0) return Fp32InMode::Off;
+    if (std::strcmp(value, "fp16") == 0) return Fp32InMode::FP16;
+    if (std::strcmp(value, "bf16") == 0) return Fp32InMode::BF16;
+    if (std::strcmp(value, "both") == 0) return Fp32InMode::Both;
+
+    std::cerr << "Valor no reconocido para --diag-fp32in (use off|fp16|bf16|both): " << value << "\n";
     std::exit(EXIT_FAILURE);
 }
 
@@ -241,6 +278,12 @@ static Options parse_args(int argc, char** argv) {
                 std::exit(EXIT_FAILURE);
             }
             opt.kahan = parse_kahan_flag(argv[++i]);
+        } else if (std::strcmp(argv[i], "--diag-fp32in") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --diag-fp32in\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.fp32in_mode = parse_fp32in_mode(argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -1624,6 +1667,307 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     return build_metrics(nx, ny, total_ms / iters);
 }
 
+// --- Ruta de DIAGNOSTICO: entrada FP32, SOLO salida truncada a 16 bits ---
+// (ver Fp32InMode / comentario de Options::fp32in_mode). Objetivo: separar
+// cuanto del error de WMMA_FP16/BF16 viene de truncar los 4 vecinos+centro a
+// T ANTES de sumar (restriccion de HMMA, ver stencil2d_wmma_kernel) de cuanto
+// viene de truncar SOLO el resultado al guardarlo. A diferencia de
+// stencil2d_wmma_kernel, este kernel nunca alimenta un operando pre-truncado
+// a la suma: sube in (T) a float con tc_to_float y computa 0.25*(suma)-centro
+// enteramente en FP32, exactamente como stencil2d_fp32_kernel (no se llama a
+// ese kernel porque su firma no puede alterarse para truncar la salida, pero
+// la formula es identica). Solo entonces trunca val a T via
+// compensated_store<T,kKahan> (mismo mecanismo de Kahan que WMMA, sin tocar
+// su codigo) para escribir out_tc, que es lo que realmente encadena la
+// siguiente iteracion. out_fp32 (crudo, sin redondear) sigue el mismo patron
+// que en stencil2d_wmma_kernel: solo se escribe cuando write_fp32
+// (checkpoint o ultima iteracion), como ancla para CSV_DRIFT/storage_rel. Las
+// celdas de borde (!active) nunca se escriben aqui: igual que en
+// stencil2d_wmma_kernel, ya quedaron correctas desde la conversion inicial
+// completa del buffer (ver benchmark_gpu_fp32in_tcout_stencil) y no cambian
+// de valor entre iteraciones.
+template <typename T, bool kKahan>
+__global__ static void stencil2d_fp32in_tcout_kernel(const T* __restrict__ in,
+                                                      float* __restrict__ out_fp32,
+                                                      T* __restrict__ out_tc,
+                                                      int nx,
+                                                      int ny,
+                                                      int iter,
+                                                      bool write_fp32,
+                                                      int* __restrict__ first_nf,
+                                                      float* __restrict__ comp) {
+    __shared__ int blk_bad;
+    if (threadIdx.x == 0 && threadIdx.y == 0) blk_bad = 0;
+    __syncthreads();
+
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool in_range = (x < nx && y < ny);
+    const bool active = in_range && !(x == 0 || y == 0 || x == nx - 1 || y == ny - 1);
+
+    if (active) {
+        const float up = tc_to_float(in[idx2d(x, y - 1, nx)]);
+        const float down = tc_to_float(in[idx2d(x, y + 1, nx)]);
+        const float left = tc_to_float(in[idx2d(x - 1, y, nx)]);
+        const float right = tc_to_float(in[idx2d(x + 1, y, nx)]);
+        const float center = tc_to_float(in[idx2d(x, y, nx)]);
+        const float val = 0.25f * (up + down + left + right) - center;
+        if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
+        const int idx = idx2d(x, y, nx);
+        out_tc[idx] = compensated_store<T, kKahan>(val, comp, idx);
+        if (write_fp32) out_fp32[idx] = val;
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        reduce_and_mark_first_nonfinite(first_nf, iter, blk_bad);
+    }
+}
+
+// Host de la ruta de diagnostico: analogo a benchmark_gpu_tensor_core_stencil
+// (mismo manejo de Kahan/d_comp, checkpoint/energia por tramos y storage_rel
+// via out_fp32 como ancla cruda, para que R1/R2 del diagnostico sean
+// comparables sin inventar un mecanismo de medicion nuevo) pero SIN
+// maquinaria WMMA: ni tiles de warp, ni fragmentos, ni matrices identidad, ni
+// shared dinamica -- el kernel usa el mismo grid/bloque 16x16 plano que
+// stencil2d_fp32_kernel/benchmark_gpu_fp32_stencil. No hay kernel de
+// conversion separado (igual que WMMA ya no lo tiene), asi que t_kernel_ms_out
+// es el t/iter completo y no existe un t_convert_ms_out que reportar aparte
+// (el llamador pasa 0.0 al emitir CSV_SUMMARY, igual que WMMA ya hace).
+template <typename T>
+static Metrics benchmark_gpu_fp32in_tcout_stencil(const std::vector<float>& in,
+                                                   std::vector<float>& out,
+                                                   std::vector<T>& out_reduced,
+                                                   int nx,
+                                                   int ny,
+                                                   int iters,
+                                                   bool kahan_enabled,
+                                                   const CheckpointContext& ckpt,
+                                                   const char* route_label,
+                                                   int& onset_iter,
+                                                   int& first_nonfinite_iter,
+                                                   double& t_kernel_ms_out,
+                                                   int& storage_rel_eval_iter,
+                                                   double& t_checkpoint_ms_out,
+                                                   std::vector<float>& out_last_finite_o,
+                                                   std::vector<T>& out_reduced_last_finite_o,
+                                                   EnergyMeasurement& out_energy) {
+    const size_t count = in.size();
+    float* d_in_fp32 = nullptr;
+    float* d_out_fp32 = nullptr;
+    T* d_in_tc = nullptr;
+    T* d_out_tc = nullptr;
+    int* d_first_nf = nullptr;
+    // d_comp: residuo de Kahan por celda, en FP32, persistente entre
+    // iteraciones (ver comentario analogo en benchmark_gpu_tensor_core_stencil).
+    // Solo se reserva si --kahan on; nullptr en caso contrario.
+    float* d_comp = nullptr;
+
+    CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_out_fp32, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_in_tc, count * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_out_tc, count * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
+    if (kahan_enabled) {
+        CHECK_CUDA(cudaMalloc(&d_comp, count * sizeof(float)));
+        CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
+    }
+
+    CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+
+    dim3 block(16, 16);
+    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+
+    // Ambos buffers del ping-pong T arrancan como conversion completa (borde
+    // incluido) del input pristino: el kernel nunca escribe las celdas de
+    // borde (ver comentario de stencil2d_fp32in_tcout_kernel).
+    convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
+    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    auto launch_kernel = [&](T* in_buf, T* out_buf, int iter_num, bool write_fp32_flag) {
+        if (kahan_enabled) {
+            stencil2d_fp32in_tcout_kernel<T, true><<<grid, block>>>(
+                in_buf, d_out_fp32, out_buf, nx, ny, iter_num, write_fp32_flag, d_first_nf, d_comp);
+        } else {
+            stencil2d_fp32in_tcout_kernel<T, false><<<grid, block>>>(
+                in_buf, d_out_fp32, out_buf, nx, ny, iter_num, write_fp32_flag, d_first_nf, nullptr);
+        }
+    };
+
+    PowerBuffer* power_buffer = power_buffer_create(0);
+    const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
+    power_buffer_start_sampling(power_buffer);
+
+    T* tc_in = d_in_tc;
+    T* tc_out = d_out_tc;
+    for (int i = 0; i < kWarmupIters; ++i) {
+        launch_kernel(tc_in, tc_out, i + 1, /*write_fp32_flag=*/false);
+        std::swap(tc_in, tc_out);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Reinicia d_in_tc, d_out_tc y d_out_fp32 al estado original tras el
+    // warm-up descartable (ver comentario analogo en
+    // benchmark_gpu_tensor_core_stencil).
+    convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
+    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
+    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    {
+        const int init_val = INT_MAX;
+        CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
+    }
+    if (kahan_enabled) {
+        CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
+    }
+    power_buffer_stop_sampling(power_buffer);
+    power_buffer_samples_clear(power_buffer);
+    const RAEnergySnapshot rapl_before = rapl_snapshot_now();
+    (void)rapl_warmup_before;
+
+    std::vector<float> checkpoint_host_buf;
+    checkpoint_host_buf.resize(count);  // siempre, para guardar ultima finita
+
+    std::vector<float> out_last_finite(count);
+    std::vector<T> out_reduced_last_finite(count);
+    int last_finite_iter = 0;
+
+    auto is_finite_buffer = [&](const std::vector<float>& buf) {
+        for (const auto& x : buf) {
+            if (!std::isfinite(x)) return false;
+        }
+        return true;
+    };
+
+    std::vector<cudaEvent_t> kernel_start(iters), kernel_stop(iters);
+    for (int i = 0; i < iters; ++i) {
+        CHECK_CUDA(cudaEventCreate(&kernel_start[i]));
+        CHECK_CUDA(cudaEventCreate(&kernel_stop[i]));
+    }
+
+    CudaEventTimer timer;
+    double total_ms = 0.0;
+    double checkpoint_ms_total = 0.0;
+    const bool exclude_checkpoint_energy = (ckpt.checkpoint_every > 0);
+    double gpu_energy_j = 0.0;
+    double gpu_window_s = 0.0;
+    bool gpu_energy_valid = true;
+    double checkpoint_cpu_energy_j = 0.0;
+    double checkpoint_pause_s = 0.0;
+    auto close_energy_segment = [&]() {
+        power_buffer_stop_sampling(power_buffer);
+        gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
+        gpu_energy_j += power_buffer_energy_joules(power_buffer);
+        gpu_window_s += power_buffer_window_seconds(power_buffer);
+        power_buffer_samples_clear(power_buffer);
+    };
+    emit_csv_region_marker(route_label, "begin");
+    power_buffer_samples_clear(power_buffer);
+    power_buffer_start_sampling(power_buffer);
+    timer.start();
+    for (int i = 0; i < iters; ++i) {
+        const bool write_fp32 = (i + 1 == iters) ||
+                                (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0);
+        CHECK_CUDA(cudaEventRecord(kernel_start[i]));
+        launch_kernel(tc_in, tc_out, i + 1, write_fp32);
+        CHECK_CUDA(cudaEventRecord(kernel_stop[i]));
+        std::swap(tc_in, tc_out);
+
+        if (write_fp32) {
+            total_ms += timer.stop_and_elapsed_ms();
+            std::chrono::steady_clock::time_point pause_t0;
+            RAEnergySnapshot rapl_ckpt_before{};
+            if (exclude_checkpoint_energy) {
+                pause_t0 = std::chrono::steady_clock::now();
+                close_energy_segment();
+                rapl_ckpt_before = rapl_snapshot_now();
+            }
+
+            const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out_fp32,
+                                  count * sizeof(float), cudaMemcpyDeviceToHost));
+            if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
+                record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
+            }
+            if (is_finite_buffer(checkpoint_host_buf)) {
+                std::swap(out_last_finite, checkpoint_host_buf);
+                out_reduced_last_finite.resize(count);
+                CHECK_CUDA(cudaMemcpy(out_reduced_last_finite.data(), tc_in, count * sizeof(T),
+                                      cudaMemcpyDeviceToHost));
+                last_finite_iter = i + 1;
+            }
+            const auto ckpt_t1 = std::chrono::high_resolution_clock::now();
+            checkpoint_ms_total +=
+                std::chrono::duration<double, std::milli>(ckpt_t1 - ckpt_t0).count();
+
+            if (exclude_checkpoint_energy) {
+                const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
+                checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
+                power_buffer_start_sampling(power_buffer);
+                checkpoint_pause_s += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - pause_t0).count();
+            }
+
+            timer.start();
+        }
+    }
+    total_ms += timer.stop_and_elapsed_ms();
+    close_energy_segment();
+    const RAEnergySnapshot rapl_after = rapl_snapshot_now();
+    emit_csv_region_marker(route_label, "end");
+    const double energy_wall_s = gpu_window_s;
+    const double flops_total = stencil_flops(nx, ny) * static_cast<double>(iters);
+    const bool cpu_energy_valid = rapl_before.valid && rapl_after.valid &&
+                                  rapl_after.energy_j >= rapl_before.energy_j;
+    const double cpu_energy_j = std::max(
+        0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
+    out_energy = make_energy_measurement_from_segments(
+        gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
+        energy_wall_s, flops_total);
+    power_buffer_destroy(power_buffer);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
+
+    out_last_finite_o = std::move(out_last_finite);
+    out_reduced_last_finite_o = std::move(out_reduced_last_finite);
+
+    double t_kernel_sum_ms = 0.0;
+    for (int i = 0; i < iters; ++i) {
+        float ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(&ms, kernel_start[i], kernel_stop[i]));
+        t_kernel_sum_ms += ms;
+        CHECK_CUDA(cudaEventDestroy(kernel_start[i]));
+        CHECK_CUDA(cudaEventDestroy(kernel_stop[i]));
+    }
+    t_kernel_ms_out = t_kernel_sum_ms / iters;
+    t_checkpoint_ms_out = checkpoint_ms_total / iters;
+
+    if (first_nonfinite_iter != INT_MAX && last_finite_iter == 0) {
+        storage_rel_eval_iter = -1;
+    } else {
+        storage_rel_eval_iter = (last_finite_iter > 0) ? last_finite_iter : iters;
+    }
+
+    out_reduced.resize(count);
+    CHECK_CUDA(cudaMemcpy(out_reduced.data(), tc_in, count * sizeof(T), cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA(cudaFree(d_in_fp32));
+    CHECK_CUDA(cudaFree(d_out_fp32));
+    CHECK_CUDA(cudaFree(d_in_tc));
+    CHECK_CUDA(cudaFree(d_out_tc));
+    CHECK_CUDA(cudaFree(d_first_nf));
+    if (d_comp != nullptr) {
+        CHECK_CUDA(cudaFree(d_comp));
+    }
+
+    return build_metrics(nx, ny, total_ms / iters);
+}
+
 // Imprime max_abs/rel_l2, o un mensaje explicito si la referencia o la
 // solucion no son finitas (evita imprimir "0.000000"/"nan" como si fuera
 // una medicion valida). first_nf es la primera iteracion no finita de LA
@@ -2230,6 +2574,16 @@ static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
                          fit, a_nyq_ic, kFp64SeedFloor);
 }
 
+static const char* fp32in_mode_to_string(Fp32InMode mode) {
+    switch (mode) {
+        case Fp32InMode::Off: return "off";
+        case Fp32InMode::FP16: return "fp16";
+        case Fp32InMode::BF16: return "bf16";
+        case Fp32InMode::Both: return "both";
+    }
+    return "off";
+}
+
 static void print_configuration(const Options& opt) {
     std::cout << "================== CONFIGURACION ==================\n";
     std::cout << "Stencil                    : 2D 5-puntos\n";
@@ -2241,6 +2595,7 @@ static void print_configuration(const Options& opt) {
     std::cout << "Tile Tensor Core           : 16x16 con WMMA\n";
     std::cout << "Acumulacion TC             : FP32\n";
     std::cout << "Kahan (residuo almacen.)   : " << (opt.kahan ? "on" : "off") << "\n";
+    std::cout << "Diagnostico FP32in->16out  : " << fp32in_mode_to_string(opt.fp32in_mode) << "\n";
     std::cout << "===================================================\n\n";
 }
 
@@ -2683,6 +3038,156 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         }
     }
 
+    // Ruta de DIAGNOSTICO (ver Fp32InMode/T1-T3 del prompt de diagnostico):
+    // entrada FP32 (mismos vecinos/centro que GPU FP32, sin Tensor Cores),
+    // solo la salida se trunca a 16 bits. Independiente de --tc: se ejecuta
+    // si --diag-fp32in la activa, sin importar que rutas WMMA hayan corrido
+    // arriba. No hay desglose kernel/conversion (un solo kernel, igual que
+    // WMMA ya reporta t_conv_ms=0): t_kernel_ms_fp32in_* es el t/iter
+    // completo.
+    bool ran_fp32in_fp16 = false;
+    bool ran_fp32in_bf16 = false;
+    int onset_fp32in_fp16 = -1;
+    int onset_fp32in_bf16 = -1;
+    int first_nf_fp32in_fp16 = INT_MAX;
+    int first_nf_fp32in_bf16 = INT_MAX;
+
+    if (opt.fp32in_mode == Fp32InMode::FP16 || opt.fp32in_mode == Fp32InMode::Both) {
+        ran_fp32in_fp16 = true;
+        double t_kernel_ms_fp32in_fp16 = 0.0, t_checkpoint_ms_fp32in_fp16 = 0.0;
+        int storage_rel_eval_iter_fp32in_fp16 = 0;
+        std::vector<float> y_fp32in_fp16(count, 0.0f);
+        std::vector<__half> y_fp32in_fp16_reduced;
+        std::vector<float> y_fp32in_fp16_last_finite;
+        std::vector<__half> y_fp32in_fp16_reduced_last_finite;
+        EnergyMeasurement e_fp32in_fp16;
+        const Metrics diag_fp32in_fp16 = benchmark_gpu_fp32in_tcout_stencil<__half>(
+            input, y_fp32in_fp16, y_fp32in_fp16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
+            ckpt, "FP32IN_FP16OUT", onset_fp32in_fp16, first_nf_fp32in_fp16,
+            t_kernel_ms_fp32in_fp16, storage_rel_eval_iter_fp32in_fp16, t_checkpoint_ms_fp32in_fp16,
+            y_fp32in_fp16_last_finite, y_fp32in_fp16_reduced_last_finite, e_fp32in_fp16);
+        const ErrorMetrics diag_fp32in_fp16_err = compare_fp64_ref_vs_fp32(y_ref, y_fp32in_fp16);
+        const ErrorMetrics diag_fp32in_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_fp32in_fp16);
+        const bool fp32in_fp16_storage_evaluable = (storage_rel_eval_iter_fp32in_fp16 != -1);
+        const StorageRelResult fp32in_fp16_storage_result = fp32in_fp16_storage_evaluable
+            ? storage_roundtrip_metrics<__half>(y_fp32in_fp16_last_finite,
+                                                storage_rel_eval_iter_fp32in_fp16)
+            : StorageRelResult{};
+        const ErrorMetrics diag_fp32in_fp16_prop_err =
+            compare_fp64_ref_vs_fp32(y_ref, reduced_to_float(y_fp32in_fp16_reduced));
+
+        std::cout << "GPU FP32in->FP16out (diagnostico) - tiempo/iter (media) : "
+                  << diag_fp32in_fp16.ms << " ms\n";
+        std::cout << "GPU FP32in->FP16out (diagnostico) - tiempo total        : "
+                  << diag_fp32in_fp16.ms * opt.iters << " ms\n";
+        std::cout << "GPU FP32in->FP16out (diagnostico) - rend.  : " << diag_fp32in_fp16.gflops
+                  << " GFLOP/s (" << diag_fp32in_fp16.tflops << " TFLOP/s efectivos)\n";
+        std::cout << "Speedup vs CPU             : " << cpu.ms / diag_fp32in_fp16.ms << "x\n";
+        std::cout << "Speedup vs GPU FP32        : " << gpu.ms / diag_fp32in_fp16.ms << "x\n";
+        std::cout << "t checkpoints/iter  : " << t_checkpoint_ms_fp32in_fp16
+                  << " ms  (excluido del t/iter reportado)\n";
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
+                            "Error rel Linf vs FP64             : ", diag_fp32in_fp16_err,
+                            first_nf_fp32in_fp16);
+        print_propagated_error_metrics(diag_fp32in_fp16_prop_err, first_nf_fp32in_fp16);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
+                            "Error rel Linf vs CPU FP32         : ", diag_fp32in_fp16_vs_cpu_err,
+                            first_nf_fp32in_fp16);
+        print_first_nonfinite("Primera iteracion no finita        : ", first_nf_fp32in_fp16, opt.iters);
+        print_storage_metrics("FP16 (diag fp32in)", fp32in_fp16_storage_result,
+                              fp32in_fp16_storage_evaluable, opt.iters, 1.0e-3);
+        std::cout << "\n\n";
+        emit_csv_summary_row("FP32IN_FP16OUT", opt.nx, opt.ny, opt.iters, opt.kahan,
+                             diag_fp32in_fp16.ms, diag_fp32in_fp16.gflops,
+                             fmt_csv_num(cpu.ms / diag_fp32in_fp16.ms),
+                             fmt_csv_num(gpu.ms / diag_fp32in_fp16.ms),
+                             fmt_csv_num(t_kernel_ms_fp32in_fp16), fmt_csv_num(0.0),
+                             fmt_csv_num(t_checkpoint_ms_fp32in_fp16), diag_fp32in_fp16_err,
+                             first_nf_fp32in_fp16,
+                             fmt_csv_error_num(diag_fp32in_fp16_prop_err, diag_fp32in_fp16_prop_err.rel_l2),
+                             fmt_csv_error_num(diag_fp32in_fp16_prop_err, diag_fp32in_fp16_prop_err.rel_linf),
+                             storage_num_field(fp32in_fp16_storage_result, fp32in_fp16_storage_evaluable,
+                                               fp32in_fp16_storage_result.rel_norm),
+                             storage_num_field(fp32in_fp16_storage_result, fp32in_fp16_storage_evaluable,
+                                               fp32in_fp16_storage_result.rel_max_guarded),
+                             storage_count_field(fp32in_fp16_storage_result, fp32in_fp16_storage_evaluable),
+                             storage_eval_iter_field(fp32in_fp16_storage_result, fp32in_fp16_storage_evaluable),
+                             e_fp32in_fp16);
+        emit_csv_store_row("FP32IN_FP16OUT", opt.nx, opt.ny, opt.iters, opt.kahan,
+                           fp32in_fp16_storage_result, fp32in_fp16_storage_evaluable, kFp16StorageUlp);
+        print_energy_metrics(e_fp32in_fp16);
+        emit_csv_energy_row("FP32IN_FP16OUT", opt.nx, opt.ny, opt.iters, opt.kahan, e_fp32in_fp16,
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+    }
+
+    if (opt.fp32in_mode == Fp32InMode::BF16 || opt.fp32in_mode == Fp32InMode::Both) {
+        ran_fp32in_bf16 = true;
+        double t_kernel_ms_fp32in_bf16 = 0.0, t_checkpoint_ms_fp32in_bf16 = 0.0;
+        int storage_rel_eval_iter_fp32in_bf16 = 0;
+        std::vector<float> y_fp32in_bf16(count, 0.0f);
+        std::vector<__nv_bfloat16> y_fp32in_bf16_reduced;
+        std::vector<float> y_fp32in_bf16_last_finite;
+        std::vector<__nv_bfloat16> y_fp32in_bf16_reduced_last_finite;
+        EnergyMeasurement e_fp32in_bf16;
+        const Metrics diag_fp32in_bf16 = benchmark_gpu_fp32in_tcout_stencil<__nv_bfloat16>(
+            input, y_fp32in_bf16, y_fp32in_bf16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
+            ckpt, "FP32IN_BF16OUT", onset_fp32in_bf16, first_nf_fp32in_bf16,
+            t_kernel_ms_fp32in_bf16, storage_rel_eval_iter_fp32in_bf16, t_checkpoint_ms_fp32in_bf16,
+            y_fp32in_bf16_last_finite, y_fp32in_bf16_reduced_last_finite, e_fp32in_bf16);
+        const ErrorMetrics diag_fp32in_bf16_err = compare_fp64_ref_vs_fp32(y_ref, y_fp32in_bf16);
+        const ErrorMetrics diag_fp32in_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_fp32in_bf16);
+        const bool fp32in_bf16_storage_evaluable = (storage_rel_eval_iter_fp32in_bf16 != -1);
+        const StorageRelResult fp32in_bf16_storage_result = fp32in_bf16_storage_evaluable
+            ? storage_roundtrip_metrics<__nv_bfloat16>(y_fp32in_bf16_last_finite,
+                                                       storage_rel_eval_iter_fp32in_bf16)
+            : StorageRelResult{};
+        const ErrorMetrics diag_fp32in_bf16_prop_err =
+            compare_fp64_ref_vs_fp32(y_ref, reduced_to_float(y_fp32in_bf16_reduced));
+
+        std::cout << "GPU FP32in->BF16out (diagnostico) - tiempo/iter (media) : "
+                  << diag_fp32in_bf16.ms << " ms\n";
+        std::cout << "GPU FP32in->BF16out (diagnostico) - tiempo total        : "
+                  << diag_fp32in_bf16.ms * opt.iters << " ms\n";
+        std::cout << "GPU FP32in->BF16out (diagnostico) - rend.  : " << diag_fp32in_bf16.gflops
+                  << " GFLOP/s (" << diag_fp32in_bf16.tflops << " TFLOP/s efectivos)\n";
+        std::cout << "Speedup vs CPU             : " << cpu.ms / diag_fp32in_bf16.ms << "x\n";
+        std::cout << "Speedup vs GPU FP32        : " << gpu.ms / diag_fp32in_bf16.ms << "x\n";
+        std::cout << "t checkpoints/iter  : " << t_checkpoint_ms_fp32in_bf16
+                  << " ms  (excluido del t/iter reportado)\n";
+        print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
+                            "Error rel Linf vs FP64             : ", diag_fp32in_bf16_err,
+                            first_nf_fp32in_bf16);
+        print_propagated_error_metrics(diag_fp32in_bf16_prop_err, first_nf_fp32in_bf16);
+        print_error_metrics("Error max abs vs CPU FP32          : ", "Error relativo L2 vs CPU FP32      : ",
+                            "Error rel Linf vs CPU FP32         : ", diag_fp32in_bf16_vs_cpu_err,
+                            first_nf_fp32in_bf16);
+        print_first_nonfinite("Primera iteracion no finita        : ", first_nf_fp32in_bf16, opt.iters);
+        print_storage_metrics("BF16 (diag fp32in)", fp32in_bf16_storage_result,
+                              fp32in_bf16_storage_evaluable, opt.iters, 8.0e-3);
+        std::cout << "\n\n";
+        emit_csv_summary_row("FP32IN_BF16OUT", opt.nx, opt.ny, opt.iters, opt.kahan,
+                             diag_fp32in_bf16.ms, diag_fp32in_bf16.gflops,
+                             fmt_csv_num(cpu.ms / diag_fp32in_bf16.ms),
+                             fmt_csv_num(gpu.ms / diag_fp32in_bf16.ms),
+                             fmt_csv_num(t_kernel_ms_fp32in_bf16), fmt_csv_num(0.0),
+                             fmt_csv_num(t_checkpoint_ms_fp32in_bf16), diag_fp32in_bf16_err,
+                             first_nf_fp32in_bf16,
+                             fmt_csv_error_num(diag_fp32in_bf16_prop_err, diag_fp32in_bf16_prop_err.rel_l2),
+                             fmt_csv_error_num(diag_fp32in_bf16_prop_err, diag_fp32in_bf16_prop_err.rel_linf),
+                             storage_num_field(fp32in_bf16_storage_result, fp32in_bf16_storage_evaluable,
+                                               fp32in_bf16_storage_result.rel_norm),
+                             storage_num_field(fp32in_bf16_storage_result, fp32in_bf16_storage_evaluable,
+                                               fp32in_bf16_storage_result.rel_max_guarded),
+                             storage_count_field(fp32in_bf16_storage_result, fp32in_bf16_storage_evaluable),
+                             storage_eval_iter_field(fp32in_bf16_storage_result, fp32in_bf16_storage_evaluable),
+                             e_fp32in_bf16);
+        emit_csv_store_row("FP32IN_BF16OUT", opt.nx, opt.ny, opt.iters, opt.kahan,
+                           fp32in_bf16_storage_result, fp32in_bf16_storage_evaluable, kBf16StorageUlp);
+        print_energy_metrics(e_fp32in_bf16);
+        emit_csv_energy_row("FP32IN_BF16OUT", opt.nx, opt.ny, opt.iters, opt.kahan, e_fp32in_bf16,
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+    }
+
     std::cout << "====================================================\n\n";
 
     // Calibracion del horizonte de overflow desde la referencia FP64: ajuste
@@ -2703,6 +3208,12 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         }
         if (ran_bf16) {
             std::cout << "CSV_ONSET,WMMA_BF16," << onset_bf16 << "\n";
+        }
+        if (ran_fp32in_fp16) {
+            std::cout << "CSV_ONSET,FP32IN_FP16OUT," << onset_fp32in_fp16 << "\n";
+        }
+        if (ran_fp32in_bf16) {
+            std::cout << "CSV_ONSET,FP32IN_BF16OUT," << onset_fp32in_bf16 << "\n";
         }
         std::cout << "=====================================================\n\n";
     }
