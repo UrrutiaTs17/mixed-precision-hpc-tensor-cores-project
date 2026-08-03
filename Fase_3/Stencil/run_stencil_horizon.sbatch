@@ -96,6 +96,20 @@ CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
 # de las cifras ya validadas (bloque de gates).
 KAHAN_LIST="${KAHAN_LIST:-off on}"
 
+# Tercera politica de compensacion, alternativa a --kahan off|on: error
+# feedback ESPACIAL (ver CompMode en stencil_tensor_activation.cu). Mismo
+# mecanismo y mismo default que en run_stencil_tc.sbatch; "off" no cambia una
+# sola operacion respecto de las corridas ya validadas. Se expone tambien aqui
+# porque esta es la corrida donde la pregunta tiene sentido: si la compensacion
+# espacial mueve o no el horizonte n* (FP16~28, BF16~138) hace falta ITERS
+# grande, que es justo lo que este barrido hace y el de metricas no.
+# SPATIAL_COMP=on fuerza KAHAN_LIST=off: el binario rechaza la combinacion y
+# con `set -e` eso mataria el job.
+SPATIAL_COMP="${SPATIAL_COMP:-off}"
+if [[ "${SPATIAL_COMP}" == "on" ]]; then
+    KAHAN_LIST="off"
+fi
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -122,7 +136,8 @@ for KAHAN in ${KAHAN_LIST}; do
     echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
     echo "============================================================"
     time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-          --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"
+          --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
+          --spatial-comp "${SPATIAL_COMP}"
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 

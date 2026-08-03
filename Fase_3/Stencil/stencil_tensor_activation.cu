@@ -78,6 +78,32 @@ enum class TensorCoreMode {
     Both
 };
 
+// Politica de compensacion del redondeo de almacenamiento a 16 bits en las
+// rutas WMMA. Se resuelve en tiempo de COMPILACION (parametro de plantilla del
+// kernel, ver compensated_store / stencil2d_wmma_kernel): ninguna de las tres
+// paga ramas de las otras dos.
+//
+//   Off     (--kahan off, por defecto): sin compensacion. Comportamiento
+//           historico, byte a byte.
+//   Local   (--kahan on): Kahan por celda. comp[idx] guarda el residuo que
+//           dejo la celda idx y se reincorpora cuando ESA MISMA celda vuelve
+//           a escribir. Comportamiento historico, byte a byte.
+//   Spatial (--spatial-comp on): error feedback espacial. Cada celda
+//           reincorpora los residuos de sus 4 vecinas Y el propio ANTES de la
+//           suma, no solo el propio. Motivacion: en este stencil el valor de
+//           una celda se calcula leyendo 5 celdas VECINAS, cada una cargando
+//           el residuo que dejo su propia escritura; con compensacion Local
+//           ese residuo entra a la suma sin compensar (comp[idx] solo conoce
+//           la historia de idx), asi que el error se propaga espacialmente
+//           mientras la compensacion es puramente local. Ver la derivacion en
+//           compensated_store y el costo en memoria en
+//           benchmark_gpu_tensor_core_stencil.
+enum class CompMode {
+    Off,
+    Local,
+    Spatial
+};
+
 struct Options {
     int nx = 2048;
     int ny = 2048;
@@ -100,7 +126,22 @@ struct Options {
     // compensacion seria un no-op con puro overhead). Ver
     // benchmark_gpu_tensor_core_stencil.
     bool kahan = false;
+    // false (por defecto, "off") = comportamiento identico al previo. true
+    // ("on"): compensacion ESPACIAL (error feedback de vecinos) en vez de la
+    // Kahan local; ver CompMode::Spatial. Mutuamente excluyente con --kahan on
+    // (son dos politicas alternativas de la misma compensacion, no dos capas
+    // acumulables): parse_args lo rechaza.
+    bool spatial_comp = false;
 };
+
+// Politica efectiva derivada de los dos flags. parse_args ya garantizo que no
+// esten ambos activos, asi que el orden de estas ramas no puede ocultar una
+// combinacion valida.
+static CompMode comp_mode_of(const Options& opt) {
+    if (opt.spatial_comp) return CompMode::Spatial;
+    if (opt.kahan) return CompMode::Local;
+    return CompMode::Off;
+}
 
 __host__ __device__ inline int idx2d(int x, int y, int nx) {
     return y * nx + x;
@@ -125,6 +166,27 @@ static std::string fmt_csv_error_num(const ErrorMetrics& e, double v) {
 
 static const char* kahan_label(bool kahan) {
     return kahan ? "on" : "off";
+}
+
+// Etiquetas de ruta/formato para la variante espacial. La columna kahan de los
+// CSV_* sigue siendo off|on (unicos valores que tools/extract_csv.py sabe
+// reconocer, ver KAHAN_RE/RUN_RE: un tercer valor no haria match y la fila
+// heredaria en silencio el contexto de la corrida anterior); la variante se
+// distingue por el SUFIJO de la ruta/formato, que esas herramientas propagan
+// tal cual sin interpretarlo. Asi el par (route, kahan) identifica sin
+// ambiguedad las tres politicas en un CSV que mezcle corridas:
+//   (WMMA_FP16, off) (WMMA_FP16, on) (WMMA_FP16_SP, off)
+// Ningun esquema de columnas cambia.
+static const char* wmma_route_label(CompMode mode, const char* base, const char* base_spatial) {
+    return (mode == CompMode::Spatial) ? base_spatial : base;
+}
+
+static const char* fp16_route_label(CompMode mode) {
+    return wmma_route_label(mode, "WMMA_FP16", "WMMA_FP16_SP");
+}
+
+static const char* bf16_route_label(CompMode mode) {
+    return wmma_route_label(mode, "WMMA_BF16", "WMMA_BF16_SP");
 }
 
 static std::string csv_first_nonfinite_field(int first_nf) {
@@ -156,7 +218,8 @@ static void print_usage(const char* prog) {
     std::cout
         << "Uso:\n"
         << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
-           " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]\n\n"
+           " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]"
+           " [--spatial-comp off|on]\n\n"
         << "Descripcion:\n"
         << "  Compara CPU FP32, GPU CUDA FP32 y GPU WMMA Tensor Core para stencil 2D.\n"
         << "  La ruta Tensor Core usa operandos FP16/BF16 y acumulacion/salida FP32.\n\n"
@@ -176,13 +239,23 @@ static void print_usage(const char* prog) {
         << "  --kahan off|on (por defecto off) activa suma compensada de Kahan del\n"
         << "  redondeo de almacenamiento a 16 bits en las rutas WMMA (FP16/BF16); no\n"
         << "  aplica a GPU FP32 clasico. off preserva el comportamiento previo byte a\n"
-        << "  byte.\n\n"
+        << "  byte. La compensacion es LOCAL: comp[idx] solo conoce la historia de la\n"
+        << "  celda idx, no la de las 4 vecinas que entran a la suma.\n\n"
+        << "  --spatial-comp off|on (por defecto off) usa compensacion ESPACIAL (error\n"
+        << "  feedback: cada celda reincorpora los residuos de sus 4 vecinas y el propio\n"
+        << "  antes de sumar) en vez de la Kahan local. Mutuamente excluyente con\n"
+        << "  --kahan on. Cuesta 5 lecturas globales FP32 y 1 escritura FP32 extra por\n"
+        << "  celda por iteracion, y duplica el buffer de residuos (ping-pong): en un\n"
+        << "  kernel limitado por memoria eso NO es gratis, ver t/iter reportado. Las\n"
+        << "  rutas WMMA se reportan como WMMA_FP16_SP / WMMA_BF16_SP para que sus\n"
+        << "  filas CSV no se confundan con las de --kahan off|on.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --checkpoint-every 5\n"
-        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n";
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --spatial-comp on\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -202,11 +275,11 @@ static TensorCoreMode parse_tc_mode(const char* value) {
     std::exit(EXIT_FAILURE);
 }
 
-static bool parse_kahan_flag(const char* value) {
+static bool parse_on_off_flag(const char* flag, const char* value) {
     if (std::strcmp(value, "off") == 0) return false;
     if (std::strcmp(value, "on") == 0) return true;
 
-    std::cerr << "Valor no reconocido para --kahan (use off|on): " << value << "\n";
+    std::cerr << "Valor no reconocido para " << flag << " (use off|on): " << value << "\n";
     std::exit(EXIT_FAILURE);
 }
 
@@ -240,7 +313,13 @@ static Options parse_args(int argc, char** argv) {
                 std::cerr << "Falta valor para --kahan\n";
                 std::exit(EXIT_FAILURE);
             }
-            opt.kahan = parse_kahan_flag(argv[++i]);
+            opt.kahan = parse_on_off_flag("--kahan", argv[++i]);
+        } else if (std::strcmp(argv[i], "--spatial-comp") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --spatial-comp\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.spatial_comp = parse_on_off_flag("--spatial-comp", argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -257,6 +336,12 @@ static Options parse_args(int argc, char** argv) {
     }
     if (opt.checkpoint_every < 0) {
         std::cerr << "checkpoint-every debe ser >= 0 (0 desactiva los checkpoints).\n";
+        std::exit(EXIT_FAILURE);
+    }
+    if (opt.kahan && opt.spatial_comp) {
+        std::cerr << "--kahan on y --spatial-comp on son mutuamente excluyentes: son dos"
+                     " politicas alternativas de compensacion del mismo redondeo de\n"
+                     "almacenamiento, no dos capas acumulables. Use una u otra.\n";
         std::exit(EXIT_FAILURE);
     }
     if (opt.profile_only && opt.tc_mode == TensorCoreMode::Both) {
@@ -904,22 +989,76 @@ __device__ inline __nv_bfloat16 float_to_tc<__nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
 
-// Suma compensada de Kahan del redondeo de ALMACENAMIENTO a 16 bits (no de la
-// suma de los 5 vecinos, ver metodologia 5.3/4.1.4 y el comentario de
-// benchmark_gpu_tensor_core_stencil): comp[idx] persiste en FP32 entre
-// iteraciones el residuo del redondeo anterior, indexado por celda. Cuando
-// kKahan es false, comp no se toca (puede ser nullptr) y esto colapsa a
+// Compensacion del redondeo de ALMACENAMIENTO a 16 bits (no de la suma de los
+// 5 vecinos, ver metodologia 5.3/4.1.4 y el comentario de
+// benchmark_gpu_tensor_core_stencil). comp[idx] persiste en FP32 entre
+// iteraciones el residuo indexado por celda; que se guarda ahi y con que signo
+// depende de kMode:
+//
+//   Local (--kahan on): convencion Kahan clasica. Se PRE-RESTA el residuo
+//     anterior antes de redondear y se guarda el nuevo residuo con signo
+//     Q(y)-y. Formulacion historica, intacta byte a byte.
+//
+//   Spatial (--spatial-comp on): convencion de error feedback. Se guarda lo
+//     que el redondeo PERDIO, comp = val - Q(val), de modo que el lector
+//     reconstruye el valor FP32 exacto con Q(val) + comp (ver el uso en
+//     stencil2d_wmma_kernel). Esa identidad es exacta en FP32 mientras val
+//     este dentro del rango normal de T: Q(val) y val difieren en menos de un
+//     factor 2, asi que la resta es exacta (Sterbenz) y cabe en la mantisa de
+//     24 bits. Fuera de rango (|val| > 65504 en FP16) Q(val) es inf y comp
+//     pasa a -inf: la iteracion siguiente produce NaN y first_nf lo marca --
+//     es decir, la variante espacial NO extiende el limite de RANGO del
+//     formato, solo elimina el error de PRECISION del almacenamiento.
+//
+// Con kMode == Off, comp no se toca (puede ser nullptr) y esto colapsa a
 // float_to_tc<T> sin rama en tiempo de ejecucion (if constexpr, resuelto en
 // compilacion): la ruta --kahan off no paga costo alguno.
-template <typename T, bool kKahan>
+template <typename T, CompMode kMode>
 __device__ inline T compensated_store(float val, float* comp, int idx) {
-    if constexpr (kKahan) {
+    if constexpr (kMode == CompMode::Local) {
         const float y = val - comp[idx];
         const T s = float_to_tc<T>(y);
         comp[idx] = tc_to_float(s) - y;
         return s;
+    } else if constexpr (kMode == CompMode::Spatial) {
+        const T s = float_to_tc<T>(val);
+        comp[idx] = val - tc_to_float(s);
+        return s;
     } else {
         return float_to_tc<T>(val);
+    }
+}
+
+// Siembra el residuo inicial (solo modo Spatial) con lo que perdio la
+// conversion FP32 -> T de la condicion inicial: comp[i] = u0[i] - Q(u0[i]),
+// misma convencion de signo que compensated_store<Spatial> (Q(v) + comp
+// reconstruye v).
+//
+// Por que es necesario y no un extra: sin esto la variante espacial
+// compensaria TODAS las escrituras menos la primera, y esa primera domina el
+// error final. Con lambda~2 el error de una inyeccion en la iteracion k se
+// amplifica 2^(n-k), asi que la serie de inyecciones esta dominada por las mas
+// tempranas y la conversion inicial (k=0) es el termino mayor de todos. Dejarla
+// sin compensar pondria un piso al error que ninguna compensacion posterior
+// puede bajar, y la medicion de "sirve la compensacion espacial?" quedaria
+// midiendo ese piso en vez del efecto bajo estudio.
+//
+// Consecuencia a declarar en la interpretacion: el estado propagado de la ruta
+// espacial es el PAR (buffer T, buffer comp) = 6 bytes/celda en FP16, no 2. La
+// comparacion honesta de costo es contra eso, no contra los 2 bytes de
+// --kahan off|on.
+//
+// Se aplica a TODAS las celdas, borde incluido: el borde nunca se recalcula, de
+// modo que su comp queda fijo en el valor sembrado y las celdas interiores
+// vecinas al borde reconstruyen su valor FP32 exacto en cada iteracion.
+template <typename T>
+__global__ static void seed_comp_from_conversion_kernel(const float* __restrict__ src_fp32,
+                                                        const T* __restrict__ src_tc,
+                                                        float* __restrict__ comp,
+                                                        int size) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        comp[i] = src_fp32[i] - tc_to_float(src_tc[i]);
     }
 }
 
@@ -968,12 +1107,26 @@ __host__ __device__ constexpr size_t wmma_warp_shared_bytes() {
     return wmma_tc_tiles_bytes<T>() + wmma_out_tile_bytes();
 }
 
-// kKahan (parametro de plantilla, no runtime): activa la compensacion de
-// Kahan del redondeo de almacenamiento (ver compensated_store). comp es
-// nullptr y no se toca cuando kKahan es false -- el llamador (benchmark_
-// gpu_tensor_core_stencil) elige la instanciacion en tiempo de compilacion
-// segun el flag --kahan, asi la ruta off no paga rama ni acceso a comp.
-template <typename T, bool kKahan>
+// kMode (parametro de plantilla, no runtime): elige la politica de
+// compensacion del redondeo de almacenamiento (ver CompMode /
+// compensated_store). comp/comp_prev son nullptr y no se tocan cuando
+// kMode == Off -- el llamador (benchmark_gpu_tensor_core_stencil) elige la
+// instanciacion en tiempo de compilacion segun los flags, asi la ruta off no
+// paga rama ni acceso a comp.
+//
+// comp:      buffer de residuos que ESTA iteracion escribe. En modo Local es
+//            tambien el que lee (actualizacion en sitio, cada celda solo toca
+//            su propia entrada: no hay carrera).
+// comp_prev: solo en modo Spatial, buffer de residuos de la iteracion
+//            ANTERIOR (el que corresponde a `in`). Es un buffer DISTINTO de
+//            comp, en ping-pong con el, porque aqui cada celda lee las
+//            entradas de sus 4 vecinas mientras esas mismas vecinas escriben
+//            las suyas: actualizar en sitio seria una carrera lectura/escritura
+//            entre bloques, exactamente el mismo motivo por el que in/out ya
+//            estan en ping-pong. nullptr en los modos Off/Local, donde nunca se
+//            dereferencia (por eso __restrict__ aqui es valido: en Spatial
+//            comp y comp_prev nunca apuntan al mismo buffer).
+template <typename T, CompMode kMode>
 __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                                              float* __restrict__ out_fp32,
                                              T* __restrict__ out_tc,
@@ -984,7 +1137,8 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                                              int iter,
                                              bool write_fp32,
                                              int* __restrict__ first_nf,
-                                             float* __restrict__ comp) {
+                                             float* __restrict__ comp,
+                                             const float* __restrict__ comp_prev) {
     // Cada warp procesa un tile 16x16 propio e independiente (shared privada
     // por warp, ver smem_raw mas abajo): el bloque ya no es 1 warp = 1 tile,
     // es kWarpsPerBlock warps = kWarpsPerBlock tiles.
@@ -1086,9 +1240,31 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
         for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
             const int local_x = linear % kTile;
             const int local_y = linear / kTile;
-            const float val = out_tile[linear];
-            const int idx = idx2d(x0 + local_x, y0 + local_y, nx);
-            out_tc[idx] = compensated_store<T, kKahan>(val, comp, idx);
+            const int x = x0 + local_x;
+            const int y = y0 + local_y;
+            float val = out_tile[linear];
+            const int idx = idx2d(x, y, nx);
+            if constexpr (kMode == CompMode::Spatial) {
+                // Los tiles que entraron al Tensor Core son de tipo T: sumarles
+                // el residuo FP32 antes del mma lo destruiria al reconvertir a
+                // 16 bits. Como el operador es LINEAL, la correccion se calcula
+                // aparte en FP32 y se suma al acumulador ya volcado:
+                //   L(v + c) = L(v) + L(c)
+                // donde L es el mismo Laplaciano de 5 puntos, v el estado
+                // almacenado en T y c el residuo. Equivale exactamente a leer
+                // v+c en cada vecina (que es lo que hace la rama escalar de
+                // abajo), sin sacar el trabajo pesado de los Tensor Cores ni
+                // tocar la formula del stencil.
+                // full_tile garantiza 1 <= x,y <= nx-2/ny-2, asi que las cuatro
+                // vecinas caen dentro del arreglo.
+                const float cu = comp_prev[idx2d(x, y - 1, nx)];
+                const float cd = comp_prev[idx2d(x, y + 1, nx)];
+                const float cl = comp_prev[idx2d(x - 1, y, nx)];
+                const float cr = comp_prev[idx2d(x + 1, y, nx)];
+                const float cc = comp_prev[idx];
+                val += 0.25f * (cu + cd + cl + cr) - cc;
+            }
+            out_tc[idx] = compensated_store<T, kMode>(val, comp, idx);
             if (write_fp32) out_fp32[idx] = val;
             if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
         }
@@ -1111,14 +1287,29 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             // __syncthreads() de mas abajo.
             const bool active = !(x <= 0 || y <= 0 || x >= nx - 1 || y >= ny - 1);
             if (active) {
-                const float up = tc_to_float(in[idx2d(x, y - 1, nx)]);
-                const float down = tc_to_float(in[idx2d(x, y + 1, nx)]);
-                const float left = tc_to_float(in[idx2d(x - 1, y, nx)]);
-                const float right = tc_to_float(in[idx2d(x + 1, y, nx)]);
-                const float center = tc_to_float(in[idx2d(x, y, nx)]);
-                const float val = 0.25f * (up + down + left + right) - center;
+                const int i_up = idx2d(x, y - 1, nx);
+                const int i_down = idx2d(x, y + 1, nx);
+                const int i_left = idx2d(x - 1, y, nx);
+                const int i_right = idx2d(x + 1, y, nx);
                 const int idx = idx2d(x, y, nx);
-                out_tc[idx] = compensated_store<T, kKahan>(val, comp, idx);
+                // En modo Spatial cada vecina se reconstruye a su valor FP32
+                // exacto (Q(v) + residuo perdido, ver compensated_store) ANTES
+                // de entrar a la suma: es la forma directa de lo que la rama
+                // full_tile de arriba hace por linealidad.
+                float up = tc_to_float(in[i_up]);
+                float down = tc_to_float(in[i_down]);
+                float left = tc_to_float(in[i_left]);
+                float right = tc_to_float(in[i_right]);
+                float center = tc_to_float(in[idx]);
+                if constexpr (kMode == CompMode::Spatial) {
+                    up += comp_prev[i_up];
+                    down += comp_prev[i_down];
+                    left += comp_prev[i_left];
+                    right += comp_prev[i_right];
+                    center += comp_prev[idx];
+                }
+                const float val = 0.25f * (up + down + left + right) - center;
+                out_tc[idx] = compensated_store<T, kMode>(val, comp, idx);
                 if (write_fp32) out_fp32[idx] = val;
                 if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
             }
@@ -1277,7 +1468,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  int nx,
                                                  int ny,
                                                  int iters,
-                                                 bool kahan_enabled,
+                                                 CompMode comp_mode,
                                                  const CheckpointContext& ckpt,
                                                  const char* route_label,
                                                  int& onset_iter,
@@ -1297,11 +1488,21 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     T* d_identity_pos = nullptr;
     T* d_identity_neg = nullptr;
     int* d_first_nf = nullptr;
-    // d_comp: residuo de Kahan por celda, en FP32, persistente entre
-    // iteraciones (NO participa del ping-pong: se actualiza en sitio, ver
-    // compensated_store). Solo se reserva si --kahan on; nullptr en caso
-    // contrario (la instanciacion kKahan=false del kernel nunca lo toca).
+    // d_comp: residuo por celda, en FP32, persistente entre iteraciones (ver
+    // compensated_store). Solo se reserva si hay compensacion activa; nullptr
+    // en caso contrario (la instanciacion CompMode::Off del kernel nunca lo
+    // toca).
+    //   Local   : un solo buffer, actualizado en sitio (cada celda solo toca su
+    //             propia entrada, no hay carrera). d_comp_prev queda en nullptr.
+    //   Spatial : DOS buffers en ping-pong, igual que d_in_tc/d_out_tc. Aqui
+    //             cada celda LEE las entradas de sus 4 vecinas mientras esas
+    //             vecinas escriben las suyas; en sitio seria una carrera
+    //             lectura/escritura entre bloques. Costo de memoria: +2 x 4
+    //             bytes por celda frente al 1 x 4 de Local.
     float* d_comp = nullptr;
+    float* d_comp_prev = nullptr;
+    const bool comp_enabled = (comp_mode != CompMode::Off);
+    const bool comp_pingpong = (comp_mode == CompMode::Spatial);
 
     CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_out_fp32, count * sizeof(float)));
@@ -1310,9 +1511,13 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMalloc(&d_identity_pos, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_identity_neg, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
-    if (kahan_enabled) {
+    if (comp_enabled) {
         CHECK_CUDA(cudaMalloc(&d_comp, count * sizeof(float)));
         CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
+    }
+    if (comp_pingpong) {
+        CHECK_CUDA(cudaMalloc(&d_comp_prev, count * sizeof(float)));
+        CHECK_CUDA(cudaMemset(d_comp_prev, 0, count * sizeof(float)));
     }
 
     CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
@@ -1344,27 +1549,68 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     dim3 grid((total_tiles + kWarpsPerBlock - 1) / kWarpsPerBlock);
     const size_t shared_bytes = static_cast<size_t>(kWarpsPerBlock) * wmma_warp_shared_bytes<T>();
 
+    // Siembra los DOS buffers de residuo con el error de la conversion inicial
+    // FP32 -> T (ver seed_comp_from_conversion_kernel). Los dos, y no solo uno,
+    // por el mismo motivo por el que d_in_tc/d_out_tc se convierten ambos: tras
+    // un numero impar de swaps cualquiera de los dos puede ser el que lea la
+    // primera iteracion. d_in_tc y d_out_tc tienen contenido identico aqui, asi
+    // que basta con leer uno. No-op fuera del modo Spatial: --kahan off|on
+    // conservan su residuo inicial en cero, byte a byte.
+    auto seed_comp_buffers = [&]() {
+        if (!comp_pingpong) return;
+        const int blocks = static_cast<int>((count + kConversionThreads - 1) / kConversionThreads);
+        seed_comp_from_conversion_kernel<T><<<blocks, kConversionThreads>>>(
+            d_in_fp32, d_in_tc, d_comp, static_cast<int>(count));
+        seed_comp_from_conversion_kernel<T><<<blocks, kConversionThreads>>>(
+            d_in_fp32, d_in_tc, d_comp_prev, static_cast<int>(count));
+        CHECK_CUDA(cudaGetLastError());
+    };
+
     // Ambos buffers del ping-pong T arrancan como conversion completa (borde
     // incluido) del input pristino: ver comentario de la funcion.
     convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
     convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
+    seed_comp_buffers();
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Elige la instanciacion kKahan={true,false} del kernel en tiempo de
-    // compilacion segun el flag runtime --kahan: kahan_enabled no cambia
-    // dentro de esta llamada, asi que el branch se resuelve una vez por
-    // benchmark, no por lanzamiento. Cuando kahan_enabled es false, d_comp es
-    // nullptr y la instanciacion kKahan=false nunca lo dereferencia.
+    // Punteros vivos del ping-pong de residuos (solo en modo Spatial):
+    // comp_out es el buffer que la iteracion en curso escribe, comp_in el que
+    // dejo la anterior. Se declaran aqui, antes de launch_wmma, porque la
+    // lambda los captura por referencia y el swap ocurre junto al de tc_in/
+    // tc_out en cada iteracion (incluido el warm-up).
+    float* comp_out = d_comp;
+    float* comp_in = d_comp_prev;
+
+    // Elige la instanciacion CompMode del kernel en tiempo de compilacion
+    // segun los flags runtime: comp_mode no cambia dentro de esta llamada, asi
+    // que el branch se resuelve una vez por benchmark, no por lanzamiento.
+    // Cuando comp_mode es Off, d_comp es nullptr y la instanciacion
+    // CompMode::Off nunca lo dereferencia; en Local, comp_prev va en nullptr
+    // (esa instanciacion tampoco lo dereferencia).
     auto launch_wmma = [&](T* in_buf, T* out_buf, int iter_num, bool write_fp32_flag) {
-        if (kahan_enabled) {
-            stencil2d_wmma_kernel<T, true><<<grid, block, shared_bytes>>>(
-                in_buf, d_out_fp32, out_buf, d_identity_pos, d_identity_neg,
-                nx, ny, iter_num, write_fp32_flag, d_first_nf, d_comp);
-        } else {
-            stencil2d_wmma_kernel<T, false><<<grid, block, shared_bytes>>>(
-                in_buf, d_out_fp32, out_buf, d_identity_pos, d_identity_neg,
-                nx, ny, iter_num, write_fp32_flag, d_first_nf, nullptr);
+        switch (comp_mode) {
+            case CompMode::Local:
+                stencil2d_wmma_kernel<T, CompMode::Local><<<grid, block, shared_bytes>>>(
+                    in_buf, d_out_fp32, out_buf, d_identity_pos, d_identity_neg,
+                    nx, ny, iter_num, write_fp32_flag, d_first_nf, d_comp, nullptr);
+                break;
+            case CompMode::Spatial:
+                stencil2d_wmma_kernel<T, CompMode::Spatial><<<grid, block, shared_bytes>>>(
+                    in_buf, d_out_fp32, out_buf, d_identity_pos, d_identity_neg,
+                    nx, ny, iter_num, write_fp32_flag, d_first_nf, comp_out, comp_in);
+                break;
+            case CompMode::Off:
+                stencil2d_wmma_kernel<T, CompMode::Off><<<grid, block, shared_bytes>>>(
+                    in_buf, d_out_fp32, out_buf, d_identity_pos, d_identity_neg,
+                    nx, ny, iter_num, write_fp32_flag, d_first_nf, nullptr, nullptr);
+                break;
         }
+    };
+
+    // Avanza el ping-pong de residuos junto al de los buffers T. No-op fuera
+    // del modo Spatial (en Local el unico buffer se actualiza en sitio).
+    auto swap_comp = [&]() {
+        if (comp_pingpong) std::swap(comp_in, comp_out);
     };
 
     PowerBuffer* power_buffer = power_buffer_create(0);
@@ -1376,6 +1622,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     for (int i = 0; i < kWarmupIters; ++i) {
         launch_wmma(tc_in, tc_out, i + 1, /*write_fp32_flag=*/false);
         std::swap(tc_in, tc_out);
+        swap_comp();
     }
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -1394,11 +1641,23 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         const int init_val = INT_MAX;
         CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
     }
-    // Reinicia el residuo de Kahan tras el warm-up, igual que d_first_nf: sin
-    // esto los residuos del warm-up (descartable) contaminarian el bucle
-    // medido (ver bloque 2 del prompt de correccion).
-    if (kahan_enabled) {
+    // Reinicia el residuo tras el warm-up, igual que d_first_nf: sin esto los
+    // residuos del warm-up (descartable) contaminarian el bucle medido (ver
+    // bloque 2 del prompt de correccion). En modo Spatial se ponen a cero los
+    // DOS buffers del ping-pong, por el mismo motivo por el que d_in_tc y
+    // d_out_tc se reconvierten ambos mas arriba: comp_in/comp_out pueden haber
+    // quedado intercambiados tras kWarmupIters swaps, asi que no basta con
+    // limpiar uno -- cualquiera de los dos puede ser el que lea la primera
+    // iteracion medida.
+    if (comp_enabled) {
         CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
+    }
+    if (comp_pingpong) {
+        CHECK_CUDA(cudaMemset(d_comp_prev, 0, count * sizeof(float)));
+        // Vuelve a sembrar el residuo de la conversion inicial: el bucle medido
+        // debe arrancar del MISMO estado (T + residuo) que veria sin warm-up.
+        seed_comp_buffers();
+        CHECK_CUDA(cudaDeviceSynchronize());
     }
     power_buffer_stop_sampling(power_buffer);
     power_buffer_samples_clear(power_buffer);
@@ -1479,6 +1738,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         launch_wmma(tc_in, tc_out, i + 1, write_fp32);
         CHECK_CUDA(cudaEventRecord(wmma_stop[i]));
         std::swap(tc_in, tc_out);
+        swap_comp();
 
         if (write_fp32) {
             // Cierra el tramo cronometrado antes de tocar el host con
@@ -1619,6 +1879,9 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaFree(d_first_nf));
     if (d_comp != nullptr) {
         CHECK_CUDA(cudaFree(d_comp));
+    }
+    if (d_comp_prev != nullptr) {
+        CHECK_CUDA(cudaFree(d_comp_prev));
     }
 
     return build_metrics(nx, ny, total_ms / iters);
@@ -2215,14 +2478,23 @@ static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
                                   int ny,
                                   int iters,
                                   bool kahan,
+                                  CompMode comp_mode,
                                   int n_fp16,
                                   int n_bf16,
                                   int n_gpu_fp32,
                                   int n_fp64) {
     const OverflowFitResult& fit = horizon.fit;
-    emit_csv_horizon_row("FP16", nx, ny, iters, kahan, horizon.pred_fp16, n_fp16,
+    // Mismo criterio de sufijo que las rutas (ver wmma_route_label): h_medido
+    // de estas dos filas SI depende de la politica de compensacion (es el
+    // first_nonfinite de la ruta WMMA correspondiente), asi que la variante
+    // espacial no puede compartir la etiqueta de formato con --kahan off|on.
+    // Las filas FP32/FP64 no dependen de la compensacion y conservan su
+    // etiqueta.
+    emit_csv_horizon_row(wmma_route_label(comp_mode, "FP16", "FP16_SP"),
+                         nx, ny, iters, kahan, horizon.pred_fp16, n_fp16,
                          fit, a_nyq_ic, kFp16SeedFloor);
-    emit_csv_horizon_row("BF16", nx, ny, iters, kahan, horizon.pred_bf16, n_bf16,
+    emit_csv_horizon_row(wmma_route_label(comp_mode, "BF16", "BF16_SP"),
+                         nx, ny, iters, kahan, horizon.pred_bf16, n_bf16,
                          fit, a_nyq_ic, kBf16SeedFloor);
     emit_csv_horizon_row("FP32", nx, ny, iters, kahan, horizon.pred_fp32, n_gpu_fp32,
                          fit, a_nyq_ic, kFp32SeedFloor);
@@ -2240,7 +2512,15 @@ static void print_configuration(const Options& opt) {
     std::cout << "Iteraciones                : " << opt.iters << "\n";
     std::cout << "Tile Tensor Core           : 16x16 con WMMA\n";
     std::cout << "Acumulacion TC             : FP32\n";
+    // Esta linea es la que tools/extract_csv.py usa (KAHAN_RE) para poblar la
+    // columna kahan cuando el log no trae la cabecera "Corrida:" del sbatch:
+    // su valor debe seguir siendo exactamente off|on. La politica espacial se
+    // reporta en una linea APARTE, no reemplazando este token.
     std::cout << "Kahan (residuo almacen.)   : " << (opt.kahan ? "on" : "off") << "\n";
+    std::cout << "Compensacion espacial      : " << (opt.spatial_comp ? "on" : "off") << "\n";
+    if (opt.spatial_comp) {
+        std::cout << "  (rutas WMMA reportadas como WMMA_FP16_SP / WMMA_BF16_SP)\n";
+    }
     std::cout << "===================================================\n\n";
 }
 
@@ -2258,7 +2538,7 @@ static const char* tc_mode_to_string(TensorCoreMode mode) {
 // 2 metricas mientras la corrida real usa las 12 de NCU_QUICK_METRICS).
 // --launch-skip se deriva de kWarmupIters (no un literal) para no desincronizarse.
 static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters,
-                              TensorCoreMode tc_mode, bool kahan) {
+                              TensorCoreMode tc_mode, bool kahan, bool spatial_comp) {
     std::cout << "Validacion Nsight Compute (coincide con NCU_QUICK_METRICS):\n";
     std::cout << "  ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \\\n";
     std::cout << "      --launch-skip " << kWarmupIters << " --launch-count 1 \\\n";
@@ -2279,7 +2559,8 @@ static void print_nsight_hint(const char* exe_name, int nx, int ny, int iters,
                  "launch__occupancy_limit_registers \\\n";
     std::cout << "      " << exe_name << " --nx " << nx << " --ny " << ny
               << " --iters " << iters << " --tc " << tc_mode_to_string(tc_mode)
-              << " --kahan " << (kahan ? "on" : "off") << " --profile-only\n";
+              << " --kahan " << (kahan ? "on" : "off")
+              << (spatial_comp ? " --spatial-comp on" : "") << " --profile-only\n";
 }
 
 // Modo --profile-only: los ~1723 s de pared por llamada a ncu eran, sobre
@@ -2323,7 +2604,8 @@ static void run_profile_only(const Options& opt) {
         int first_nf_fp16 = INT_MAX;
         EnergyMeasurement e_unused_fp16;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
-                                                  opt.iters, opt.kahan, ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16,
+                                                  opt.iters, comp_mode_of(opt), ckpt,
+                                                  fp16_route_label(comp_mode_of(opt)), onset_fp16, first_nf_fp16,
                                                   t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                   t_checkpoint_ms_unused, y_tc_fp16_last_finite_unused,
                                                   y_tc_fp16_reduced_last_finite_unused, e_unused_fp16);
@@ -2336,7 +2618,8 @@ static void run_profile_only(const Options& opt) {
         int first_nf_bf16 = INT_MAX;
         EnergyMeasurement e_unused_bf16;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
-                                                         opt.iters, opt.kahan, ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16,
+                                                         opt.iters, comp_mode_of(opt), ckpt,
+                                                         bf16_route_label(comp_mode_of(opt)), onset_bf16, first_nf_bf16,
                                                          t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                          t_checkpoint_ms_unused, y_tc_bf16_last_finite_unused,
                                                          y_tc_bf16_reduced_last_finite_unused, e_unused_bf16);
@@ -2509,6 +2792,16 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     int first_nf_fp16 = INT_MAX;
     int first_nf_bf16 = INT_MAX;
 
+    // Politica de compensacion y etiquetas de ruta derivadas: con
+    // --spatial-comp on las rutas WMMA se reportan como WMMA_FP16_SP /
+    // WMMA_BF16_SP en TODAS sus filas CSV (DRIFT, SUMMARY, STORE, ENERGY,
+    // REGION, ONSET) para que no se confundan con las de --kahan off|on al
+    // mezclar corridas. La columna kahan de esas filas sigue siendo off (ver
+    // wmma_route_label): el esquema no cambia.
+    const CompMode comp_mode = comp_mode_of(opt);
+    const char* route_fp16 = fp16_route_label(comp_mode);
+    const char* route_bf16 = bf16_route_label(comp_mode);
+
     if (opt.tc_mode == TensorCoreMode::FP16 || opt.tc_mode == TensorCoreMode::Both) {
         ran_fp16 = true;
         double t_wmma_ms_fp16 = 0.0, t_conv_ms_fp16 = 0.0, t_checkpoint_ms_fp16 = 0.0;
@@ -2517,8 +2810,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<__half> y_tc_fp16_reduced_last_finite;
         EnergyMeasurement e_fp16;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
-            input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
-            ckpt, "WMMA_FP16", onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
+            input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, comp_mode,
+            ckpt, route_fp16, onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
             storage_rel_eval_iter_fp16, t_checkpoint_ms_fp16, y_tc_fp16_last_finite,
             y_tc_fp16_reduced_last_finite, e_fp16);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
@@ -2568,7 +2861,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         print_storage_metrics("FP16", fp16_storage_result, fp16_storage_evaluable,
                               opt.iters, 1.0e-3);
         std::cout << "\n\n";
-        emit_csv_summary_row("WMMA_FP16", opt.nx, opt.ny, opt.iters, opt.kahan,
+        emit_csv_summary_row(route_fp16, opt.nx, opt.ny, opt.iters, opt.kahan,
                              tc_fp16.ms, tc_fp16.gflops,
                              fmt_csv_num(cpu.ms / tc_fp16.ms), fmt_csv_num(gpu.ms / tc_fp16.ms),
                              fmt_csv_num(t_wmma_ms_fp16), fmt_csv_num(t_conv_ms_fp16),
@@ -2581,10 +2874,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                                                fp16_storage_result.rel_max_guarded),
                              storage_count_field(fp16_storage_result, fp16_storage_evaluable),
                              storage_eval_iter_field(fp16_storage_result, fp16_storage_evaluable), e_fp16);
-        emit_csv_store_row("WMMA_FP16", opt.nx, opt.ny, opt.iters, opt.kahan,
+        emit_csv_store_row(route_fp16, opt.nx, opt.ny, opt.iters, opt.kahan,
                            fp16_storage_result, fp16_storage_evaluable, kFp16StorageUlp);
         print_energy_metrics(e_fp16);
-        emit_csv_energy_row("WMMA_FP16", opt.nx, opt.ny, opt.iters, opt.kahan, e_fp16,
+        emit_csv_energy_row(route_fp16, opt.nx, opt.ny, opt.iters, opt.kahan, e_fp16,
                             stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.kahan, opt.nx, opt.ny, opt.iters,
@@ -2607,8 +2900,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<__nv_bfloat16> y_tc_bf16_reduced_last_finite;
         EnergyMeasurement e_bf16;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
-            input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, opt.kahan,
-            ckpt, "WMMA_BF16", onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
+            input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, comp_mode,
+            ckpt, route_bf16, onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
             storage_rel_eval_iter_bf16, t_checkpoint_ms_bf16, y_tc_bf16_last_finite,
             y_tc_bf16_reduced_last_finite, e_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
@@ -2652,7 +2945,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         print_storage_metrics("BF16", bf16_storage_result, bf16_storage_evaluable,
                               opt.iters, 8.0e-3);
         std::cout << "\n\n";
-        emit_csv_summary_row("WMMA_BF16", opt.nx, opt.ny, opt.iters, opt.kahan,
+        emit_csv_summary_row(route_bf16, opt.nx, opt.ny, opt.iters, opt.kahan,
                              tc_bf16.ms, tc_bf16.gflops,
                              fmt_csv_num(cpu.ms / tc_bf16.ms), fmt_csv_num(gpu.ms / tc_bf16.ms),
                              fmt_csv_num(t_wmma_ms_bf16), fmt_csv_num(t_conv_ms_bf16),
@@ -2665,10 +2958,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                                                bf16_storage_result.rel_max_guarded),
                              storage_count_field(bf16_storage_result, bf16_storage_evaluable),
                              storage_eval_iter_field(bf16_storage_result, bf16_storage_evaluable), e_bf16);
-        emit_csv_store_row("WMMA_BF16", opt.nx, opt.ny, opt.iters, opt.kahan,
+        emit_csv_store_row(route_bf16, opt.nx, opt.ny, opt.iters, opt.kahan,
                            bf16_storage_result, bf16_storage_evaluable, kBf16StorageUlp);
         print_energy_metrics(e_bf16);
-        emit_csv_energy_row("WMMA_BF16", opt.nx, opt.ny, opt.iters, opt.kahan, e_bf16,
+        emit_csv_energy_row(route_bf16, opt.nx, opt.ny, opt.iters, opt.kahan, e_bf16,
                             stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.kahan, opt.nx, opt.ny, opt.iters,
@@ -2692,22 +2985,23 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     print_overflow_horizon(horizon, a_nyq,
                           first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
-    emit_csv_horizon_rows(horizon, a_nyq, opt.nx, opt.ny, opt.iters, opt.kahan,
+    emit_csv_horizon_rows(horizon, a_nyq, opt.nx, opt.ny, opt.iters, opt.kahan, comp_mode,
                           first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
 
     if (opt.checkpoint_every > 0) {
         std::cout << "=========== RESUMEN ONSET DE DIVERGENCIA ===========\n";
         std::cout << "CSV_ONSET,GPU_FP32," << onset_gpu_fp32 << "\n";
         if (ran_fp16) {
-            std::cout << "CSV_ONSET,WMMA_FP16," << onset_fp16 << "\n";
+            std::cout << "CSV_ONSET," << route_fp16 << "," << onset_fp16 << "\n";
         }
         if (ran_bf16) {
-            std::cout << "CSV_ONSET,WMMA_BF16," << onset_bf16 << "\n";
+            std::cout << "CSV_ONSET," << route_bf16 << "," << onset_bf16 << "\n";
         }
         std::cout << "=====================================================\n\n";
     }
 
-    print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters, opt.tc_mode, opt.kahan);
+    print_nsight_hint(exe_name, opt.nx, opt.ny, opt.iters, opt.tc_mode, opt.kahan,
+                      opt.spatial_comp);
 }
 
 }  // namespace
