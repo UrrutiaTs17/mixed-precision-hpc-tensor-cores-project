@@ -101,6 +101,24 @@ ITERS_NCU="${ITERS_NCU:-100}"
 # completa) -- el costo extra es ese recalculo redundante, no trabajo nuevo.
 KAHAN_LIST="${KAHAN_LIST:-off on}"
 
+# Compensacion ESPACIAL (error feedback de vecinos) como TERCERA politica,
+# alternativa a --kahan off|on (ver CompMode en stencil_tensor_activation.cu).
+# "off" por defecto: el flag se pasa igual, y --spatial-comp off no cambia una
+# sola operacion respecto de las corridas ya validadas.
+#
+# El binario RECHAZA --kahan on junto con --spatial-comp on (son dos politicas
+# alternativas de la misma compensacion, no dos capas): con SPATIAL_COMP=on se
+# fuerza KAHAN_LIST=off aqui, porque con `set -e` una combinacion invalida
+# mataria el job a mitad del barrido.
+#
+# Las rutas WMMA de una corrida espacial se reportan como WMMA_FP16_SP /
+# WMMA_BF16_SP, asi que sus filas conviven sin ambiguedad con las de
+# KAHAN_LIST="off on" en un mismo CSV extraido.
+SPATIAL_COMP="${SPATIAL_COMP:-off}"
+if [[ "${SPATIAL_COMP}" == "on" ]]; then
+    KAHAN_LIST="off"
+fi
+
 NX="${NX:-16384}"
 NY="${NY:-16384}"
 
@@ -155,7 +173,7 @@ echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "NVCC_FLAGS=${NVCC_FLAGS}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST}"
+echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP}"
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no
@@ -234,7 +252,7 @@ ncu_profile_kernel() {
         --export "${report}" \
         --force-overwrite \
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${tc_type}" \
-            --kahan "${kahan}" --profile-only; } 2>&1
+            --kahan "${kahan}" --spatial-comp "${SPATIAL_COMP}" --profile-only; } 2>&1
 }
 
 # Una sola invocacion de tee envuelve TODO el bucle (todas las combinaciones
@@ -253,7 +271,8 @@ for run in "${RUNS[@]}"; do
         echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
         echo "============================================================"
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-            --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"
+            --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
+            --spatial-comp "${SPATIAL_COMP}"
 
         if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego
