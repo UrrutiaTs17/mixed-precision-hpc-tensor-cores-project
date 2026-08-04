@@ -7,13 +7,16 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --exclusive
-# Subido de 01:00:00 a 02:00:00 (bloque 5): la corrida ahora se duplica
-# (--kahan off y --kahan on, ver KAHAN_LIST mas abajo); Kahan no toca CPU
-# FP32/FP64 (las referencias, el costo dominante de esta corrida) asi que la
-# segunda pasada las recalcula de forma redundante -- el tiempo total sube
-# aprox. al doble del de una sola pasada. Sin datos de wall-time medidos de
-# esta corrida en PACCA para calibrar con precision, 02:00:00 da margen frente
-# a duplicar un limite que ya se asumia ajustado a una sola pasada.
+# Subido de 01:00:00 a 02:00:00 (bloque 5): con KAHAN_LIST="off on" la corrida
+# se duplica; Kahan no toca CPU FP32/FP64 (las referencias, el costo dominante
+# de esta corrida) asi que la segunda pasada las recalcula de forma redundante
+# -- el tiempo total sube aprox. al doble del de una sola pasada. Sin datos de
+# wall-time medidos de esta corrida en PACCA para calibrar con precision,
+# 02:00:00 da margen frente a duplicar un limite que ya se asumia ajustado a
+# una sola pasada.
+# El limite se CONSERVA aunque el default actual (SPATIAL_COMP=on) fuerce
+# KAHAN_LIST=off y por tanto una sola pasada: SPATIAL_COMP=off restaura las dos
+# pasadas, y es esa la configuracion que necesita las 2 horas.
 #SBATCH --time=02:00:00
 
 set -euo pipefail
@@ -37,7 +40,13 @@ RESULTS_LOG="results/run_${JOB_ID}.log"
 # los puntos) ese costo cabe holgado en la ventana de este job.
 # No corre ncu: el objetivo es el texto de n* por stdout (primera iteracion
 # no finita de cada ruta), no perfilar Tensor Cores -- para eso esta
-# run_stencil_tc.sbatch.
+# run_stencil_tc.sbatch. TODO el perfilado NCU del stencil vive alli (variables
+# RUN_NCU / ITERS_NCU / NCU_COMP_LIST); este script no acepta RUN_NCU y
+# exportarlo aqui no tiene efecto alguno.
+#
+# Politica de compensacion por defecto: ESPACIAL (--spatial-comp on, ver
+# SPATIAL_COMP mas abajo). Las rutas WMMA salen etiquetadas WMMA_FP16_SP /
+# WMMA_BF16_SP. Para las rutas de Kahan local: SPATIAL_COMP=off.
 
 # Arquitectura por defecto para A100.
 # Puedes sobrescribirla con:
@@ -90,22 +99,46 @@ TC="${TC:-both}"
 # ruta (unas pocas decenas de MB cada uno, no escalan con ITERS).
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
 
-# Diseno factorial {fp16,bf16} x {kahan off,on} (bloque 5): esta es la corrida
-# donde SI importa si Kahan extiende n* de FP16 mas alla de 28 (pregunta
-# explicita del bloque). --kahan off primero preserva el orden de no-regresion
-# de las cifras ya validadas (bloque de gates).
+# Diseno factorial {fp16,bf16} x {kahan off,on} (bloque 5): la corrida donde
+# SI importa si Kahan extiende n* de FP16 mas alla de 28 (pregunta explicita
+# del bloque). --kahan off primero preserva el orden de no-regresion de las
+# cifras ya validadas (bloque de gates).
+# OJO: con el default actual (SPATIAL_COMP=on, ver abajo) esta lista se fuerza
+# a "off" y el barrido factorial de Kahan NO corre. Para recuperarlo hay que
+# pedir explicitamente SPATIAL_COMP=off.
 KAHAN_LIST="${KAHAN_LIST:-off on}"
 
-# Tercera politica de compensacion, alternativa a --kahan off|on: error
-# feedback ESPACIAL (ver CompMode en stencil_tensor_activation.cu). Mismo
-# mecanismo y mismo default que en run_stencil_tc.sbatch; "off" no cambia una
-# sola operacion respecto de las corridas ya validadas. Se expone tambien aqui
-# porque esta es la corrida donde la pregunta tiene sentido: si la compensacion
-# espacial mueve o no el horizonte n* (FP16~28, BF16~138) hace falta ITERS
-# grande, que es justo lo que este barrido hace y el de metricas no.
-# SPATIAL_COMP=on fuerza KAHAN_LIST=off: el binario rechaza la combinacion y
-# con `set -e` eso mataria el job.
-SPATIAL_COMP="${SPATIAL_COMP:-off}"
+# Politica de compensacion POR DEFECTO: error feedback ESPACIAL (CompMode en
+# stencil_tensor_activation.cu). El default se invirtio de "off" a "on" porque
+# es la unica de las tres politicas que efectivamente mitiga el error medido:
+#
+#   - Kahan LOCAL (--kahan on, comp[idx] por celda) es indistinguible de no
+#     compensar: rel_l2 coincide hasta la 4a cifra significativa con --kahan
+#     off en todo el trayecto y NO mueve el horizonte (FP16=28, BF16=138),
+#     verificado a nx=4096/8192/16384 (jobs 4501/4502 y 4511-4514). Cuesta
+#     ~1.97x en t_iter_ms a cambio de nada.
+#   - Compensacion ESPACIAL (--spatial-comp on) baja rel_l2 ~5-6 ordenes de
+#     magnitud (FP16: 7.76e-02 -> 3.15e-07; BF16: 6.01e-01 -> 3.16e-07 a
+#     nx=16384) y lleva el horizonte de BF16 de 138 a 142, igualando
+#     exactamente el de FP32 clasico. Cuesta ~1.56x, MENOS que Kahan local.
+#
+# La ruta de Kahan local se conserva intacta y activable: es la evidencia de
+# que la tecnica estandar de la literatura NO basta para este operador, y el
+# plan de grado pide evaluar Kahan y su overhead.
+#
+# COMO REPRODUCIR LA COMPARACION LOCAL-vs-ESPACIAL (ya no es el camino por
+# defecto): SPATIAL_COMP=off es la unica via para obtener las rutas de Kahan
+# local con kahan off y on, porque SPATIAL_COMP=on fuerza KAHAN_LIST=off (el
+# binario rechaza --kahan on junto con --spatial-comp on: son politicas
+# alternativas, no capas acumulables, y con `set -e` esa combinacion mataria
+# el job). Es decir:
+#   sbatch run_stencil_horizon.sbatch                          -> WMMA_*_SP
+#   sbatch --export=ALL,SPATIAL_COMP=off run_stencil_horizon.sbatch
+#                                        -> WMMA_FP16/BF16 con kahan off y on
+# Se expone aqui (y no solo en el barrido de metricas) porque medir si una
+# politica mueve el horizonte n* exige ITERS grande, que es justo lo que este
+# barrido hace y el de metricas no.
+SPATIAL_COMP="${SPATIAL_COMP:-on}"
 if [[ "${SPATIAL_COMP}" == "on" ]]; then
     KAHAN_LIST="off"
 fi

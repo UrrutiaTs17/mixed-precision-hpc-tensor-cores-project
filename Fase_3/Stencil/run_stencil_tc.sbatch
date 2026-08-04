@@ -58,12 +58,25 @@ else
 fi
 NCU_SET="${NCU_SET:-full}"
 # Se perfilan tres kernels en invocaciones ncu SEPARADAS (un regex cada una):
-# el WMMA (template sobre T = __half / __nv_bfloat16; ncu filtra por nombre
-# demangled, asi que el regex cubre ambas instanciaciones), el GPU FP32
-# clasico y las conversiones float<->16 bits que corren dentro de la ruta WMMA.
+# el WMMA (template sobre T = __half / __nv_bfloat16 y sobre CompMode, asi que
+# el regex cubre todas las instanciaciones; cual se lanza lo deciden los flags
+# del binario en cada invocacion, no el nombre), el GPU FP32 clasico y las
+# conversiones float<->16 bits que corren dentro de la ruta WMMA.
 NCU_KERNEL_REGEX_WMMA="${NCU_KERNEL_REGEX_WMMA:-.*stencil2d_wmma_kernel.*}"
 NCU_KERNEL_REGEX_FP32="${NCU_KERNEL_REGEX_FP32:-.*stencil2d_fp32_kernel.*}"
 NCU_KERNEL_REGEX_CONVERT="${NCU_KERNEL_REGEX_CONVERT:-.*convert_float_to_(half|bfloat16)_kernel.*}"
+# La compensacion espacial NO es un kernel aparte: es la instanciacion
+# stencil2d_wmma_kernel<T, CompMode::Spatial> del MISMO template (ver
+# launch_wmma en stencil_tensor_activation.cu, que elige Off/Local/Spatial en
+# tiempo de compilacion). Por eso el regex es el mismo por defecto: lo que
+# distingue una politica de otra no es el nombre del kernel sino los flags con
+# que se invoca el binario, y cada llamada a ncu lanza una sola instanciacion.
+# Se declara como variable propia para poder apuntarla a un regex sobre el
+# nombre demangled (que si lleva el argumento de plantilla) si alguna vez hace
+# falta: ncu usa --kernel-name-base=function por defecto, que recorta los
+# argumentos de plantilla, asi que ese caso exigiria ademas
+# --kernel-name-base demangled.
+NCU_KERNEL_REGEX_WMMA_SP="${NCU_KERNEL_REGEX_WMMA_SP:-${NCU_KERNEL_REGEX_WMMA}}"
 # Debe coincidir con kWarmupIters en stencil_tensor_activation.cu (Fase_3/Stencil);
 # se deriva del propio fuente en vez de repetir el literal para que ambos no
 # puedan desincronizarse si kWarmupIters cambia.
@@ -88,10 +101,16 @@ ITERS_LIST="${ITERS_LIST:-10 50 100 120}"
 # checkpoints en 5,10,15,20,25,... -- el ultimo antes de n*~28 (FP16, el
 # formato que diverge mas temprano) cae en 25, bien dentro del rango finito.
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
-# Restriccion de tiempo: NCU solo se corre para un valor de ITERS de la lista,
-# no para todos -- mantiene el numero de reportes NCU en 5 (sin Kahan) o 7 (con
-# Kahan: +2 WMMA fp16/bf16 kahan=on) por corrida (WMMA fp16/bf16, conversion
-# fp16/bf16, FP32 clasico una sola vez).
+# Restriccion de tiempo: NCU solo se corre para el valor de ITERS de la lista
+# que coincida con ITERS_NCU, no para todos -- perfilar en cada ITERS
+# multiplicaria el tiempo de cola. Reportes por corrida perfilada: 9 = FP32
+# clasico (1) + conversion fp16/bf16 (2) + WMMA fp16/bf16 x las 3 politicas de
+# NCU_COMP_LIST (6).
+#
+# ATENCION: ITERS_NCU e ITERS_LIST son independientes y hay que alinearlas a
+# mano. Si ningun valor de ITERS_LIST es igual a ITERS_NCU no se genera ningun
+# reporte; el script lo avisa (al arrancar y en cada corrida omitida) en vez de
+# saltarse el bloque en silencio como hacia antes.
 ITERS_NCU="${ITERS_NCU:-100}"
 # Diseno factorial {fp16,bf16} x {kahan off,on} x ITERS_LIST (bloque 5): cada
 # valor de ITERS_LIST corre completo con --kahan off y con --kahan on. Kahan
@@ -99,22 +118,40 @@ ITERS_NCU="${ITERS_NCU:-100}"
 # clasico y las referencias CPU FP32/FP64 dan identico resultado en ambas
 # pasadas, pero se recalculan de todas formas (una invocacion == una corrida
 # completa) -- el costo extra es ese recalculo redundante, no trabajo nuevo.
+# OJO: con el default actual (SPATIAL_COMP=on, ver abajo) esta lista se fuerza
+# a "off" y el barrido factorial de Kahan NO corre en las mediciones. Para
+# recuperarlo hay que pedir explicitamente SPATIAL_COMP=off.
 KAHAN_LIST="${KAHAN_LIST:-off on}"
 
-# Compensacion ESPACIAL (error feedback de vecinos) como TERCERA politica,
+# Compensacion ESPACIAL (error feedback de vecinos): politica POR DEFECTO,
 # alternativa a --kahan off|on (ver CompMode en stencil_tensor_activation.cu).
-# "off" por defecto: el flag se pasa igual, y --spatial-comp off no cambia una
-# sola operacion respecto de las corridas ya validadas.
+# El default se invirtio de "off" a "on" porque es la unica de las tres
+# politicas que efectivamente mitiga el error medido: Kahan LOCAL es
+# indistinguible de no compensar (rel_l2 igual hasta la 4a cifra con --kahan
+# off, horizonte sin mover: FP16=28, BF16=138) a un costo de ~1.97x en
+# t_iter_ms, mientras la espacial baja rel_l2 ~5-6 ordenes de magnitud
+# (BF16 a nx=16384: 6.01e-01 -> 3.16e-07) y lleva el horizonte de BF16 de 138
+# a 142, el mismo de FP32 clasico, por ~1.56x. Verificado a nx=4096/8192/16384
+# (jobs 4501/4502 y 4511-4514).
 #
 # El binario RECHAZA --kahan on junto con --spatial-comp on (son dos politicas
 # alternativas de la misma compensacion, no dos capas): con SPATIAL_COMP=on se
 # fuerza KAHAN_LIST=off aqui, porque con `set -e` una combinacion invalida
-# mataria el job a mitad del barrido.
+# mataria el job a mitad del barrido. Por eso SPATIAL_COMP=off es la UNICA via
+# para obtener el barrido factorial de Kahan local (kahan off y on), que se
+# conserva intacto:
+#   sbatch run_stencil_tc.sbatch                     -> WMMA_*_SP
+#   sbatch --export=ALL,SPATIAL_COMP=off run_stencil_tc.sbatch
+#                                     -> WMMA_FP16/BF16 con kahan off y on
 #
 # Las rutas WMMA de una corrida espacial se reportan como WMMA_FP16_SP /
 # WMMA_BF16_SP, asi que sus filas conviven sin ambiguedad con las de
 # KAHAN_LIST="off on" en un mismo CSV extraido.
-SPATIAL_COMP="${SPATIAL_COMP:-off}"
+#
+# Nota: esto solo fija la politica de las corridas de MEDICION. El perfilado
+# NCU no depende de esta variable para el kernel WMMA: perfila las tres
+# politicas en la misma corrida (ver NCU_COMP_LIST).
+SPATIAL_COMP="${SPATIAL_COMP:-on}"
 if [[ "${SPATIAL_COMP}" == "on" ]]; then
     KAHAN_LIST="off"
 fi
@@ -138,6 +175,27 @@ done
 #   quick -> --metrics "${NCU_QUICK_METRICS}" (rapido, valida Tensor Cores)
 #   full  -> --set "${NCU_SET}"               (caracterizacion completa)
 NCU_MODE="${NCU_MODE:-quick}"
+
+# Metricas extra del modo quick para discriminar por que la compensacion
+# espacial (5 lecturas de comp[] por celda) resulta MAS rapida que la Kahan
+# local (1 lectura): stalls por warp -> hipotesis de latencia serializada;
+# sectores/request -> hipotesis de coalescencia. Ambos grupos se definen y
+# documentan en tools/common_ncu.sh. Vaciar la variable
+# (NCU_COMP_ANALYSIS_METRICS="") vuelve al conjunto quick historico, util si
+# la version de ncu de PACCA rechaza algun nombre de metrica.
+NCU_COMP_ANALYSIS_METRICS="${NCU_COMP_ANALYSIS_METRICS:-${NCU_WARP_STALL_METRICS:-},${NCU_COALESCING_METRICS:-}}"
+
+# Politicas de compensacion a perfilar en el kernel WMMA, independientes de
+# SPATIAL_COMP/KAHAN_LIST (que fijan las corridas de MEDICION). Se perfilan las
+# tres en la misma corrida, con la misma nx/iters, porque comparar sus perfiles
+# lado a lado es justamente lo que explica la anomalia de rendimiento; ncu
+# invoca el binario aparte con --profile-only, asi que puede pedir una politica
+# distinta de la que corre el barrido sin alterarlo.
+#   off     -> --kahan off --spatial-comp off  (base, reporte ..._kahan0)
+#   local   -> --kahan on  --spatial-comp off  (Kahan local, ..._kahan1)
+#   spatial -> --kahan off --spatial-comp on   (espacial, ..._sp)
+# Nunca se combinan kahan on + spatial on: el binario rechaza esa combinacion.
+NCU_COMP_LIST="${NCU_COMP_LIST:-off local spatial}"
 TIMEFORMAT=">>> Tiempo real de la llamada ncu (NCU_MODE=${NCU_MODE}): %R s (user %U, sys %S)"
 
 echo "Nodo: $(hostname)"
@@ -236,11 +294,17 @@ fi
 # del ambito que la invoca (bucle principal, mas abajo). kahan (5to arg,
 # "off"/"on") se pasa tal cual a --kahan; default "off" para los kernels que
 # Kahan no toca (FP32 clasico, conversion), que solo se perfilan una vez.
+# spatial (6to arg) default "${SPATIAL_COMP}": los kernels que la compensacion
+# no toca (FP32 clasico, conversion) siguen la politica del barrido sin tener
+# que declararla; el kernel WMMA la recibe explicita, una por politica de
+# NCU_COMP_LIST.
 ncu_profile_kernel() {
     local label="$1" regex="$2" tc_type="$3" report_tag="$4" kahan="${5:-off}"
+    local spatial="${6:-${SPATIAL_COMP}}"
     local report="logs/ncu_${report_tag}_nx${NX}_ny${NY}_job${SLURM_JOB_ID:-manual}"
     echo
-    echo "Perfilando ${label} con Nsight Compute (NCU_MODE=${NCU_MODE}, kahan=${kahan})..."
+    echo "Perfilando ${label} con Nsight Compute (NCU_MODE=${NCU_MODE}," \
+         "kahan=${kahan}, spatial-comp=${spatial})..."
     echo "Reporte: ${report}.ncu-rep"
     # `time` (y stderr de ncu) se redirigen al .out para correlacionar
     # duracion vs #SBATCH --time en corridas con --set full.
@@ -252,8 +316,27 @@ ncu_profile_kernel() {
         --export "${report}" \
         --force-overwrite \
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${tc_type}" \
-            --kahan "${kahan}" --spatial-comp "${SPATIAL_COMP}" --profile-only; } 2>&1
+            --kahan "${kahan}" --spatial-comp "${spatial}" --profile-only; } 2>&1
 }
+
+# Primer valor de KAHAN_LIST: la pasada en la que se concentra todo el
+# perfilado NCU (ver el bloque RUN_NCU mas abajo).
+read -r KAHAN_FIRST _ <<< "${KAHAN_LIST}"
+
+# Aviso temprano: si NINGUN valor de ITERS_LIST coincide con ITERS_NCU, la
+# corrida entera terminara sin un solo .ncu-rep. Detectarlo aqui evita
+# descubrirlo despues de horas de cola.
+if [[ "${RUN_NCU}" == "1" ]]; then
+    NCU_ITERS_MATCH=0
+    for _iters_val in ${ITERS_LIST}; do
+        [[ "${_iters_val}" == "${ITERS_NCU}" ]] && NCU_ITERS_MATCH=1
+    done
+    if [[ "${NCU_ITERS_MATCH}" == "0" ]]; then
+        echo "AVISO: RUN_NCU=1 pero ITERS_NCU=${ITERS_NCU} no esta en" \
+             "ITERS_LIST='${ITERS_LIST}': esta corrida NO generara ningun reporte NCU." \
+             "Alinee ITERS_NCU con algun valor de ITERS_LIST para perfilar." >&2
+    fi
+fi
 
 # Una sola invocacion de tee envuelve TODO el bucle (todas las combinaciones
 # de RUNS x KAHAN_LIST) en vez de reabrirse por cada pasada de KAHAN: mismo
@@ -290,33 +373,76 @@ for run in "${RUNS[@]}"; do
             if [[ "${NCU_MODE}" == "full" ]]; then
                 NCU_CAPTURE_ARGS=(--set "${NCU_SET}")
             else
-                NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
+                NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}${NCU_COMP_ANALYSIS_METRICS:+,${NCU_COMP_ANALYSIS_METRICS}}")
             fi
 
-            # GPU FP32 clasico y las conversiones no dependen de Kahan (no las
-            # toca, ver stencil_tensor_activation.cu): se perfilan UNA sola vez
-            # por corrida, en la pasada KAHAN=off, para no duplicar tiempo de
-            # pared sin informacion nueva. El valor de --tc que se le pasa al
-            # FP32 clasico es irrelevante para ese kernel; se usa el primero de
-            # NCU_TC_TYPES.
-            if [[ "${KAHAN}" == "off" ]]; then
+            # Todo el perfilado se hace en UNA sola pasada del bucle de KAHAN
+            # (la primera): ncu invoca el binario aparte, con --profile-only y
+            # con la politica de compensacion que el mismo elige (ver
+            # NCU_COMP_LIST), asi que no gana nada repitiendose por cada valor
+            # de KAHAN_LIST. Se ancla al primer elemento y no al literal "off"
+            # para que KAHAN_LIST="on" (o cualquier lista de un solo valor)
+            # tampoco se quede sin perfilar.
+            if [[ "${KAHAN}" == "${KAHAN_FIRST}" ]]; then
+                # El valor de --tc que se le pasa al FP32 clasico es
+                # irrelevante para ese kernel; se usa el primero de
+                # NCU_TC_TYPES.
                 ncu_profile_kernel "GPU FP32 clasico" "${NCU_KERNEL_REGEX_FP32}" \
                     "${NCU_TC_TYPES[0]}" "fp32_stencil"
-            fi
 
-            for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
-                KAHAN_BIT=0
-                [[ "${KAHAN}" == "on" ]] && KAHAN_BIT=1
-                # El kernel WMMA SI depende de Kahan (cambia la escritura de
-                # out_tc): se perfila una vez por valor de KAHAN, con reporte
-                # distinguible por sufijo kahan{0,1}.
-                ncu_profile_kernel "WMMA ${TC_TYPE} kahan=${KAHAN}" "${NCU_KERNEL_REGEX_WMMA}" \
-                    "${TC_TYPE}" "wmma_stencil_${TC_TYPE}_kahan${KAHAN_BIT}" "${KAHAN}"
-                if [[ "${KAHAN}" == "off" ]]; then
+                for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
+                    # Las conversiones float<->16 bits no dependen de la
+                    # politica de compensacion (no las toca, ver
+                    # stencil_tensor_activation.cu): un reporte por precision.
                     ncu_profile_kernel "conversion ${TC_TYPE}" "${NCU_KERNEL_REGEX_CONVERT}" \
                         "${TC_TYPE}" "convert_${TC_TYPE}"
-                fi
-            done
+
+                    # El kernel WMMA SI depende de la politica: se perfila una
+                    # vez por politica de NCU_COMP_LIST, con reportes
+                    # distinguibles por sufijo (kahan0 / kahan1 / sp). Los tres
+                    # salen de la MISMA corrida, nx e iters -- que es lo que
+                    # permite compararlos lado a lado.
+                    for COMP_POLICY in ${NCU_COMP_LIST}; do
+                        case "${COMP_POLICY}" in
+                            off)
+                                NCU_KAHAN=off; NCU_SPATIAL=off
+                                COMP_TAG="kahan0"; COMP_LABEL="sin compensacion"
+                                COMP_REGEX="${NCU_KERNEL_REGEX_WMMA}"
+                                ;;
+                            local)
+                                NCU_KAHAN=on;  NCU_SPATIAL=off
+                                COMP_TAG="kahan1"; COMP_LABEL="Kahan local"
+                                COMP_REGEX="${NCU_KERNEL_REGEX_WMMA}"
+                                ;;
+                            spatial)
+                                NCU_KAHAN=off; NCU_SPATIAL=on
+                                COMP_TAG="sp";  COMP_LABEL="compensacion espacial"
+                                COMP_REGEX="${NCU_KERNEL_REGEX_WMMA_SP}"
+                                ;;
+                            *)
+                                echo "AVISO: politica desconocida en NCU_COMP_LIST:" \
+                                     "'${COMP_POLICY}' (validas: off local spatial)." \
+                                     "Se omite." >&2
+                                continue
+                                ;;
+                        esac
+                        ncu_profile_kernel "WMMA ${TC_TYPE} (${COMP_LABEL})" \
+                            "${COMP_REGEX}" "${TC_TYPE}" \
+                            "wmma_stencil_${TC_TYPE}_${COMP_TAG}" \
+                            "${NCU_KAHAN}" "${NCU_SPATIAL}"
+                    done
+                done
+            fi
+        elif [[ "${RUN_NCU}" == "1" ]]; then
+            # Sin este aviso el bloque NCU se saltaba en silencio: ITERS_NCU e
+            # ITERS_LIST son variables independientes, y toda corrida cuyo
+            # ITERS no coincidiera con ITERS_NCU terminaba sin un solo
+            # .ncu-rep sin que nada lo dijera en el log.
+            echo
+            echo "AVISO: NCU omitido en esta corrida: ITERS=${ITERS} no coincide con" \
+                 "ITERS_NCU=${ITERS_NCU}. El perfilado solo se dispara en el valor de" \
+                 "ITERS_LIST igual a ITERS_NCU (ITERS_LIST='${ITERS_LIST}'); si ninguno" \
+                 "coincide, esta corrida no generara ningun .ncu-rep." >&2
         fi
     done
 done

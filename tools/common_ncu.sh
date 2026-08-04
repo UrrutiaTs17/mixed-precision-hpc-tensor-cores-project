@@ -34,6 +34,40 @@
 #     no shared) pasa a ser el limitante de ocupacion con Kahan activo.
 NCU_QUICK_METRICS="sm__inst_executed_pipe_tensor_op_hmma.sum,sm__inst_executed_pipe_tensor_op_hmma_type_hfma2.sum,sm__ops_path_tensor_src_fp16_dst_fp32.sum,sm__ops_path_tensor_src_bf16_dst_fp32.sum,sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum,dram__bytes_write.sum,l1tex__t_sector_hit_rate.pct,smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct,launch__registers_per_thread,sm__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct,launch__occupancy_limit_registers"
 
+# --------------------------------------------------------------------------
+# Grupos ADICIONALES para discriminar la anomalia de rendimiento del stencil
+# (Fase 3): la compensacion ESPACIAL, que hace 5 lecturas de comp[] por celda,
+# es consistentemente MAS RAPIDA (~1.56x sobre la base) que la Kahan LOCAL, que
+# hace 1 (~1.97x), en nx=4096/8192/16384. Dos hipotesis rivales:
+#
+#   (a) coalescencia: las 5 lecturas son de celdas vecinas contiguas y se
+#       sirven en pocas transacciones, asi que el costo no escala con el
+#       numero de lecturas.
+#   (b) latencia serializada: la ruta local encadena leer comp -> calcular ->
+#       escribir comp, y esa dependencia domina sobre el numero de accesos,
+#       mientras la espacial emite lecturas independientes que se solapan.
+#
+# NO se agregan a NCU_QUICK_METRICS: eso encareceria tambien a GEMM y
+# Convolution, que no tienen esta pregunta. Los .sbatch que las necesiten las
+# concatenan explicitamente (ver run_stencil_tc.sbatch de Fase_3).
+
+# Discrimina (b). Desglose de Warp State Statistics: si la ruta local esta
+# limitada por una cadena de dependencias y no por volumen de trafico, sus
+# ciclos de stall se concentraran en long_scoreboard (espera de dato de
+# memoria global pendiente) y/o wait (dependencia de instruccion de latencia
+# fija), con pocos warps elegibles por scheduler; si la espacial solapa sus 5
+# lecturas independientes, el mismo stall por lectura se reparte entre mas
+# accesos en vuelo y la razon por issue activo baja.
+NCU_WARP_STALL_METRICS="smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio,smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio,smsp__average_warps_issue_stalled_wait_per_issue_active.ratio,smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio,smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio,smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio,smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio,smsp__average_warps_issue_stalled_not_selected_per_issue_active.ratio,smsp__issue_active.avg.pct_of_peak_sustained_active"
+
+# Discrimina (a). Sectores por request (la columna "Sectors/Req" de Memory
+# Workload Analysis) mas los totales crudos de request y sector: si las 5
+# lecturas vecinas se sirven coalescidas, sectors_per_request NO escalara con
+# el numero de lecturas y el total de requests subira ~5x mientras el de
+# sectores sube mucho menos. Si en cambio cada lectura vecina paga su propia
+# transaccion, ambos escalan juntos y la hipotesis (a) queda descartada.
+NCU_COALESCING_METRICS="l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio,l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_st.ratio,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_st.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum"
+
 # Ejecuta el comando dado (tipicamente ncu) con NCU_PROFILING=1 en el entorno.
 # El binario objetivo (lanzado por ncu como target-process, que hereda el
 # entorno) usa esa variable para marcar sus tiempos como no validos y
