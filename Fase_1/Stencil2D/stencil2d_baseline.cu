@@ -209,7 +209,11 @@ Metrics run_gpu_stencil(const std::vector<T>& in, std::vector<T>& out,
     CUDA_CHECK(cudaMalloc(&d_out, bytes));
     CUDA_CHECK(cudaMemcpy(d_in, in.data(), bytes, cudaMemcpyHostToDevice));
 
-    dim3 block(16, 16);
+    // 32 hilos en x: cada fila de hilos cubre una linea de cache de 128 B (FP32)
+    // o 256 B (FP64). Con el (16,16) original una fila pedia solo media linea,
+    // desperdiciando la mitad de cada transaccion en un kernel que esta limitado
+    // por ancho de banda de memoria.
+    dim3 block(32, 8);
     dim3 grid((nx + block.x - 1) / block.x,
               (ny + block.y - 1) / block.y);
 

@@ -49,10 +49,24 @@ constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
 
 // 4×4 warps = 16 warps = 512 hilos; tile de salida 64×64.
-// Con 512 hilos/bloque y ~28.5 KiB shared/bloque el SM aloja 3 bloques
-// simultaneos → 48/48 warps activos → 100 % ocupancia en Ampere (CC 8.6).
 constexpr int kBlockWarpsM = 4;
 constexpr int kBlockWarpsN = 4;
+
+// Bloques residentes por SM que se le piden al compilador (segundo argumento de
+// __launch_bounds__). El valor se fijo originalmente pensando en CC 8.6
+// (48 warps/SM), no en el A100 de PACCA. En sm_80 el techo es 2048 hilos/SM y
+// 64 warps/SM:
+//   3 bloques x 512 hilos = 1536 hilos = 48/64 warps = 75 % de ocupancia,
+//   con presupuesto de 65536/(3*512) = 42 registros por hilo.
+// Subir a 4 daria 100 % pero recorta el presupuesto a 32 registros por hilo y
+// el kernel (3 fragmentos WMMA + indices) desbordaria a memoria local, que
+// cuesta mas que los warps ganados. La memoria compartida no es el limite:
+// 3 x 28.5 KiB = 85.5 KiB de los 164 KiB por SM del A100.
+// Sobrescribible al compilar para barrer el parametro en PACCA:
+//   nvcc -DWMMA_MIN_BLOCKS_PER_SM=2 ...
+#ifndef WMMA_MIN_BLOCKS_PER_SM
+#define WMMA_MIN_BLOCKS_PER_SM 3
+#endif
 constexpr int kBlockTileM  = kBlockWarpsM * kWmmaM;  // 64
 constexpr int kBlockTileN  = kBlockWarpsN * kWmmaN;  // 64
 
@@ -65,6 +79,34 @@ constexpr int kNumStages = 3;
 
 // Padding en shared memory para evitar bank conflicts (16 bytes extra por fila).
 constexpr int kWmmaShmemPad = 8;
+
+// Filas de shared memory, en elementos de 2 bytes (FP16).
+constexpr int kSmemStrideA = kKStep      + kWmmaShmemPad;  // 40 elem = 80 B
+constexpr int kSmemStrideB = kBlockTileN + kWmmaShmemPad;  // 72 elem = 144 B
+
+// Ancho de cada cp.async. Ampere admite 4, 8 o 16 bytes por LDGSTS; la version
+// original usaba 4 (un uint32_t = 2 elementos), lo que emite 4x mas
+// instrucciones de las necesarias para mover el mismo tile. Con 16 bytes
+// (8 elementos de 2 bytes) el bloque copia un tile K completo en una sola
+// pasada de sus 512 hilos.
+constexpr int kVecElems = 16 / 2;                                 // 8
+constexpr int kVecsA    = kBlockTileM * kKStep      / kVecElems;  // 256
+constexpr int kVecsB    = kKStep      * kBlockTileN / kVecElems;  // 256
+
+// cp.async exige que origen y destino esten alineados al tamaño copiado (16 B).
+// Destino: la base de sA/sB lleva __align__(16) y cada fila/etapa debe medir un
+// multiplo de 16 B para que el alineamiento se propague.
+static_assert(kKStep      % kVecElems == 0, "kKStep debe ser multiplo de kVecElems");
+static_assert(kBlockTileN % kVecElems == 0, "kBlockTileN debe ser multiplo de kVecElems");
+static_assert(kSmemStrideA * 2 % 16 == 0, "fila de sA no alineada a 16 B");
+static_assert(kSmemStrideB * 2 % 16 == 0, "fila de sB no alineada a 16 B");
+static_assert(kBlockTileM * kSmemStrideA * 2 % 16 == 0, "etapa de sA no alineada a 16 B");
+static_assert(kKStep      * kSmemStrideB * 2 % 16 == 0, "etapa de sB no alineada a 16 B");
+// Origen: los desplazamientos en global son (fila)*ld + k_off + col. Con col
+// multiplo de kVecElems y k_off multiplo de kKStep, basta que los leading
+// dimensions (Kcol = C*R*S y Ncol = outH*outW) sean multiplos de kVecElems; lo
+// garantiza la validacion de benchmark_gpu_wmma_conv (Kcol % kKStep == 0 y
+// Ncol % kBlockTileN == 0).
 
 // Formatos de datos soportados en la ruta cuDNN con Tensor Cores.
 enum class TensorCoreFormat {
@@ -133,8 +175,8 @@ static void print_usage(const char* prog) {
         << "    2. GPU cuDNN clasico (FP32/FP64, sin Tensor Cores)\n"
         << "    3. GPU cuDNN con Tensor Cores (FP16/BF16 entrada, FP32 acumulacion)\n"
         << "    4. GPU im2col FP16 + kernel WMMA custom (Tensor Cores directos)\n"
-        << "  La ruta WMMA (4) requiere K multiplo de 32, outH*outW multiplo de 32\n"
-        << "  y C*R*S multiplo de 16. Si no se cumple se omite con aviso.\n"
+        << "  La ruta WMMA (4) requiere K multiplo de 64, outH*outW multiplo de 64\n"
+        << "  y C*R*S multiplo de 32. Si no se cumple se omite con aviso.\n"
         << "  Con --double solo se ejecutan las rutas 1 y 2.\n"
         << "  --tc-format selecciona el formato de la ruta 3 (por defecto fp16).\n"
         << "  BF16 requiere GPU Ampere o superior (compute capability >= 8.0).\n\n"
@@ -1003,14 +1045,51 @@ __global__ static void im2col_fp16_kernel(
               : __float2half(0.0f);
 }
 
+// Emite las cp.async de un tile K completo (sA + sB) hacia una etapa del
+// triple buffer. Los kVecsA + kVecsB vectores de 16 bytes se reparten entre
+// TODOS los hilos del bloque en un unico bucle: con la configuracion por
+// defecto son 256 + 256 = 512 vectores para 512 hilos, es decir un LDGSTS.128
+// por hilo. El bucle mantiene la forma grid-stride para seguir siendo correcto
+// si se cambian kBlockTile*/kKStep.
+//
+// Los indices globales se calculan en size_t: con Ncol = 65536 y Kcol grande el
+// producto fila*ld se acerca al rango de int.
+__device__ __forceinline__ void issue_stage_copy(
+        const __half* __restrict__ A,
+        const __half* __restrict__ B,
+        __half* __restrict__ sA_stage,
+        __half* __restrict__ sB_stage,
+        int block_row, int block_col, int k_off, int N, int K) {
+    for (int i = threadIdx.x; i < kVecsA + kVecsB; i += blockDim.x) {
+        if (i < kVecsA) {
+            const int elem = i * kVecElems;
+            const int row  = elem / kKStep;
+            const int col  = elem % kKStep;
+            __pipeline_memcpy_async(
+                &sA_stage[row * kSmemStrideA + col],
+                &A[static_cast<size_t>(block_row + row) * K + k_off + col],
+                sizeof(uint4));
+        } else {
+            const int elem = (i - kVecsA) * kVecElems;
+            const int row  = elem / kBlockTileN;
+            const int col  = elem % kBlockTileN;
+            __pipeline_memcpy_async(
+                &sB_stage[row * kSmemStrideB + col],
+                &B[static_cast<size_t>(k_off + row) * N + block_col + col],
+                sizeof(uint4));
+        }
+    }
+}
+
 // Kernel GEMM con API WMMA + pipeline cp.async de 3 etapas (Ampere sm_80+).
 // C(M,N) = A(M,K) * B(K,N), todos row-major FP16→FP32.
 // En el contexto de convolucion: A = filtros W [K, C*R*S], B = im2col [C*R*S, outH*outW].
 //
 // 4×4 warps = 512 hilos, tile 64×64, triple buffer cp.async.
-// Requisito: M mult. de 64, N mult. de 64, K mult. de 16 (validado en benchmark).
-// Ocupancia esperada en CC 8.6: 3 bloques/SM × 16 warps = 48/48 = 100 %.
-__launch_bounds__(kBlockWarpsM * kBlockWarpsN * 32, 3)
+// Requisito: M mult. de 64, N mult. de 64, K mult. de 32 (validado en benchmark).
+// Ocupancia esperada en sm_80 (A100): WMMA_MIN_BLOCKS_PER_SM bloques/SM × 16
+// warps; con el valor por defecto 3 son 48 de los 64 warps del SM (75 %).
+__launch_bounds__(kBlockWarpsM * kBlockWarpsN * 32, WMMA_MIN_BLOCKS_PER_SM)
 __global__ static void wmma_gemm_kernel(
         const __half* __restrict__ A,
         const __half* __restrict__ B,
@@ -1020,8 +1099,10 @@ __global__ static void wmma_gemm_kernel(
 
     // Triple buffer: sA[etapa][fila][col], sB[etapa][fila][col].
     // sA[3][64][40]: 15 360 bytes; sB[3][32][72]: 13 824 bytes → 28.5 KiB total.
-    __shared__ __half sA[kNumStages][kBlockTileM][kKStep      + kWmmaShmemPad];
-    __shared__ __half sB[kNumStages][kKStep]     [kBlockTileN + kWmmaShmemPad];
+    // __align__(16) es obligatorio para el destino de las cp.async de 16 bytes:
+    // nvcc solo garantizaria el alineamiento natural del tipo (2 bytes).
+    __shared__ __align__(16) __half sA[kNumStages][kBlockTileM][kSmemStrideA];
+    __shared__ __align__(16) __half sB[kNumStages][kKStep]     [kSmemStrideB];
 
     const int warp_id       = threadIdx.x / 32;
     const int warp_row      = warp_id / kBlockWarpsN;
@@ -1038,31 +1119,10 @@ __global__ static void wmma_gemm_kernel(
 
     const int num_tiles = K / kKStep;
 
-    // Pares uint32_t (2 fp16 = 4 bytes): minimo requerido por cp.async en Ampere.
-    const int n_pairs_A = kBlockTileM * kKStep / 2;   // 64*32/2 = 1024
-    const int n_pairs_B = kKStep      * kBlockTileN / 2; // 32*64/2 = 1024
-
     // -- Precarga de las primeras kNumStages etapas --
     for (int s = 0; s < kNumStages && s < num_tiles; ++s) {
-        const int k_off = s * kKStep;
-        for (int i = threadIdx.x; i < n_pairs_A; i += blockDim.x) {
-            const int elem = i * 2;
-            const int row  = elem / kKStep;
-            const int col  = elem % kKStep;
-            __pipeline_memcpy_async(
-                reinterpret_cast<uint32_t*>(&sA[s][row][col]),
-                reinterpret_cast<const uint32_t*>(&A[(block_row + row) * K + k_off + col]),
-                sizeof(uint32_t));
-        }
-        for (int i = threadIdx.x; i < n_pairs_B; i += blockDim.x) {
-            const int elem = i * 2;
-            const int row  = elem / kBlockTileN;
-            const int col  = elem % kBlockTileN;
-            __pipeline_memcpy_async(
-                reinterpret_cast<uint32_t*>(&sB[s][row][col]),
-                reinterpret_cast<const uint32_t*>(&B[(k_off + row) * N + block_col + col]),
-                sizeof(uint32_t));
-        }
+        issue_stage_copy(A, B, &sA[s][0][0], &sB[s][0][0],
+                         block_row, block_col, s * kKStep, N, K);
         __pipeline_commit();
     }
 
@@ -1078,10 +1138,10 @@ __global__ static void wmma_gemm_kernel(
         for (int k_inner = 0; k_inner < kKStep; k_inner += kWmmaK) {
             wmma::load_matrix_sync(a_frag,
                 reinterpret_cast<const __half*>(&sA[stage_c][warp_row * kWmmaM][k_inner]),
-                kKStep + kWmmaShmemPad);
+                kSmemStrideA);
             wmma::load_matrix_sync(b_frag,
                 reinterpret_cast<const __half*>(&sB[stage_c][k_inner][warp_col * kWmmaN]),
-                kBlockTileN + kWmmaShmemPad);
+                kSmemStrideB);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
 
@@ -1092,25 +1152,8 @@ __global__ static void wmma_gemm_kernel(
         // Lanzar carga futura en stage_c (ahora libre).
         const int future = tile + kNumStages;
         if (future < num_tiles) {
-            const int k_off = future * kKStep;
-            for (int i = threadIdx.x; i < n_pairs_A; i += blockDim.x) {
-                const int elem = i * 2;
-                const int row  = elem / kKStep;
-                const int col  = elem % kKStep;
-                __pipeline_memcpy_async(
-                    reinterpret_cast<uint32_t*>(&sA[stage_c][row][col]),
-                    reinterpret_cast<const uint32_t*>(&A[(block_row + row) * K + k_off + col]),
-                    sizeof(uint32_t));
-            }
-            for (int i = threadIdx.x; i < n_pairs_B; i += blockDim.x) {
-                const int elem = i * 2;
-                const int row  = elem / kBlockTileN;
-                const int col  = elem % kBlockTileN;
-                __pipeline_memcpy_async(
-                    reinterpret_cast<uint32_t*>(&sB[stage_c][row][col]),
-                    reinterpret_cast<const uint32_t*>(&B[(k_off + row) * N + block_col + col]),
-                    sizeof(uint32_t));
-            }
+            issue_stage_copy(A, B, &sA[stage_c][0][0], &sB[stage_c][0][0],
+                             block_row, block_col, future * kKStep, N, K);
             __pipeline_commit();
         }
     }
@@ -1180,7 +1223,7 @@ static Metrics benchmark_gpu_wmma_conv(const std::vector<float>& x,
     const int col_elems = Kcol * Ncol;
     const int col_blocks = (col_elems + kConversionThreads - 1) / kConversionThreads;
 
-    // 512 hilos/bloque (16 warps): permite 3 bloques/SM → 100 % ocupancia.
+    // 512 hilos/bloque (16 warps); ver WMMA_MIN_BLOCKS_PER_SM para la ocupancia.
     const dim3 gemm_block(static_cast<unsigned int>(kBlockWarpsM * kBlockWarpsN * 32));
     const dim3 gemm_grid(
         static_cast<unsigned int>((M    + kBlockTileM - 1) / kBlockTileM),
