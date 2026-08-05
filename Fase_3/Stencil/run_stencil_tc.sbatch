@@ -156,6 +156,14 @@ if [[ "${SPATIAL_COMP}" == "on" ]]; then
     KAHAN_LIST="off"
 fi
 
+# "on" agrega GPU_FP32_SP a cada corrida de medicion y mantiene GPU_FP32.
+# Default off preserva el conjunto y el orden de rutas de los jobs validados.
+FP32_SPATIAL="${FP32_SPATIAL:-off}"
+if [[ "${FP32_SPATIAL}" != "off" && "${FP32_SPATIAL}" != "on" ]]; then
+    echo "ERROR: FP32_SPATIAL debe ser off|on (recibido: ${FP32_SPATIAL})." >&2
+    exit 1
+fi
+
 NX="${NX:-16384}"
 NY="${NY:-16384}"
 
@@ -231,7 +239,7 @@ echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "NVCC_FLAGS=${NVCC_FLAGS}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP}"
+echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP32_SPATIAL=${FP32_SPATIAL}"
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no
@@ -351,11 +359,11 @@ for run in "${RUNS[@]}"; do
     for KAHAN in ${KAHAN_LIST}; do
         echo
         echo "============================================================"
-        echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+        echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}, FP32_SPATIAL=${FP32_SPATIAL}"
         echo "============================================================"
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
             --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
-            --spatial-comp "${SPATIAL_COMP}"
+            --spatial-comp "${SPATIAL_COMP}" --fp32-spatial "${FP32_SPATIAL}"
 
         if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego

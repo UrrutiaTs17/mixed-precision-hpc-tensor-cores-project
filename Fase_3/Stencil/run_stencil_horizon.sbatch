@@ -143,6 +143,14 @@ if [[ "${SPATIAL_COMP}" == "on" ]]; then
     KAHAN_LIST="off"
 fi
 
+# Control metodologico aditivo: "on" agrega GPU_FP32_SP sin reemplazar la
+# ruta GPU_FP32 clasica. Default off conserva el conjunto de rutas previo.
+FP32_SPATIAL="${FP32_SPATIAL:-off}"
+if [[ "${FP32_SPATIAL}" != "off" && "${FP32_SPATIAL}" != "on" ]]; then
+    echo "ERROR: FP32_SPATIAL debe ser off|on (recibido: ${FP32_SPATIAL})." >&2
+    exit 1
+fi
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -166,11 +174,11 @@ TIMEFORMAT=">>> Tiempo real de la corrida: %R s (user %U, sys %S)"
 for KAHAN in ${KAHAN_LIST}; do
     echo
     echo "============================================================"
-    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}, FP32_SPATIAL=${FP32_SPATIAL}"
     echo "============================================================"
     time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
           --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
-          --spatial-comp "${SPATIAL_COMP}"
+          --spatial-comp "${SPATIAL_COMP}" --fp32-spatial "${FP32_SPATIAL}"
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 

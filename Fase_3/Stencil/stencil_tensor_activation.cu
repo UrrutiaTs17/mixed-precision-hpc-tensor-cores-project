@@ -132,6 +132,17 @@ struct Options {
     // (son dos politicas alternativas de la misma compensacion, no dos capas
     // acumulables): parse_args lo rechaza.
     bool spatial_comp = false;
+    // false (por defecto, "off") = comportamiento identico al previo. true
+    // ("on"): AGREGA una ruta GPU_FP32_SP (FP32 con compensacion espacial, ver
+    // stencil2d_fp32_spatial_kernel) SIN quitar ni alterar GPU_FP32 clasico:
+    // ambas corren en la misma invocacion. Es el control metodologico que
+    // separa las dos variables que --spatial-comp mezcla (formato 32->16 bits
+    // Y algoritmo ingenuo->compensado): comparar WMMA_*_SP contra GPU_FP32
+    // compara a la vez formato y algoritmo; contra GPU_FP32_SP compara solo el
+    // formato, con el algoritmo fijo. Independiente de --kahan/--spatial-comp
+    // (esos dos solo gobiernan las rutas WMMA), asi que se puede combinar con
+    // cualquiera de ellos.
+    bool fp32_spatial = false;
 };
 
 // Politica efectiva derivada de los dos flags. parse_args ya garantizo que no
@@ -219,7 +230,7 @@ static void print_usage(const char* prog) {
         << "Uso:\n"
         << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
            " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]"
-           " [--spatial-comp off|on]\n\n"
+           " [--spatial-comp off|on] [--fp32-spatial off|on]\n\n"
         << "Descripcion:\n"
         << "  Compara CPU FP32, GPU CUDA FP32 y GPU WMMA Tensor Core para stencil 2D.\n"
         << "  La ruta Tensor Core usa operandos FP16/BF16 y acumulacion/salida FP32.\n\n"
@@ -249,13 +260,23 @@ static void print_usage(const char* prog) {
         << "  kernel limitado por memoria eso NO es gratis, ver t/iter reportado. Las\n"
         << "  rutas WMMA se reportan como WMMA_FP16_SP / WMMA_BF16_SP para que sus\n"
         << "  filas CSV no se confundan con las de --kahan off|on.\n\n"
+        << "  --fp32-spatial off|on (por defecto off) AGREGA la ruta GPU_FP32_SP: FP32\n"
+        << "  con la misma compensacion espacial (residuo FP32 por celda en ping-pong,\n"
+        << "  reconstruccion de las 5 vecinas antes de sumar; estado de 8 bytes/celda).\n"
+        << "  NO reemplaza a GPU_FP32\n"
+        << "  clasico: ambas corren en la misma invocacion. GPU_FP32 vs GPU_FP32_SP aisla\n"
+        << "  cuanto aporta la COMPENSACION sola (formato fijo en 32 bits); WMMA_*_SP vs\n"
+        << "  GPU_FP32_SP aisla el efecto del FORMATO (algoritmo fijo). Independiente de\n"
+        << "  --kahan/--spatial-comp, que solo gobiernan las rutas WMMA.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --checkpoint-every 5\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n"
-        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --spatial-comp on\n";
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --spatial-comp on\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 100 --tc both --checkpoint-every 5"
+           " --spatial-comp on --fp32-spatial on\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -320,6 +341,12 @@ static Options parse_args(int argc, char** argv) {
                 std::exit(EXIT_FAILURE);
             }
             opt.spatial_comp = parse_on_off_flag("--spatial-comp", argv[++i]);
+        } else if (std::strcmp(argv[i], "--fp32-spatial") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --fp32-spatial\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.fp32_spatial = parse_on_off_flag("--fp32-spatial", argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -683,6 +710,127 @@ __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx
     if (in_range) out[idx2d(x, y, nx)] = val;
 }
 
+// Transformacion libre de error TwoSum en FP32: a+b = sum+error. Los
+// intrinsecos *_rn fijan el redondeo en cada operacion y evitan que el
+// compilador contraiga o reasocie el calculo que recupera el residuo.
+// Se usa exclusivamente en GPU_FP32_SP; el kernel GPU_FP32 clasico de arriba
+// permanece intacto.
+__device__ inline void fp32_two_sum(float a, float b, float& sum, float& error) {
+    sum = __fadd_rn(a, b);
+    const float b_virtual = __fsub_rn(sum, a);
+    const float a_virtual = __fsub_rn(sum, b_virtual);
+    const float b_roundoff = __fsub_rn(b, b_virtual);
+    const float a_roundoff = __fsub_rn(a, a_virtual);
+    error = __fadd_rn(a_roundoff, b_roundoff);
+}
+
+// Acumula un termino pequeno en una expansion FP32 de dos componentes. El
+// termino de primer orden queda en hi y el error de esa acumulacion se retiene
+// en lo; no introduce aritmetica FP64 en la linea base compensada.
+__device__ inline void fp32_accumulate_correction(float term, float& hi, float& lo) {
+    float next_hi = 0.0f;
+    float roundoff = 0.0f;
+    fp32_two_sum(hi, term, next_hi, roundoff);
+    hi = next_hi;
+    lo = __fadd_rn(lo, roundoff);
+}
+
+// Ruta aditiva FP32 con compensacion espacial. El estado propagado es el par
+// (out, comp) de dos FP32. Cada entrada se reconstruye con su residuo antes de
+// evaluar el mismo Laplaciano de 5 puntos; TwoSum retiene tambien cualquier
+// redondeo de esa reconstruccion. Al escribir, el par se renormaliza y
+// comp[idx] conserva con la convencion Spatial el termino PERDIDO:
+//
+//     valor representado = out[idx] + comp[idx]
+//
+// A diferencia de WMMA_*_SP, aqui no existe conversion FP32 -> 16 bits: el
+// residuo nuevo contiene solo error de redondeo de las operaciones FP32.
+__global__ static void stencil2d_fp32_spatial_kernel(const float* __restrict__ in,
+                                                     float* __restrict__ out,
+                                                     const float* __restrict__ comp_prev,
+                                                     float* __restrict__ comp,
+                                                     int nx,
+                                                     int ny,
+                                                     int iter,
+                                                     int* __restrict__ first_nf) {
+    __shared__ int blk_bad;
+    if (threadIdx.x == 0 && threadIdx.y == 0) blk_bad = 0;
+    __syncthreads();
+
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool in_range = (x < nx && y < ny);
+    const bool active = in_range && !(x == 0 || y == 0 || x == nx - 1 || y == ny - 1);
+
+    if (active) {
+        const int i_up = idx2d(x, y - 1, nx);
+        const int i_down = idx2d(x, y + 1, nx);
+        const int i_left = idx2d(x - 1, y, nx);
+        const int i_right = idx2d(x + 1, y, nx);
+        const int idx = idx2d(x, y, nx);
+
+        // Reconstruccion pedida: in[i] + comp_prev[i] antes de la suma. El
+        // segundo resultado de TwoSum evita perder otra vez el bit que se
+        // intenta reincorporar cuando el residuo es menor que 0.5 ulp FP32.
+        float up = 0.0f, down = 0.0f, left = 0.0f, right = 0.0f, center = 0.0f;
+        float e_up = 0.0f, e_down = 0.0f, e_left = 0.0f, e_right = 0.0f, e_center = 0.0f;
+        fp32_two_sum(in[i_up], comp_prev[i_up], up, e_up);
+        fp32_two_sum(in[i_down], comp_prev[i_down], down, e_down);
+        fp32_two_sum(in[i_left], comp_prev[i_left], left, e_left);
+        fp32_two_sum(in[i_right], comp_prev[i_right], right, e_right);
+        fp32_two_sum(in[idx], comp_prev[idx], center, e_center);
+
+        // Misma formula y mismo orden de suma que GPU_FP32. TwoSum expone el
+        // error de cada suma; 0.25 es potencia de dos y su residuo (relevante
+        // solo ante subnormales) se obtiene con una FMA FP32.
+        float sum_ud = 0.0f, e_ud = 0.0f;
+        float sum_udl = 0.0f, e_udl = 0.0f;
+        float sum_neighbors = 0.0f, e_neighbors = 0.0f;
+        fp32_two_sum(up, down, sum_ud, e_ud);
+        fp32_two_sum(sum_ud, left, sum_udl, e_udl);
+        fp32_two_sum(sum_udl, right, sum_neighbors, e_neighbors);
+        const float quarter_neighbors = __fmul_rn(0.25f, sum_neighbors);
+        const float e_scale = __fmaf_rn(0.25f, sum_neighbors, -quarter_neighbors);
+        float raw_value = 0.0f, e_sub = 0.0f;
+        fp32_two_sum(quarter_neighbors, -center, raw_value, e_sub);
+
+        float corr_hi = 0.0f;
+        float corr_lo = 0.0f;
+        fp32_accumulate_correction(__fmul_rn(0.25f, e_up), corr_hi, corr_lo);
+        fp32_accumulate_correction(__fmul_rn(0.25f, e_down), corr_hi, corr_lo);
+        fp32_accumulate_correction(__fmul_rn(0.25f, e_left), corr_hi, corr_lo);
+        fp32_accumulate_correction(__fmul_rn(0.25f, e_right), corr_hi, corr_lo);
+        fp32_accumulate_correction(-e_center, corr_hi, corr_lo);
+        fp32_accumulate_correction(__fmul_rn(0.25f, e_ud), corr_hi, corr_lo);
+        fp32_accumulate_correction(__fmul_rn(0.25f, e_udl), corr_hi, corr_lo);
+        fp32_accumulate_correction(__fmul_rn(0.25f, e_neighbors), corr_hi, corr_lo);
+        fp32_accumulate_correction(e_scale, corr_hi, corr_lo);
+        fp32_accumulate_correction(e_sub, corr_hi, corr_lo);
+
+        float correction = 0.0f;
+        float correction_roundoff = 0.0f;
+        fp32_two_sum(corr_hi, corr_lo, correction, correction_roundoff);
+        float value = 0.0f;
+        float residue = 0.0f;
+        fp32_two_sum(raw_value, correction, value, residue);
+        residue = __fadd_rn(residue, correction_roundoff);
+        out[idx] = value;
+        comp[idx] = residue;
+        if (!isfinite(value)) blk_bad = 1;  // carrera benigna: todos escriben 1
+    } else if (in_range) {
+        // El borde no se recalcula: ambos componentes se preservan en el
+        // mismo ping-pong que el interior.
+        const int idx = idx2d(x, y, nx);
+        out[idx] = in[idx];
+        comp[idx] = comp_prev[idx];
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        reduce_and_mark_first_nonfinite(first_nf, iter, blk_bad);
+    }
+}
+
 // Contexto compartido de checkpoints para las tres rutas de baja precision:
 // snapshots FP64 por checkpoint (iteraciones {K, 2K, ...}, ver
 // compute_cpu_stencil_fp64) y el intervalo K que los genero.
@@ -943,6 +1091,159 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
 
     CHECK_CUDA(cudaFree(d_a));
     CHECK_CUDA(cudaFree(d_b));
+    CHECK_CUDA(cudaFree(d_first_nf));
+    return build_metrics(nx, ny, total_ms / iters);
+}
+
+// Benchmark aditivo para GPU_FP32_SP. Replica el ciclo de vida validado de la
+// ruta GPU_FP32 (warm-up descartable, cronometro/energia por tramos y bloques
+// de checkpoint fuera de la medicion), agregando unicamente el ping-pong de
+// residuos que necesita stencil2d_fp32_spatial_kernel. La funcion y el kernel
+// de GPU_FP32 clasico no se modifican ni se parametrizan.
+static Metrics benchmark_gpu_fp32_spatial_stencil(const std::vector<float>& in,
+                                                  std::vector<float>& out,
+                                                  int nx,
+                                                  int ny,
+                                                  int iters,
+                                                  const CheckpointContext& ckpt,
+                                                  const char* route_label,
+                                                  int& onset_iter,
+                                                  int& first_nonfinite_iter,
+                                                  double& t_checkpoint_ms_out,
+                                                  EnergyMeasurement& out_energy) {
+    const size_t count = in.size();
+    float* d_a = nullptr;
+    float* d_b = nullptr;
+    float* d_comp_a = nullptr;
+    float* d_comp_b = nullptr;
+    int* d_first_nf = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_a, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_b, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_comp_a, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_comp_b, count * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
+    CHECK_CUDA(cudaMemcpy(d_a, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(d_comp_a, 0, count * sizeof(float)));
+    CHECK_CUDA(cudaMemset(d_comp_b, 0, count * sizeof(float)));
+    {
+        const int init_val = INT_MAX;
+        CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    PowerBuffer* power_buffer = power_buffer_create(0);
+    const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
+    power_buffer_start_sampling(power_buffer);
+
+    dim3 block(16, 16);
+    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+
+    float* warm_in = d_a;
+    float* warm_out = d_b;
+    float* warm_comp_in = d_comp_a;
+    float* warm_comp_out = d_comp_b;
+    for (int i = 0; i < kWarmupIters; ++i) {
+        stencil2d_fp32_spatial_kernel<<<grid, block>>>(
+            warm_in, warm_out, warm_comp_in, warm_comp_out, nx, ny, i + 1, d_first_nf);
+        std::swap(warm_in, warm_out);
+        std::swap(warm_comp_in, warm_comp_out);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // El warm-up es descartable: se restauran los DOS componentes de ambos
+    // lados del ping-pong antes de la region medida.
+    CHECK_CUDA(cudaMemcpy(d_a, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(d_comp_a, 0, count * sizeof(float)));
+    CHECK_CUDA(cudaMemset(d_comp_b, 0, count * sizeof(float)));
+    {
+        const int init_val = INT_MAX;
+        CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
+    }
+    power_buffer_stop_sampling(power_buffer);
+    power_buffer_samples_clear(power_buffer);
+    const RAEnergySnapshot rapl_before = rapl_snapshot_now();
+    (void)rapl_warmup_before;
+
+    std::vector<float> checkpoint_host_buf;
+    if (ckpt.checkpoint_every > 0) {
+        checkpoint_host_buf.resize(count);
+    }
+
+    float* d_in = d_a;
+    float* d_out = d_b;
+    float* comp_in = d_comp_a;
+    float* comp_out = d_comp_b;
+    CudaEventTimer timer;
+    double total_ms = 0.0;
+    double checkpoint_ms_total = 0.0;
+    double gpu_energy_j = 0.0;
+    double gpu_window_s = 0.0;
+    bool gpu_energy_valid = true;
+    double checkpoint_cpu_energy_j = 0.0;
+    auto close_energy_segment = [&]() {
+        power_buffer_stop_sampling(power_buffer);
+        gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
+        gpu_energy_j += power_buffer_energy_joules(power_buffer);
+        gpu_window_s += power_buffer_window_seconds(power_buffer);
+        power_buffer_samples_clear(power_buffer);
+    };
+
+    emit_csv_region_marker(route_label, "begin");
+    power_buffer_samples_clear(power_buffer);
+    power_buffer_start_sampling(power_buffer);
+    timer.start();
+    for (int i = 0; i < iters; ++i) {
+        stencil2d_fp32_spatial_kernel<<<grid, block>>>(
+            d_in, d_out, comp_in, comp_out, nx, ny, i + 1, d_first_nf);
+        std::swap(d_in, d_out);
+        std::swap(comp_in, comp_out);
+
+        if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
+            total_ms += timer.stop_and_elapsed_ms();
+            close_energy_segment();
+            const RAEnergySnapshot rapl_ckpt_before = rapl_snapshot_now();
+
+            const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_in,
+                                  count * sizeof(float), cudaMemcpyDeviceToHost));
+            record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
+            const auto ckpt_t1 = std::chrono::high_resolution_clock::now();
+            checkpoint_ms_total +=
+                std::chrono::duration<double, std::milli>(ckpt_t1 - ckpt_t0).count();
+
+            const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
+            checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
+            power_buffer_start_sampling(power_buffer);
+            timer.start();
+        }
+    }
+    total_ms += timer.stop_and_elapsed_ms();
+    close_energy_segment();
+    const RAEnergySnapshot rapl_after = rapl_snapshot_now();
+    emit_csv_region_marker(route_label, "end");
+
+    const double energy_wall_s = gpu_window_s;
+    const double flops_total = stencil_flops(nx, ny) * static_cast<double>(iters);
+    const bool cpu_energy_valid = rapl_before.valid && rapl_after.valid &&
+                                  rapl_after.energy_j >= rapl_before.energy_j;
+    const double cpu_energy_j = std::max(
+        0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
+    out_energy = make_energy_measurement_from_segments(
+        gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
+        energy_wall_s, flops_total);
+    power_buffer_destroy(power_buffer);
+    t_checkpoint_ms_out = checkpoint_ms_total / iters;
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaMemcpy(out.data(), d_in, count * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA(cudaFree(d_a));
+    CHECK_CUDA(cudaFree(d_b));
+    CHECK_CUDA(cudaFree(d_comp_a));
+    CHECK_CUDA(cudaFree(d_comp_b));
     CHECK_CUDA(cudaFree(d_first_nf));
     return build_metrics(nx, ny, total_ms / iters);
 }
@@ -1349,6 +1650,7 @@ void convert_input_to_tc<__nv_bfloat16>(const float* d_in_fp32,
 // por lo que son validas aqui sin necesidad de un kernel adicional.
 static inline float host_val_to_float(__half v) { return __half2float(v); }
 static inline float host_val_to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
+static inline float host_val_to_float(float v) { return v; }
 
 // Convierte el buffer T (formato de 16 bits) a un vector float elemento a
 // elemento, para poder compararlo contra la referencia FP64 con
@@ -1367,6 +1669,7 @@ static std::vector<float> reduced_to_float(const std::vector<T>& reduced) {
 
 static inline __half host_float_to_tc_impl(float v, __half*) { return __float2half(v); }
 static inline __nv_bfloat16 host_float_to_tc_impl(float v, __nv_bfloat16*) { return __float2bfloat16(v); }
+static inline float host_float_to_tc_impl(float v, float*) { return v; }
 
 template <typename T>
 static T host_float_to_tc(float v) {
@@ -1952,6 +2255,7 @@ static void print_first_nonfinite(const char* label, int first_nf, int iters) {
 
 constexpr double kFp16StorageUlp = 4.8828125e-4;  // 2^-11
 constexpr double kBf16StorageUlp = 3.90625e-3;    // 2^-8
+constexpr double kFp32StorageUlp = 5.9604644775390625e-8;  // 2^-24
 
 static void append_storage_eval_annotation(const StorageRelResult& storage, int iters) {
     if (storage.eval_iter > 0 && storage.eval_iter < iters) {
@@ -2521,6 +2825,9 @@ static void print_configuration(const Options& opt) {
     if (opt.spatial_comp) {
         std::cout << "  (rutas WMMA reportadas como WMMA_FP16_SP / WMMA_BF16_SP)\n";
     }
+    if (opt.fp32_spatial) {
+        std::cout << "FP32 compensado espacial   : on (ruta adicional GPU_FP32_SP)\n";
+    }
     std::cout << "===================================================\n\n";
 }
 
@@ -2669,6 +2976,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     std::vector<float> input(count);
     std::vector<float> y_cpu(count, 0.0f);
     std::vector<float> y_gpu(count, 0.0f);
+    std::vector<float> y_gpu_fp32_sp;
     std::vector<float> y_tc_fp16(count, 0.0f);
     std::vector<float> y_tc_bf16(count, 0.0f);
     std::vector<__half> y_tc_fp16_reduced;
@@ -2732,6 +3040,27 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                                                     ckpt, "GPU_FP32", onset_gpu_fp32,
                                                     first_nf_gpu_fp32, t_checkpoint_ms_gpu_fp32,
                                                     e_gpu_fp32);
+    Metrics gpu_fp32_sp;
+    ErrorMetrics gpu_fp32_sp_err;
+    ErrorMetrics gpu_fp32_sp_vs_cpu_err;
+    StorageRelResult gpu_fp32_sp_storage;
+    int onset_gpu_fp32_sp = -1;
+    int first_nf_gpu_fp32_sp = INT_MAX;
+    double t_checkpoint_ms_gpu_fp32_sp = 0.0;
+    EnergyMeasurement e_gpu_fp32_sp;
+    if (opt.fp32_spatial) {
+        y_gpu_fp32_sp.resize(count);
+        gpu_fp32_sp = benchmark_gpu_fp32_spatial_stencil(
+            input, y_gpu_fp32_sp, opt.nx, opt.ny, opt.iters, ckpt, "GPU_FP32_SP",
+            onset_gpu_fp32_sp, first_nf_gpu_fp32_sp, t_checkpoint_ms_gpu_fp32_sp,
+            e_gpu_fp32_sp);
+        gpu_fp32_sp_err = compare_fp64_ref_vs_fp32(y_ref, y_gpu_fp32_sp);
+        gpu_fp32_sp_vs_cpu_err = compare_float_vectors(y_cpu, y_gpu_fp32_sp);
+        // Q_FP32(u)-u es exactamente cero: esta fila CSV_STORE explicita que
+        // la ruta no introduce truncacion de formato. Si la salida final ya
+        // no es finita, las guardas existentes la reportan como no evaluable.
+        gpu_fp32_sp_storage = storage_roundtrip_metrics<float>(y_gpu_fp32_sp, opt.iters);
+    }
     // Metrica primaria: contra el ground truth FP64 (objetivo especifico #3);
     // secundaria: contra la CPU FP32 (trazabilidad con corridas previas).
     const ErrorMetrics cpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
@@ -2783,6 +3112,51 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                      energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.energy_j),
                      energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.avg_power_w),
                      energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.edp));
+    }
+
+    if (opt.fp32_spatial) {
+        const bool fp32_sp_storage_evaluable = gpu_fp32_sp_storage.evaluated;
+        print_reference_comparison("GPU CUDA FP32 compensado espacial", gpu_fp32_sp, cpu.ms,
+                                   gpu_fp32_sp_err, gpu_fp32_sp_vs_cpu_err,
+                                   first_nf_gpu_fp32_sp, opt.iters,
+                                   t_checkpoint_ms_gpu_fp32_sp);
+        print_storage_metrics("FP32", gpu_fp32_sp_storage, fp32_sp_storage_evaluable,
+                              opt.iters, 2.0 * kFp32StorageUlp);
+        emit_csv_summary_row(
+            "GPU_FP32_SP", opt.nx, opt.ny, opt.iters, opt.kahan,
+            gpu_fp32_sp.ms, gpu_fp32_sp.gflops, fmt_csv_num(cpu.ms / gpu_fp32_sp.ms),
+            fmt_csv_num(gpu.ms / gpu_fp32_sp.ms), "NaN", "NaN",
+            fmt_csv_num(t_checkpoint_ms_gpu_fp32_sp), gpu_fp32_sp_err,
+            first_nf_gpu_fp32_sp, "NaN", "NaN",
+            storage_num_field(gpu_fp32_sp_storage, fp32_sp_storage_evaluable,
+                              gpu_fp32_sp_storage.rel_norm),
+            storage_num_field(gpu_fp32_sp_storage, fp32_sp_storage_evaluable,
+                              gpu_fp32_sp_storage.rel_max_guarded),
+            storage_count_field(gpu_fp32_sp_storage, fp32_sp_storage_evaluable),
+            storage_eval_iter_field(gpu_fp32_sp_storage, fp32_sp_storage_evaluable),
+            e_gpu_fp32_sp);
+        emit_csv_store_row("GPU_FP32_SP", opt.nx, opt.ny, opt.iters, opt.kahan,
+                           gpu_fp32_sp_storage, fp32_sp_storage_evaluable,
+                           kFp32StorageUlp);
+        print_energy_metrics(e_gpu_fp32_sp);
+        emit_csv_energy_row(
+            "GPU_FP32_SP", opt.nx, opt.ny, opt.iters, opt.kahan, e_gpu_fp32_sp,
+            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+        if (csv_enabled) {
+            write_csv_row(
+                csv, "gpu_fp32_sp", opt.kahan, opt.nx, opt.ny, opt.iters,
+                gpu_fp32_sp.ms, gpu_fp32_sp.gflops, gpu_fp32_sp_err,
+                first_nf_gpu_fp32_sp,
+                storage_num_field(gpu_fp32_sp_storage, fp32_sp_storage_evaluable,
+                                  gpu_fp32_sp_storage.rel_max_guarded),
+                "NA", "NA", fmt_sci(t_checkpoint_ms_gpu_fp32_sp), "NA", "NA",
+                energy_field(!under_ncu && e_gpu_fp32_sp.gpu_valid,
+                             e_gpu_fp32_sp.energy_j),
+                energy_field(!under_ncu && e_gpu_fp32_sp.gpu_valid,
+                             e_gpu_fp32_sp.avg_power_w),
+                energy_field(!under_ncu && e_gpu_fp32_sp.gpu_valid,
+                             e_gpu_fp32_sp.edp));
+        }
     }
 
     bool ran_fp16 = false;
@@ -2991,6 +3365,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     if (opt.checkpoint_every > 0) {
         std::cout << "=========== RESUMEN ONSET DE DIVERGENCIA ===========\n";
         std::cout << "CSV_ONSET,GPU_FP32," << onset_gpu_fp32 << "\n";
+        if (opt.fp32_spatial) {
+            std::cout << "CSV_ONSET,GPU_FP32_SP," << onset_gpu_fp32_sp << "\n";
+        }
         if (ran_fp16) {
             std::cout << "CSV_ONSET," << route_fp16 << "," << onset_fp16 << "\n";
         }
