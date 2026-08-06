@@ -260,13 +260,21 @@ double run_cpu_conv_openblas_float(const ConvConfig& cfg, const ConvOutputDims& 
     for (int it = 0; it < cfg.iters; ++it) {
         for (int n = 0; n < cfg.N; ++n) {
             im2col_float_single_image(&x[static_cast<size_t>(n) * cfg.C * cfg.H * cfg.W], col.data(), cfg, d);
-            cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+            // El filtro NCHW [K,C,R,S] es row-major [M, Kcol] e im2col escribe
+            // col-major [Kcol, Ncol] (= row-major [Ncol, Kcol], de ahi
+            // CblasTrans). La llamada anterior declaraba ColMajor con lda=M para
+            // ambos: BLAS releia el filtro con stride M en vez de Kcol y escribia
+            // la salida con el canal como indice rapido (NHWC), de modo que
+            // y_cpu no era comparable elemento a elemento con la salida NCHW de
+            // cuDNN -> error L2 relativo ~sqrt(2) (vectores independientes).
+            // Mismo layout que Fase_2/Convolution/conv_tensor_activation.cu.
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         M, Ncol, Kcol,
                         alpha,
-                        w.data(), M,
+                        w.data(), Kcol,
                         col.data(), Kcol,
                         beta,
-                        &y[static_cast<size_t>(n) * cfg.K * d.outH * d.outW], M);
+                        &y[static_cast<size_t>(n) * cfg.K * d.outH * d.outW], Ncol);
         }
     }
     auto end = std::chrono::high_resolution_clock::now();
@@ -288,17 +296,59 @@ double run_cpu_conv_openblas_double(const ConvConfig& cfg, const ConvOutputDims&
     for (int it = 0; it < cfg.iters; ++it) {
         for (int n = 0; n < cfg.N; ++n) {
             im2col_double_single_image(&x[static_cast<size_t>(n) * cfg.C * cfg.H * cfg.W], col.data(), cfg, d);
-            cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+            // Mismo layout que la version float: salida NCHW row-major.
+            cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         M, Ncol, Kcol,
                         alpha,
-                        w.data(), M,
+                        w.data(), Kcol,
                         col.data(), Kcol,
                         beta,
-                        &y[static_cast<size_t>(n) * cfg.K * d.outH * d.outW], M);
+                        &y[static_cast<size_t>(n) * cfg.K * d.outH * d.outW], Ncol);
         }
     }
     auto end = std::chrono::high_resolution_clock::now();
     return std::chrono::duration<double, std::milli>(end - start).count() / cfg.iters;
+}
+
+// Deja que cuDNN elija el algoritmo de convolucion directa en vez de forzar
+// CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, que era el unico que no pide
+// workspace y tambien el mas lento en estas formas: fijarlo hacia que Fase 1
+// midiera ~9.8x mas que Fase 2 (153.96 ms vs 15.63 ms con C=K=1024) sobre la
+// misma convolucion y el mismo dispositivo. Se descartan los candidatos cuyo
+// workspace no cabe en la memoria libre; hay que llamarla despues de reservar
+// los tensores para que free_bytes ya los descuente.
+// Misma seleccion que Fase_2/Convolution/conv_tensor_activation.cu.
+cudnnConvolutionFwdAlgo_t select_forward_algo(cudnnHandle_t handle,
+                                              cudnnTensorDescriptor_t xDesc,
+                                              cudnnFilterDescriptor_t wDesc,
+                                              cudnnConvolutionDescriptor_t convDesc,
+                                              cudnnTensorDescriptor_t yDesc,
+                                              size_t& workspaceBytes) {
+    constexpr int kMaxAlgos = 8;
+    cudnnConvolutionFwdAlgoPerf_t perf[kMaxAlgos];
+    int algo_count = 0;
+    CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm_v7(
+        handle, xDesc, wDesc, convDesc, yDesc, kMaxAlgos, &algo_count, perf));
+
+    size_t free_bytes = 0, total_bytes = 0;
+    CHECK_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t ws_limit = free_bytes / 4 * 3;
+
+    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+    for (int i = 0; i < algo_count; ++i) {
+        if (perf[i].status == CUDNN_STATUS_SUCCESS && perf[i].memory <= ws_limit) {
+            algo = perf[i].algo;
+            break;
+        }
+    }
+
+    workspaceBytes = 0;
+    CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc,
+                                                        algo, &workspaceBytes));
+    std::cout << "cuDNN algoritmo elegido   : " << static_cast<int>(algo)
+              << " (workspace " << std::fixed << std::setprecision(1)
+              << workspaceBytes / (1024.0 * 1024.0) << " MiB)\n";
+    return algo;
 }
 
 double run_gpu_cudnn_float(const ConvConfig& cfg, const ConvOutputDims& d,
@@ -325,6 +375,12 @@ double run_gpu_cudnn_float(const ConvConfig& cfg, const ConvOutputDims& d,
                                                 cfg.dilation_h, cfg.dilation_w,
                                                 CUDNN_CROSS_CORRELATION,
                                                 CUDNN_DATA_FLOAT));
+    // Baseline "sin Tensor Cores": con CUDNN_DEFAULT_MATH cuDNN habilita TF32 en
+    // Ampere por su cuenta y la linea base FP32 termina corriendo en Tensor
+    // Cores. CUDNN_FMA_MATH obliga a la ruta FP32 escalar (pico 19.5 TFLOP/s en
+    // A100, no los 156 TFLOP/s de TF32).
+    CHECK_CUDNN(cudnnSetConvolutionMathType(convDesc, CUDNN_FMA_MATH));
+    std::cout << "cuDNN math type           : CUDNN_FMA_MATH (TF32 desactivado)\n";
     CHECK_CUDNN(cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                                            d.outN, d.outC, d.outH, d.outW));
 
@@ -341,10 +397,9 @@ double run_gpu_cudnn_float(const ConvConfig& cfg, const ConvOutputDims& d,
     CHECK_CUDA(cudaMemcpy(d_w, w.data(), wBytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_y, 0, yBytes));
 
-    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
     size_t workspaceBytes = 0;
-    CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc,
-                                                        algo, &workspaceBytes));
+    const cudnnConvolutionFwdAlgo_t algo =
+        select_forward_algo(handle, xDesc, wDesc, convDesc, yDesc, workspaceBytes);
     void* d_workspace = nullptr;
     if (workspaceBytes > 0) CHECK_CUDA(cudaMalloc(&d_workspace, workspaceBytes));
 
@@ -427,10 +482,9 @@ double run_gpu_cudnn_double(const ConvConfig& cfg, const ConvOutputDims& d,
     CHECK_CUDA(cudaMemcpy(d_w, w.data(), wBytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_y, 0, yBytes));
 
-    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
     size_t workspaceBytes = 0;
-    CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(handle, xDesc, wDesc, convDesc, yDesc,
-                                                        algo, &workspaceBytes));
+    const cudnnConvolutionFwdAlgo_t algo =
+        select_forward_algo(handle, xDesc, wDesc, convDesc, yDesc, workspaceBytes);
     void* d_workspace = nullptr;
     if (workspaceBytes > 0) CHECK_CUDA(cudaMalloc(&d_workspace, workspaceBytes));
 
