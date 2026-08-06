@@ -79,8 +79,10 @@ echo "Compilando gemm_compare_balanced..."
 
 # Dimensiones alineadas con las corridas de Fase 2 para que los baselines de
 # ambas fases sean directamente comparables.
-# FP64 solo se corre en 12288: a 32768 las tres matrices ocupan 25.7 GiB en la
-# A100 de 40 GiB y la referencia OpenBLAS pasaria de 30 s por iteracion.
+# FP64 a 32768 si cabe: las tres matrices ocupan 3*32768^2*8 B = 25.8 GiB de los
+# 39.5 GiB de la A100 (y 34.4 GiB en host contando A, B, C_cpu y C_gpu, dentro
+# de los 128 G pedidos). El costo real es la referencia OpenBLAS: 7.04e13 FLOP
+# por iteracion, ~1 min por iteracion en 16 nucleos, ~35 min las 30 iteraciones.
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     declare -a RUNS=(
         "1024 1024 1024 2 fp32"
@@ -90,6 +92,7 @@ else
         "12288 12288 12288 30 fp32"
         "12288 12288 12288 30 fp64"
         "32768 32768 32768 30 fp32"
+        "32768 32768 32768 30 fp64"
     )
 fi
 

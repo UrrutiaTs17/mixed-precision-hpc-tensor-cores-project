@@ -108,6 +108,10 @@ echo "Compilando cudnn_conv_balanced..."
 
 # Mismas formas que las corridas de Fase 2, para comparar el baseline cuDNN FP32
 # contra la ruta Tensor Core de Fase 2 sobre la misma convolucion.
+# El baseline FP32 desactiva TF32 desde el codigo (cudnnSetConvolutionMathType
+# con CUDNN_FMA_MATH en cudnn_conv_balanced.cu), no por NVIDIA_TF32_OVERRIDE:
+# asi la linea base sigue siendo FP32 escalar aunque el binario se corra a mano
+# fuera de este sbatch.
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     declare -a RUNS=(
         "1 64 64 64 64 3 3 1 1 1 1 1 1 2 fp32"

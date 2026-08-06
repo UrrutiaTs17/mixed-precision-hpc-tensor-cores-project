@@ -519,6 +519,14 @@ static Metrics benchmark_gpu_cudnn_float(const std::vector<float>& x,
                                                 opt.dilation_h, opt.dilation_w,
                                                 CUDNN_CROSS_CORRELATION,
                                                 CUDNN_DATA_FLOAT));
+    // Esta ruta es la linea base "sin Tensor Cores" contra la que se mide el
+    // speedup de las rutas 3 y 4, asi que tiene que ser FP32 escalar de verdad.
+    // Con CUDNN_DEFAULT_MATH cuDNN habilita TF32 por su cuenta en Ampere y la
+    // supuesta linea base corria en Tensor Cores: 79.1 TFLOP/s medidos son el
+    // 50.7 % del pico TF32 (156 TFLOP/s) y 4x por encima del pico FP32 escalar
+    // del A100 (19.5 TFLOP/s), con lo que el speedup TC/FP32 salia deflactado
+    // (1.9x-3.0x). CUDNN_FMA_MATH fuerza la ruta FP32 escalar.
+    CHECK_CUDNN(cudnnSetConvolutionMathType(convDesc, CUDNN_FMA_MATH));
     CHECK_CUDNN(cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
                                            d.outN, d.outC, d.outH, d.outW));
 
@@ -529,7 +537,17 @@ static Metrics benchmark_gpu_cudnn_float(const std::vector<float>& x,
     int algo_count = 0;
     CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm_v7(
         handle.get(), xDesc, wDesc, convDesc, yDesc, 8, &algo_count, perf_results));
-    const cudnnConvolutionFwdAlgo_t algo = perf_results[0].algo;
+
+    // Con CUDNN_FMA_MATH quedan descartados los algoritmos que solo existen en
+    // variante Tensor Core, y esos vuelven con status != SUCCESS: hay que tomar
+    // el primero ejecutable, no el primero de la lista.
+    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+    for (int ai = 0; ai < algo_count; ++ai) {
+        if (perf_results[ai].status == CUDNN_STATUS_SUCCESS) {
+            algo = perf_results[ai].algo;
+            break;
+        }
+    }
 
     // El workspace es memoria temporal en GPU que algunos algoritmos necesitan.
     size_t ws_bytes = 0;
@@ -1299,8 +1317,9 @@ static void print_float_report(const Options& opt,
     std::cout << "Error max abs vs FP64       : " << cpu_err.max_abs << "\n";
     std::cout << "Error relativo L2 vs FP64   : " << cpu_err.rel_l2 << "\n\n";
 
-    std::cout << "GPU cuDNN clasico - tiempo  : " << gpu.ms << " ms\n";
-    std::cout << "GPU cuDNN clasico - rend.   : " << gpu.gflops << " GFLOP/s ("
+    std::cout << "GPU cuDNN FP32 escalar      : math type CUDNN_FMA_MATH (TF32 desactivado)\n";
+    std::cout << "GPU cuDNN FP32 - tiempo     : " << gpu.ms << " ms\n";
+    std::cout << "GPU cuDNN FP32 - rend.      : " << gpu.gflops << " GFLOP/s ("
               << gpu.tflops << " TFLOP/s)\n";
     std::cout << "Speedup vs CPU              : " << cpu.ms / gpu.ms << "x\n";
     std::cout << "Error max abs vs FP64       : " << gpu_err.max_abs << "\n";
@@ -1313,7 +1332,7 @@ static void print_float_report(const Options& opt,
         std::cout << "GPU Tensor Core - rend.     : " << tc.gflops << " GFLOP/s ("
                   << tc.tflops << " TFLOP/s)\n";
         std::cout << "Speedup TC vs CPU           : " << cpu.ms / tc.ms << "x\n";
-        std::cout << "Speedup TC vs GPU clasico   : " << gpu.ms / tc.ms << "x\n";
+        std::cout << "Speedup TC vs FP32 escalar  : " << gpu.ms / tc.ms << "x\n";
         std::cout << "Error max abs vs FP64       : " << tc_err.max_abs << "\n";
         std::cout << "Error relativo L2 vs FP64   : " << tc_err.rel_l2 << "\n";
         std::cout << "Error max abs vs CPU FP32   : " << tc_vs_cpu_err.max_abs << "\n";
@@ -1325,7 +1344,7 @@ static void print_float_report(const Options& opt,
         std::cout << "GPU Tensor Core BF16 - rend.     : " << tc_bf16.gflops << " GFLOP/s ("
                   << tc_bf16.tflops << " TFLOP/s)\n";
         std::cout << "Speedup TC BF16 vs CPU           : " << cpu.ms / tc_bf16.ms << "x\n";
-        std::cout << "Speedup TC BF16 vs GPU clasico   : " << gpu.ms / tc_bf16.ms << "x\n";
+        std::cout << "Speedup TC BF16 vs FP32 escalar  : " << gpu.ms / tc_bf16.ms << "x\n";
         std::cout << "Error max abs vs FP64            : " << tc_bf16_err.max_abs << "\n";
         std::cout << "Error relativo L2 vs FP64        : " << tc_bf16_err.rel_l2 << "\n";
         std::cout << "Error max abs vs CPU FP32        : " << tc_bf16_vs_cpu_err.max_abs << "\n";
@@ -1337,7 +1356,7 @@ static void print_float_report(const Options& opt,
         std::cout << "GPU WMMA custom - rend.     : " << wmma.gflops << " GFLOP/s ("
                   << wmma.tflops << " TFLOP/s)\n";
         std::cout << "Speedup WMMA vs CPU         : " << cpu.ms / wmma.ms << "x\n";
-        std::cout << "Speedup WMMA vs GPU clasico : " << gpu.ms / wmma.ms << "x\n";
+        std::cout << "Speedup WMMA vs FP32 escalar: " << gpu.ms / wmma.ms << "x\n";
         std::cout << "Error max abs vs FP64       : " << wmma_err.max_abs << "\n";
         std::cout << "Error relativo L2 vs FP64   : " << wmma_err.rel_l2 << "\n";
         std::cout << "Error max abs vs CPU FP32   : " << wmma_vs_cpu_err.max_abs << "\n";
