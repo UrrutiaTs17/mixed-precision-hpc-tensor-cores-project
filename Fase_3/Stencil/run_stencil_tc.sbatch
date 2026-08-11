@@ -159,6 +159,28 @@ fi
 NX="${NX:-16384}"
 NY="${NY:-16384}"
 
+# Ruta GPU_FP64 (referencia de maxima precision EN GPU): ON por defecto, de modo
+# que TODA corrida del barrido la produzca para los MISMOS NX/NY/ITERS que las
+# rutas WMMA. Esa coincidencia es el requisito para poder unir sus filas por
+# (nx, ny, iters) y calcular el speedup de WMMA_FP16_SP / WMMA_BF16_SP contra un
+# denominador GPU, sin cruzar dispositivos: la referencia FP64 de CPU sirve como
+# ground truth de ERROR, no como denominador de RENDIMIENTO.
+#
+# Presupuesto de memoria host a 16384^2 (el caso mas caro del barrido):
+#   - fp64_checkpoints con CHECKPOINT_EVERY=5 e ITERS=120: 24 snapshots x
+#     16384^2 x 8 B = 48 GiB (ya existente, no lo agrega esta ruta)
+#   - input_fp64 + y_ref: 2 x 2 GiB = 4 GiB (ya existente)
+#   - buffers FP32 de las otras rutas: ~5 GiB (ya existente)
+#   - GPU_FP64 agrega: estado final (2 GiB) + buffer D2H de checkpoint (2 GiB)
+#     + la copia en double del input dentro de la funcion (2 GiB) = ~6 GiB
+# Total ~63 GiB contra los 128G que pide el job: cabe con holgura.
+# En GPU agrega 2 buffers de 2 GiB (4 GiB), liberados al terminar la ruta.
+#
+# FP64_GPU=off la omite (por ejemplo, para repetir una corrida historica byte a
+# byte o si se reduce --mem):
+#   sbatch --export=ALL,FP64_GPU=off run_stencil_tc.sbatch
+FP64_GPU="${FP64_GPU:-on}"
+
 # Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
 # sola vez en tools/common_ncu.sh (fuera de cualquier Fase_N) y se reutiliza
 # entre los .sbatch de todas las fases; este script corre desde
@@ -231,7 +253,7 @@ echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "NVCC_FLAGS=${NVCC_FLAGS}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP}"
+echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP64_GPU=${FP64_GPU}"
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no
@@ -353,9 +375,13 @@ for run in "${RUNS[@]}"; do
         echo "============================================================"
         echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
         echo "============================================================"
+        # --fp64-gpu se pasa SOLO aqui (corridas de medicion). Las invocaciones
+        # de ncu usan --profile-only, que no ejecuta la ruta GPU_FP64: perfilar
+        # el kernel FP64 no es el objetivo de este job y correrlo antes del
+        # kernel bajo perfil solo alargaria cada llamada a ncu.
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
             --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
-            --spatial-comp "${SPATIAL_COMP}"
+            --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}"
 
         if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego

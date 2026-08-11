@@ -143,6 +143,21 @@ if [[ "${SPATIAL_COMP}" == "on" ]]; then
     KAHAN_LIST="off"
 fi
 
+# Ruta GPU_FP64 (referencia de maxima precision EN GPU): ON por defecto, con los
+# MISMOS NX/NY/ITERS que las rutas WMMA de este barrido, para que sus filas se
+# puedan unir por (nx, ny, iters) igual que en run_stencil_tc.sbatch.
+#
+# Aqui aporta ademas algo que el barrido de metricas no puede dar: con
+# ITERS=1200 esta es la unica corrida donde el horizonte n* de la ruta FP64 de
+# GPU es observable, y por tanto donde se puede contrastar contra el n* de la
+# referencia FP64 de CPU (fila CSV_HORIZON "FP64" vs fila "GPU_FP64"): misma
+# prediccion de formato, dos implementaciones distintas del mismo operador.
+#
+# Costo de memoria a 4096^2: estado final (134 MB) + buffer D2H de checkpoint
+# (134 MB) + copia en double del input (134 MB) ~= 0.4 GB host y 268 MB en GPU,
+# despreciable frente a los 32G que pide el job (uso actual ~7 GB).
+FP64_GPU="${FP64_GPU:-on}"
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -166,11 +181,11 @@ TIMEFORMAT=">>> Tiempo real de la corrida: %R s (user %U, sys %S)"
 for KAHAN in ${KAHAN_LIST}; do
     echo
     echo "============================================================"
-    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}, FP64_GPU=${FP64_GPU}"
     echo "============================================================"
     time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
           --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
-          --spatial-comp "${SPATIAL_COMP}"
+          --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}"
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 
