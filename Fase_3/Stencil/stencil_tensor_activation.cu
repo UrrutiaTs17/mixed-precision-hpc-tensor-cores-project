@@ -132,6 +132,15 @@ struct Options {
     // (son dos politicas alternativas de la misma compensacion, no dos capas
     // acumulables): parse_args lo rechaza.
     bool spatial_comp = false;
+    // true (por defecto, "on"): corre la ruta GPU_FP64 (referencia de maxima
+    // precision EN GPU, ver benchmark_gpu_fp64_stencil). Es el denominador
+    // GPU-vs-GPU de los speedups de las rutas WMMA compensadas: sin ella la
+    // unica referencia FP64 de la corrida es la de CPU, y contrastar una ruta
+    // GPU contra un tiempo de CPU mezcla dos dispositivos en una sola razon.
+    // "off" la omite (util para recortar el costo de una corrida de smoke test
+    // o si la malla no cabe en memoria: duplica los bytes por celda respecto a
+    // GPU_FP32, ver el presupuesto en run_stencil_tc.sbatch).
+    bool fp64_gpu = true;
 };
 
 // Politica efectiva derivada de los dos flags. parse_args ya garantizo que no
@@ -198,8 +207,9 @@ static std::string csv_first_nonfinite_field(int first_nf) {
 // Se emite FUERA del par de eventos CUDA que mide t/iter (nunca dentro de lo
 // que build_metrics reporta): un muestreador NVML externo alinea ventanas de
 // potencia con estos marcadores sin que este archivo tenga que exponer nada
-// mas. Solo se usa en las rutas GPU con route_label (GPU_FP32, WMMA_FP16,
-// WMMA_BF16); CPU FP32 serial no tiene ventana de potencia GPU que alinear.
+// mas. Solo se usa en las rutas GPU con route_label (GPU_FP32, GPU_FP64,
+// WMMA_FP16, WMMA_BF16); CPU FP32 serial no tiene ventana de potencia GPU que
+// alinear.
 static void emit_csv_region_marker(const char* route, const char* phase) {
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -249,6 +259,12 @@ static void print_usage(const char* prog) {
         << "  kernel limitado por memoria eso NO es gratis, ver t/iter reportado. Las\n"
         << "  rutas WMMA se reportan como WMMA_FP16_SP / WMMA_BF16_SP para que sus\n"
         << "  filas CSV no se confundan con las de --kahan off|on.\n\n"
+        << "  --fp64-gpu off|on (por defecto on) corre la ruta GPU_FP64: el mismo\n"
+        << "  stencil en double sobre GPU, sin Tensor Cores ni compensacion. Es la\n"
+        << "  referencia de maxima precision EN GPU, pensada como denominador\n"
+        << "  GPU-vs-GPU del speedup de las rutas WMMA (comparar una ruta GPU contra\n"
+        << "  el tiempo de CPU mezcla dos dispositivos en una sola razon). Cuesta el\n"
+        << "  doble de bytes por celda que GPU_FP32; off la omite por completo.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
@@ -320,6 +336,12 @@ static Options parse_args(int argc, char** argv) {
                 std::exit(EXIT_FAILURE);
             }
             opt.spatial_comp = parse_on_off_flag("--spatial-comp", argv[++i]);
+        } else if (std::strcmp(argv[i], "--fp64-gpu") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --fp64-gpu\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.fp64_gpu = parse_on_off_flag("--fp64-gpu", argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -683,6 +705,47 @@ __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx
     if (in_range) out[idx2d(x, y, nx)] = val;
 }
 
+// Replica exacta de stencil2d_fp32_kernel en double: misma formula
+// (0.25*(up+down+left+right) - center), mismo mapeo de hilos a celdas, misma
+// guarda de borde (las celdas del contorno se copian tal cual) y la misma
+// reduccion en shared de la primera iteracion no finita. Lo UNICO que cambia
+// es el tipo de dato. Sin Tensor Cores, sin WMMA y sin compensacion: esta ruta
+// es la referencia de maxima precision en GPU, no una variante mas del kernel
+// mixto -- cualquier divergencia algoritmica respecto al FP32 clasico la
+// invalidaria como denominador de speedup GPU-vs-GPU.
+__global__ static void stencil2d_fp64_kernel(const double* in, double* out, int nx, int ny,
+                                             int iter, int* first_nf) {
+    __shared__ int blk_bad;
+    if (threadIdx.x == 0 && threadIdx.y == 0) blk_bad = 0;
+    __syncthreads();
+
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool in_range = (x < nx && y < ny);
+    const bool active = in_range && !(x == 0 || y == 0 || x == nx - 1 || y == ny - 1);
+
+    double val = 0.0;
+    if (in_range) {
+        if (active) {
+            const double up = in[idx2d(x, y - 1, nx)];
+            const double down = in[idx2d(x, y + 1, nx)];
+            const double left = in[idx2d(x - 1, y, nx)];
+            const double right = in[idx2d(x + 1, y, nx)];
+            const double center = in[idx2d(x, y, nx)];
+            val = 0.25 * (up + down + left + right) - center;
+            if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
+        } else {
+            val = in[idx2d(x, y, nx)];
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        reduce_and_mark_first_nonfinite(first_nf, iter, blk_bad);
+    }
+    if (in_range) out[idx2d(x, y, nx)] = val;
+}
+
 // Contexto compartido de checkpoints para las tres rutas de baja precision:
 // snapshots FP64 por checkpoint (iteraciones {K, 2K, ...}, ver
 // compute_cpu_stencil_fp64) y el intervalo K que los genero.
@@ -741,6 +804,75 @@ static void record_checkpoint(const CheckpointContext& ckpt,
     }
 
     const ErrorMetrics e = compare_fp64_ref_vs_fp32(ckpt.fp64_checkpoints[ckpt_idx], host_buf);
+    emit_csv_drift_row(route, iter_number, e);
+    if (!e.solution_finite && onset_iter < 0) {
+        onset_iter = iter_number;
+    }
+}
+
+// Version FP64/FP64 de compare_fp64_ref_vs_fp32 (Fase_2/common.cuh), byte a
+// byte igual salvo que `test` ya es double y no hay cast que aplicar. No se
+// usa compare_double_vectors -que si existe en common.cuh y compara el mismo
+// par de tipos- porque ESA deja l2_abs y ref_l2_norm en 0.0 por diseno (ver su
+// comentario): son justamente las dos primeras columnas numericas que
+// emit_csv_drift_row imprime, asi que CSV_DRIFT saldria con ref_l2=0 y abs_l2=0
+// para toda la ruta GPU_FP64. Se define aqui, y no ampliando common.cuh, para
+// no alterar un header compartido con Fase 1 y Fase 2.
+static ErrorMetrics compare_fp64_ref_vs_fp64(const std::vector<double>& ref_fp64,
+                                             const std::vector<double>& test_fp64) {
+    ErrorMetrics out;
+    double sq_err = 0.0;
+    double sq_ref = 0.0;
+    double ref_linf = 0.0;
+    for (size_t i = 0; i < ref_fp64.size(); ++i) {
+        const double r = ref_fp64[i];
+        const double t = test_fp64[i];
+        if (!std::isfinite(r)) { out.reference_finite = false; continue; }
+
+        // Misma regla que compare_fp64_ref_vs_fp32: la norma de la REFERENCIA
+        // se acumula antes de mirar la solucion, para que no dependa de
+        // cuantos puntos de la ruta evaluada siguen finitos.
+        sq_ref += r * r;
+        ref_linf = std::max(ref_linf, std::abs(r));
+
+        if (!std::isfinite(t)) { out.solution_finite = false; continue; }
+
+        const double diff = r - t;
+        out.max_abs = std::max(out.max_abs, std::abs(diff));
+        sq_err += diff * diff;
+    }
+    out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
+                 ? std::sqrt(sq_err / sq_ref) : 0.0;
+    out.l2_abs = (out.reference_finite && std::isfinite(sq_err)) ? std::sqrt(sq_err) : 0.0;
+    out.ref_l2_norm = (out.reference_finite && std::isfinite(sq_ref)) ? std::sqrt(sq_ref) : 0.0;
+    out.ref_linf = (out.reference_finite && std::isfinite(ref_linf)) ? ref_linf : 0.0;
+    out.rel_linf = (out.reference_finite && out.ref_linf > 0.0) ? out.max_abs / out.ref_linf : 0.0;
+    return out;
+}
+
+// Version FP64 de record_checkpoint: identica en estructura y en el esquema de
+// la fila CSV_DRIFT que emite; solo cambian el tipo del estado de la ruta y la
+// funcion de comparacion. No se reutiliza la version FP32 convirtiendo el
+// estado a float antes de comparar: eso inyectaria el redondeo de FP32 en el
+// drift de la unica ruta que no lo tiene, que es precisamente la magnitud que
+// esta ruta existe para acotar.
+static void record_checkpoint_fp64(const CheckpointContext& ckpt,
+                                   const char* route,
+                                   int iter_number,
+                                   const std::vector<double>& host_buf,
+                                   int& onset_iter) {
+    const int ckpt_idx = iter_number / ckpt.checkpoint_every - 1;
+    if (ckpt_idx < 0) return;
+
+    if (ckpt_idx >= static_cast<int>(ckpt.fp64_checkpoints.size())) {
+        emit_csv_drift_nonfinite_reference_row(route, iter_number);
+        if (!all_finite_fp64(host_buf) && onset_iter < 0) {
+            onset_iter = iter_number;
+        }
+        return;
+    }
+
+    const ErrorMetrics e = compare_fp64_ref_vs_fp64(ckpt.fp64_checkpoints[ckpt_idx], host_buf);
     emit_csv_drift_row(route, iter_number, e);
     if (!e.solution_finite && onset_iter < 0) {
         onset_iter = iter_number;
@@ -944,6 +1076,202 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaFree(d_a));
     CHECK_CUDA(cudaFree(d_b));
     CHECK_CUDA(cudaFree(d_first_nf));
+    return build_metrics(nx, ny, total_ms / iters);
+}
+
+// Ruta GPU_FP64: replica estructural de benchmark_gpu_fp32_stencil con el tipo
+// cambiado a double. Conserva sin excepcion el warm-up descartable
+// (kWarmupIters) con restauracion de ambos buffers, el reinicio del contador de
+// overflow tras el warm-up, el ping-pong por std::swap, la pausa/reanudacion
+// del cronometro alrededor del bloque de checkpoint y -- lo importante para la
+// telemetria -- la ventana de energia POR TRAMOS: close_energy_segment() antes
+// del D2H de checkpoint y power_buffer_start_sampling() despues, con pause_t0
+// tomado ANTES de cerrar el tramo (el mismo orden validado en los jobs
+// 4147/4148). Sin ese corte, energy_gpu_j de esta ruta mediria sobre todo la
+// instrumentacion y no el kernel, y el speedup/EDP GPU-vs-GPU quedaria medido
+// contra un denominador contaminado.
+//
+// El input llega en FP32 (misma condicion inicial que el resto de rutas) y se
+// promueve a double aqui: promover la MISMA condicion inicial, en vez de
+// generar una en double, es lo que hace comparables el error y el horizonte de
+// esta ruta con los de GPU_FP32 y las WMMA.
+//
+// La entrada FP32 se promueve elemento a elemento en host y se sube una sola
+// vez; el bucle medido no paga ninguna conversion (a diferencia de las rutas
+// WMMA, que reconvierten cada iteracion). Por eso esta ruta no reporta
+// t_convert_ms: no tiene kernel de conversion que cronometrar.
+static Metrics benchmark_gpu_fp64_stencil(const std::vector<float>& in,
+                                          std::vector<double>& out,
+                                          int nx,
+                                          int ny,
+                                          int iters,
+                                          const CheckpointContext& ckpt,
+                                          const char* route_label,
+                                          int& onset_iter,
+                                          int& first_nonfinite_iter,
+                                          double& t_checkpoint_ms_out,
+                                          EnergyMeasurement& out_energy) {
+    const size_t count = in.size();
+    std::vector<double> in_fp64(count);
+    for (size_t i = 0; i < count; ++i) {
+        in_fp64[i] = static_cast<double>(in[i]);
+    }
+
+    double* d_a = nullptr;
+    double* d_b = nullptr;
+    int* d_first_nf = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_a, count * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_b, count * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
+    // Ambos buffers arrancan como copia completa del input: el kernel nunca
+    // escribe las celdas de borde, asi que deben preservarse desde el inicio
+    // en cualquier buffer que llegue a jugar el rol de d_out.
+    CHECK_CUDA(cudaMemcpy(d_a, in_fp64.data(), count * sizeof(double), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, in_fp64.data(), count * sizeof(double), cudaMemcpyHostToDevice));
+
+    PowerBuffer* power_buffer = power_buffer_create(0);
+    const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
+    power_buffer_start_sampling(power_buffer);
+
+    dim3 block(16, 16);
+    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+
+    // Warm-up encadenado y descartable: alterna d_a/d_b igual que el bucle
+    // medido, pero al terminar se restauran ambos a una copia fresca del
+    // input para que el bucle medido siempre arranque desde el estado
+    // original.
+    double* warm_in = d_a;
+    double* warm_out = d_b;
+    for (int i = 0; i < kWarmupIters; ++i) {
+        stencil2d_fp64_kernel<<<grid, block>>>(warm_in, warm_out, nx, ny, i + 1, d_first_nf);
+        std::swap(warm_in, warm_out);
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(d_a, in_fp64.data(), count * sizeof(double), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_b, in_fp64.data(), count * sizeof(double), cudaMemcpyHostToDevice));
+
+    // Ultimo uso de in_fp64 (la restauracion post-warmup de arriba): se libera
+    // ANTES de abrir la ventana medida. A 16384^2 son 2 GiB que de otro modo
+    // convivirian con checkpoint_host_buf y con los snapshots FP64 de la
+    // referencia durante todo el bucle, en el job con el presupuesto de memoria
+    // mas ajustado del barrido (ver run_stencil_tc.sbatch).
+    in_fp64.clear();
+    in_fp64.shrink_to_fit();
+
+    // Reinicia el contador de overflow tras el warm-up: sus iteraciones son
+    // descartables y no deben contaminar la medicion del bucle cronometrado.
+    {
+        const int init_val = INT_MAX;
+        CHECK_CUDA(cudaMemcpy(d_first_nf, &init_val, sizeof(int), cudaMemcpyHostToDevice));
+    }
+    power_buffer_stop_sampling(power_buffer);
+    power_buffer_samples_clear(power_buffer);
+    const RAEnergySnapshot rapl_before = rapl_snapshot_now();
+    (void)rapl_warmup_before;
+
+    // Buffer host reutilizado para las copias D2H de checkpoint; vacio (sin
+    // costo) cuando el checkpointing esta desactivado.
+    std::vector<double> checkpoint_host_buf;
+    if (ckpt.checkpoint_every > 0) {
+        checkpoint_host_buf.resize(count);
+    }
+
+    double* d_in = d_a;
+    double* d_out = d_b;
+    CudaEventTimer timer;
+    double total_ms = 0.0;
+    double checkpoint_ms_total = 0.0;
+    // Ventana de energia por TRAMOS, con los mismos cortes que el cronometro:
+    // cada bloque de checkpoint cierra el tramo vigente y abre uno nuevo al
+    // terminar, de modo que el consumo del D2H y del escaneo en host queda
+    // fuera de gpu_energy_j (ver el mismo patron en benchmark_gpu_fp32_stencil).
+    double gpu_energy_j = 0.0;
+    double gpu_window_s = 0.0;
+    bool gpu_energy_valid = true;
+    double checkpoint_cpu_energy_j = 0.0;
+    double checkpoint_pause_s = 0.0;
+    auto close_energy_segment = [&]() {
+        power_buffer_stop_sampling(power_buffer);
+        gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
+        gpu_energy_j += power_buffer_energy_joules(power_buffer);
+        gpu_window_s += power_buffer_window_seconds(power_buffer);
+        power_buffer_samples_clear(power_buffer);
+    };
+    emit_csv_region_marker(route_label, "begin");
+    power_buffer_samples_clear(power_buffer);
+    power_buffer_start_sampling(power_buffer);
+    timer.start();
+    // El cronometro se pausa/reanuda alrededor del bloque de checkpoint: sin
+    // eso, el tiempo GPU ocioso mientras el host hace el D2H queda
+    // contabilizado en total_ms (mismo diagnostico que en la ruta FP32).
+    for (int i = 0; i < iters; ++i) {
+        stencil2d_fp64_kernel<<<grid, block>>>(d_in, d_out, nx, ny, i + 1, d_first_nf);
+        std::swap(d_in, d_out);
+
+        // Solo LEE d_in (ya con el swap aplicado); no altera el ping-pong.
+        if (ckpt.checkpoint_every > 0 && (i + 1) % ckpt.checkpoint_every == 0) {
+            total_ms += timer.stop_and_elapsed_ms();
+            // Misma pausa que el cronometro, tambien para la energia: el D2H y
+            // el escaneo del host dejan la GPU ociosa y, sin excluirlos,
+            // energy_gpu_j/edp_j_s medirian sobre todo la instrumentacion.
+            // pause_t0 se toma ANTES de close_energy_segment() por el mismo
+            // motivo que en la ruta FP32: esa llamada puede consumir tiempo de
+            // pared propio, y medirlo despues lo dejaria dentro de
+            // energy_wall_s pese a estar fuera de la energia acumulada.
+            const auto pause_t0 = std::chrono::steady_clock::now();
+            close_energy_segment();
+            const RAEnergySnapshot rapl_ckpt_before = rapl_snapshot_now();
+
+            const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_in,
+                                  count * sizeof(double), cudaMemcpyDeviceToHost));
+            record_checkpoint_fp64(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
+            const auto ckpt_t1 = std::chrono::high_resolution_clock::now();
+            checkpoint_ms_total +=
+                std::chrono::duration<double, std::milli>(ckpt_t1 - ckpt_t0).count();
+
+            const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
+            checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
+            power_buffer_start_sampling(power_buffer);
+            checkpoint_pause_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pause_t0).count();
+
+            timer.start();
+        }
+    }
+    total_ms += timer.stop_and_elapsed_ms();
+    close_energy_segment();
+    const RAEnergySnapshot rapl_after = rapl_snapshot_now();
+    emit_csv_region_marker(route_label, "end");
+    // energy_wall_s proviene de las mismas marcas begin/end que se acumularon
+    // en gpu_energy_j (power_buffer_window_seconds por tramo), no de un reloj
+    // de pared aparte: avg_power_w/edp_j_s quedan derivados del mismo intervalo
+    // que la energia.
+    const double energy_wall_s = gpu_window_s;
+    const double flops_total = stencil_flops(nx, ny) * static_cast<double>(iters);
+    const bool cpu_energy_valid = rapl_before.valid && rapl_after.valid &&
+                                  rapl_after.energy_j >= rapl_before.energy_j;
+    const double cpu_energy_j = std::max(
+        0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
+    out_energy = make_energy_measurement_from_segments(
+        gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
+        energy_wall_s, flops_total);
+    power_buffer_destroy(power_buffer);
+    t_checkpoint_ms_out = checkpoint_ms_total / iters;
+    CHECK_CUDA(cudaGetLastError());
+    // Tras el ultimo swap, d_in apunta al buffer con la salida mas reciente.
+    out.resize(count);
+    CHECK_CUDA(cudaMemcpy(out.data(), d_in, count * sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA(cudaFree(d_a));
+    CHECK_CUDA(cudaFree(d_b));
+    CHECK_CUDA(cudaFree(d_first_nf));
+    // checkpoint_pause_s queda acumulado como diagnostico del tiempo de pared
+    // que el bloque de checkpoint mantiene fuera de la ventana medida; igual
+    // que en la ruta FP32, no entra en ninguna metrica reportada.
+    (void)checkpoint_pause_s;
     return build_metrics(nx, ny, total_ms / iters);
 }
 
@@ -1441,6 +1769,51 @@ static StorageRelResult storage_roundtrip_metrics(const std::vector<float>& stat
     }
     if (any_included) {
         result.rel_max_guarded = max_rel;
+    }
+    return result;
+}
+
+// Analogo FP64 de storage_roundtrip_metrics. En GPU_FP64 el estado se ALMACENA
+// en el mismo formato en que se acumula (double), asi que la cuantizacion Q es
+// la identidad y el error de almacenamiento es exactamente 0. No es un relleno
+// para llenar la columna: es la cota inferior medida que da escala a los
+// store_rel de FP16/BF16 en el mismo CSV_STORE -- sin una fila de referencia,
+// un store_rel_norm de 1e-4 no se distingue de "mucho" o "poco".
+// excluded_count y eval_iter se calculan con exactamente la misma regla
+// (tau = 1e-6 * ||u||_inf, exclusion de ceros) para que las columnas sean
+// comparables entre rutas y no reflejen dos criterios distintos.
+static StorageRelResult storage_roundtrip_metrics_fp64(const std::vector<double>& state,
+                                                       int iter_context) {
+    StorageRelResult result;
+    result.eval_iter = iter_context;
+
+    double norm_inf = 0.0;
+    double sq_state = 0.0;
+    for (double x : state) {
+        if (!std::isfinite(x)) return result;   // estado no finito: no evaluable
+        norm_inf = std::max(norm_inf, std::fabs(x));
+        sq_state += x * x;
+    }
+    if (!std::isfinite(norm_inf) || !std::isfinite(sq_state) || sq_state <= 0.0) {
+        return result;
+    }
+
+    result.evaluated = true;
+    // sqrt(sum (Q(x)-x)^2 / sum x^2) con Q = identidad sobre double.
+    result.rel_norm = 0.0;
+
+    const double tau = 1.0e-6 * norm_inf;
+    bool any_included = false;
+    for (double x : state) {
+        const double abs_x = std::fabs(x);
+        if (abs_x < tau || abs_x == 0.0) {
+            result.excluded_count++;
+            continue;
+        }
+        any_included = true;
+    }
+    if (any_included) {
+        result.rel_max_guarded = 0.0;
     }
     return result;
 }
@@ -1952,6 +2325,10 @@ static void print_first_nonfinite(const char* label, int first_nf, int iters) {
 
 constexpr double kFp16StorageUlp = 4.8828125e-4;  // 2^-11
 constexpr double kBf16StorageUlp = 3.90625e-3;    // 2^-8
+// 2^-53: unidad de redondeo de double, el formato en que GPU_FP64 acumula Y
+// almacena. Da la escala contra la que se leen los store_rel de FP16/BF16 en
+// el mismo CSV_STORE.
+constexpr double kFp64StorageUlp = 1.1102230246251565e-16;  // 2^-53
 
 static void append_storage_eval_annotation(const StorageRelResult& storage, int iters) {
     if (storage.eval_iter > 0 && storage.eval_iter < iters) {
@@ -2408,7 +2785,8 @@ static std::string fmt_horizon_row(const char* label, double predicted, int meas
 // encender (ver diagnostico del bloque 4).
 static void print_overflow_horizon(const OverflowHorizonPrediction& horizon,
                                    double a_nyq_ic,
-                                   int n_fp16, int n_bf16, int n_gpu_fp32, int n_fp64) {
+                                   int n_fp16, int n_bf16, int n_gpu_fp32, int n_fp64,
+                                   bool ran_gpu_fp64, int n_gpu_fp64) {
     std::cout << "=========== HORIZONTE DE OVERFLOW (Fase 3) ===========\n";
     const OverflowFitResult& fit = horizon.fit;
     if (!fit.valid) {
@@ -2425,6 +2803,14 @@ static void print_overflow_horizon(const OverflowHorizonPrediction& horizon,
     std::cout << fmt_horizon_row("BF16", horizon.pred_bf16, n_bf16);
     std::cout << fmt_horizon_row("FP32", horizon.pred_fp32, n_gpu_fp32);
     std::cout << fmt_horizon_row("FP64", horizon.pred_fp64, n_fp64);
+    // La fila FP64 de arriba es la referencia FP64 de CPU; esta es la ruta
+    // FP64 de GPU. Comparten prediccion (mismo formato, misma semilla) pero
+    // NO el horizonte medido: son dos implementaciones distintas del mismo
+    // operador y sus n* pueden separarse (p.ej. por contraccion FMA en el
+    // kernel), que es justamente lo que esta fila permite ver.
+    if (ran_gpu_fp64) {
+        std::cout << fmt_horizon_row("FP64g", horizon.pred_fp64, n_gpu_fp64);
+    }
     std::cout << "  Semilla efectiva A (fit FP64)       : " << fmt_sci(fit.A) << "\n";
     std::cout << "  Ajuste asintotico: n=" << fit.n_points << " puntos, R^2="
               << std::fixed << std::setprecision(6) << fit.r_squared
@@ -2482,7 +2868,9 @@ static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
                                   int n_fp16,
                                   int n_bf16,
                                   int n_gpu_fp32,
-                                  int n_fp64) {
+                                  int n_fp64,
+                                  bool ran_gpu_fp64,
+                                  int n_gpu_fp64) {
     const OverflowFitResult& fit = horizon.fit;
     // Mismo criterio de sufijo que las rutas (ver wmma_route_label): h_medido
     // de estas dos filas SI depende de la politica de compensacion (es el
@@ -2500,6 +2888,17 @@ static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
                          fit, a_nyq_ic, kFp32SeedFloor);
     emit_csv_horizon_row("FP64", nx, ny, iters, kahan, horizon.pred_fp64, n_fp64,
                          fit, a_nyq_ic, kFp64SeedFloor);
+    // Fila de la RUTA GPU_FP64, distinta de la fila "FP64" de arriba (que es la
+    // referencia FP64 de CPU). Se etiqueta con el nombre de ruta completo y no
+    // con un nombre de formato porque es lo que la desambigua de esa otra fila
+    // al unir CSVs; h_predicho es el mismo (mismo formato) y h_medido es el
+    // first_nonfinite propio de la ruta GPU. Solo se emite si la ruta corrio:
+    // una fila con h_medido=-1 seria indistinguible de "corrio y nunca
+    // diverguio".
+    if (ran_gpu_fp64) {
+        emit_csv_horizon_row("GPU_FP64", nx, ny, iters, kahan, horizon.pred_fp64, n_gpu_fp64,
+                             fit, a_nyq_ic, kFp64SeedFloor);
+    }
 }
 
 static void print_configuration(const Options& opt) {
@@ -2521,6 +2920,7 @@ static void print_configuration(const Options& opt) {
     if (opt.spatial_comp) {
         std::cout << "  (rutas WMMA reportadas como WMMA_FP16_SP / WMMA_BF16_SP)\n";
     }
+    std::cout << "Ruta GPU FP64 (referencia) : " << (opt.fp64_gpu ? "on" : "off") << "\n";
     std::cout << "===================================================\n\n";
 }
 
@@ -2785,6 +3185,84 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                      energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.edp));
     }
 
+    // Ruta GPU_FP64: referencia de maxima precision EN GPU. Corre justo despues
+    // de GPU_FP32 y antes de las rutas WMMA para que su ventana de energia caiga
+    // en el mismo regimen termico que el resto de rutas GPU de la corrida (una
+    // referencia medida al final, con la GPU ya caliente, sesgaria a la baja
+    // todo speedup y toda razon de energia calculada contra ella).
+    //
+    // El error se mide con compare_fp64_ref_vs_fp64 contra el MISMO ground truth
+    // FP64 de CPU que usan las demas rutas: no es una comparacion trivial contra
+    // si misma, porque el kernel y el bucle de CPU no son bit a bit identicos
+    // (el kernel puede contraer 0.25*s - c en un FMA). Lo que mide es
+    // exactamente el piso de error alcanzable en GPU para este operador.
+    bool ran_gpu_fp64 = false;
+    int onset_gpu_fp64 = -1;
+    int first_nf_gpu_fp64 = INT_MAX;
+    if (opt.fp64_gpu) {
+        ran_gpu_fp64 = true;
+        std::vector<double> y_gpu_fp64;
+        double t_checkpoint_ms_gpu_fp64 = 0.0;
+        EnergyMeasurement e_gpu_fp64;
+        const Metrics gpu_fp64 = benchmark_gpu_fp64_stencil(
+            input, y_gpu_fp64, opt.nx, opt.ny, opt.iters, ckpt, "GPU_FP64",
+            onset_gpu_fp64, first_nf_gpu_fp64, t_checkpoint_ms_gpu_fp64, e_gpu_fp64);
+        const ErrorMetrics gpu_fp64_err = compare_fp64_ref_vs_fp64(y_ref, y_gpu_fp64);
+        // Estado final promovido a FP32 solo para la comparacion contra la CPU
+        // FP32 (columna de trazabilidad); no toca y_gpu_fp64 ni ninguna metrica
+        // vs FP64.
+        std::vector<float> y_gpu_fp64_as_fp32(y_gpu_fp64.size());
+        for (size_t i = 0; i < y_gpu_fp64.size(); ++i) {
+            y_gpu_fp64_as_fp32[i] = static_cast<float>(y_gpu_fp64[i]);
+        }
+        const ErrorMetrics gpu_fp64_vs_cpu_err = compare_float_vectors(y_cpu, y_gpu_fp64_as_fp32);
+
+        // store_rel de esta ruta: Q = identidad sobre double (ver
+        // storage_roundtrip_metrics_fp64). Se evalua sobre el estado final, que
+        // es el unico que esta ruta retiene; si diverguio, no es evaluable.
+        const bool fp64_storage_evaluable = (first_nf_gpu_fp64 == INT_MAX);
+        const StorageRelResult fp64_storage_result = fp64_storage_evaluable
+            ? storage_roundtrip_metrics_fp64(y_gpu_fp64, opt.iters)
+            : StorageRelResult{};
+
+        print_reference_comparison("GPU CUDA FP64 (referencia GPU)", gpu_fp64, cpu.ms,
+                                   gpu_fp64_err, gpu_fp64_vs_cpu_err, first_nf_gpu_fp64,
+                                   opt.iters, t_checkpoint_ms_gpu_fp64);
+        std::cout << "Speedup GPU FP32 vs GPU FP64       : " << gpu_fp64.ms / gpu.ms << "x\n";
+        print_storage_metrics("FP64", fp64_storage_result, fp64_storage_evaluable,
+                              opt.iters, 1.0e-15);
+        emit_csv_summary_row("GPU_FP64", opt.nx, opt.ny, opt.iters, opt.kahan,
+                             gpu_fp64.ms, gpu_fp64.gflops,
+                             fmt_csv_num(cpu.ms / gpu_fp64.ms), fmt_csv_num(gpu.ms / gpu_fp64.ms),
+                             "NaN", "NaN", fmt_csv_num(t_checkpoint_ms_gpu_fp64),
+                             gpu_fp64_err, first_nf_gpu_fp64,
+                             "NaN", "NaN",
+                             storage_num_field(fp64_storage_result, fp64_storage_evaluable,
+                                               fp64_storage_result.rel_norm),
+                             storage_num_field(fp64_storage_result, fp64_storage_evaluable,
+                                               fp64_storage_result.rel_max_guarded),
+                             storage_count_field(fp64_storage_result, fp64_storage_evaluable),
+                             storage_eval_iter_field(fp64_storage_result, fp64_storage_evaluable),
+                             e_gpu_fp64);
+        emit_csv_store_row("GPU_FP64", opt.nx, opt.ny, opt.iters, opt.kahan,
+                           fp64_storage_result, fp64_storage_evaluable, kFp64StorageUlp);
+        print_energy_metrics(e_gpu_fp64);
+        emit_csv_energy_row("GPU_FP64", opt.nx, opt.ny, opt.iters, opt.kahan, e_gpu_fp64,
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+        if (csv_enabled) {
+            write_csv_row(csv, under_ncu ? "NCU_gpu_fp64" : "gpu_fp64", opt.kahan,
+                          opt.nx, opt.ny, opt.iters, gpu_fp64.ms, gpu_fp64.gflops,
+                          gpu_fp64_err, first_nf_gpu_fp64,
+                          storage_num_field(fp64_storage_result, fp64_storage_evaluable,
+                                            fp64_storage_result.rel_max_guarded),
+                          "NA", "NA", fmt_sci(t_checkpoint_ms_gpu_fp64), "NA", "NA",
+                          energy_field(!under_ncu && e_gpu_fp64.gpu_valid, e_gpu_fp64.energy_j),
+                          energy_field(!under_ncu && e_gpu_fp64.gpu_valid, e_gpu_fp64.avg_power_w),
+                          energy_field(!under_ncu && e_gpu_fp64.gpu_valid, e_gpu_fp64.edp));
+        }
+        std::cout << "\n";
+    }
+
     bool ran_fp16 = false;
     bool ran_bf16 = false;
     int onset_fp16 = -1;
@@ -2984,13 +3462,18 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         compute_overflow_horizon_from_reference(linf_per_iter, u0_linf);
 
     print_overflow_horizon(horizon, a_nyq,
-                          first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
+                          first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref,
+                          ran_gpu_fp64, first_nf_gpu_fp64);
     emit_csv_horizon_rows(horizon, a_nyq, opt.nx, opt.ny, opt.iters, opt.kahan, comp_mode,
-                          first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref);
+                          first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref,
+                          ran_gpu_fp64, first_nf_gpu_fp64);
 
     if (opt.checkpoint_every > 0) {
         std::cout << "=========== RESUMEN ONSET DE DIVERGENCIA ===========\n";
         std::cout << "CSV_ONSET,GPU_FP32," << onset_gpu_fp32 << "\n";
+        if (ran_gpu_fp64) {
+            std::cout << "CSV_ONSET,GPU_FP64," << onset_gpu_fp64 << "\n";
+        }
         if (ran_fp16) {
             std::cout << "CSV_ONSET," << route_fp16 << "," << onset_fp16 << "\n";
         }
