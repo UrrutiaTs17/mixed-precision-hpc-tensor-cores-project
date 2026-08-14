@@ -890,11 +890,22 @@ static EnergyMeasurement make_energy_measurement_from_segments(bool gpu_valid,
                                                                bool cpu_valid,
                                                                double energy_cpu_j,
                                                                double time_total_s,
-                                                               double flops_total) {
+                                                               double flops_total,
+                                                               int gpu_segment_count) {
     EnergyMeasurement result;
     result.time_total_s = time_total_s;
     result.gpu_valid = gpu_valid;
     result.cpu_valid = cpu_valid;
+    // El contador NVML se cuantiza POR TRAMO, no sobre la suma: cada tramo
+    // aporta hasta un salto de error, asi que el minimo exigido de ventana se
+    // multiplica por el numero de tramos (ver REGIMEN DE VALIDEZ en
+    // tools/power_sampling.h). Sin checkpointing hay un solo tramo y esto se
+    // reduce a time_total_s >= kEnergyWindowReliableSeconds.
+    result.gpu_segment_count = gpu_segment_count;
+    result.window_reliable =
+        gpu_valid && gpu_segment_count > 0 &&
+        time_total_s >= kEnergyWindowReliableSeconds *
+                            static_cast<double>(gpu_segment_count);
     if (result.gpu_valid) {
         result.energy_gpu_j = energy_gpu_j;
         result.avg_power_w = (time_total_s > 0.0) ? result.energy_gpu_j / time_total_s : 0.0;
@@ -991,6 +1002,10 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     // checkpoint que se quiere excluir.
     double gpu_energy_j = 0.0;
     double gpu_window_s = 0.0;
+    // Numero de tramos acumulados: fija energy_window_reliable junto con la
+    // ventana total, porque el contador NVML se cuantiza por tramo y no sobre
+    // la suma (cada tramo aporta hasta un salto de error).
+    int gpu_segment_count = 0;
     bool gpu_energy_valid = true;
     double checkpoint_cpu_energy_j = 0.0;
     double checkpoint_pause_s = 0.0;
@@ -999,6 +1014,7 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
         gpu_energy_j += power_buffer_energy_joules(power_buffer);
         gpu_window_s += power_buffer_window_seconds(power_buffer);
+        ++gpu_segment_count;
         power_buffer_samples_clear(power_buffer);
     };
     emit_csv_region_marker(route_label, "begin");
@@ -1065,7 +1081,7 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
         0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
     out_energy = make_energy_measurement_from_segments(
         gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
-        energy_wall_s, flops_total);
+        energy_wall_s, flops_total, gpu_segment_count);
     power_buffer_destroy(power_buffer);
     t_checkpoint_ms_out = checkpoint_ms_total / iters;
     CHECK_CUDA(cudaGetLastError());
@@ -1188,6 +1204,10 @@ static Metrics benchmark_gpu_fp64_stencil(const std::vector<float>& in,
     // fuera de gpu_energy_j (ver el mismo patron en benchmark_gpu_fp32_stencil).
     double gpu_energy_j = 0.0;
     double gpu_window_s = 0.0;
+    // Numero de tramos acumulados: fija energy_window_reliable junto con la
+    // ventana total, porque el contador NVML se cuantiza por tramo y no sobre
+    // la suma (cada tramo aporta hasta un salto de error).
+    int gpu_segment_count = 0;
     bool gpu_energy_valid = true;
     double checkpoint_cpu_energy_j = 0.0;
     double checkpoint_pause_s = 0.0;
@@ -1196,6 +1216,7 @@ static Metrics benchmark_gpu_fp64_stencil(const std::vector<float>& in,
         gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
         gpu_energy_j += power_buffer_energy_joules(power_buffer);
         gpu_window_s += power_buffer_window_seconds(power_buffer);
+        ++gpu_segment_count;
         power_buffer_samples_clear(power_buffer);
     };
     emit_csv_region_marker(route_label, "begin");
@@ -1256,7 +1277,7 @@ static Metrics benchmark_gpu_fp64_stencil(const std::vector<float>& in,
         0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
     out_energy = make_energy_measurement_from_segments(
         gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
-        energy_wall_s, flops_total);
+        energy_wall_s, flops_total, gpu_segment_count);
     power_buffer_destroy(power_buffer);
     t_checkpoint_ms_out = checkpoint_ms_total / iters;
     CHECK_CUDA(cudaGetLastError());
@@ -2082,6 +2103,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     const bool exclude_checkpoint_energy = (ckpt.checkpoint_every > 0);
     double gpu_energy_j = 0.0;
     double gpu_window_s = 0.0;
+    // Numero de tramos acumulados: fija energy_window_reliable junto con la
+    // ventana total, porque el contador NVML se cuantiza por tramo y no sobre
+    // la suma (cada tramo aporta hasta un salto de error).
+    int gpu_segment_count = 0;
     bool gpu_energy_valid = true;
     double checkpoint_cpu_energy_j = 0.0;
     double checkpoint_pause_s = 0.0;
@@ -2090,6 +2115,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         gpu_energy_valid = gpu_energy_valid && power_buffer_capture_valid(power_buffer);
         gpu_energy_j += power_buffer_energy_joules(power_buffer);
         gpu_window_s += power_buffer_window_seconds(power_buffer);
+        ++gpu_segment_count;
         power_buffer_samples_clear(power_buffer);
     };
     emit_csv_region_marker(route_label, "begin");
@@ -2189,7 +2215,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         0.0, rapl_energy_delta(rapl_before, rapl_after) - checkpoint_cpu_energy_j);
     out_energy = make_energy_measurement_from_segments(
         gpu_energy_valid, gpu_energy_j, cpu_energy_valid, cpu_energy_j,
-        energy_wall_s, flops_total);
+        energy_wall_s, flops_total, gpu_segment_count);
     power_buffer_destroy(power_buffer);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
@@ -2405,14 +2431,26 @@ static void print_energy_metrics(const EnergyMeasurement& energy) {
     std::cout << "Joules/GFLOP  : " << energy_csv_field(total_valid, energy.joules_per_gflop) << "\n";
 }
 
+// gpu_route distingue las rutas que de verdad midieron NVML de la ruta CPU,
+// que fija gpu_valid=true sin leer el contador (no hay ventana de GPU que
+// medir, ver benchmark_cpu_stencil). Las dos ultimas columnas salen NaN en esa
+// ruta en vez de 0/0: un 0 simularia una medicion de GPU que nunca se hizo.
 static void emit_csv_energy_row(const char* route,
                                 int nx,
                                 int ny,
                                 int iters,
                                 bool kahan,
                                 const EnergyMeasurement& energy,
-                                double flops_total) {
+                                double flops_total,
+                                bool gpu_route) {
     const bool total_valid = energy.gpu_valid && energy.cpu_valid;
+    // Metrica de comparacion GPU-vs-GPU entre formatos: la energia absoluta no
+    // es comparable entre corridas con ITERS distintos, la energia por
+    // iteracion si -- siempre que la ventana sea fiable, que es lo que informa
+    // la columna siguiente.
+    const bool per_iter_valid = gpu_route && energy.gpu_valid && iters > 0;
+    const double energy_gpu_j_per_iter =
+        per_iter_valid ? energy.energy_gpu_j / static_cast<double>(iters) : 0.0;
     std::cout << "CSV_ENERGY," << route << "," << nx << "," << ny << "," << iters << ","
               << kahan_label(kahan) << ","
               << energy_csv_field(energy.gpu_valid, energy.energy_gpu_j) << ","
@@ -2421,7 +2459,9 @@ static void emit_csv_energy_row(const char* route,
               << energy_csv_field(total_valid, energy.edp_j_s) << ","
               << energy_csv_field(total_valid, energy.joules_per_gflop) << ","
               << energy_csv_field(std::isfinite(energy.time_total_s), energy.time_total_s) << ","
-              << energy_csv_field(std::isfinite(flops_total), flops_total / 1e9) << "\n";
+              << energy_csv_field(std::isfinite(flops_total), flops_total / 1e9) << ","
+              << energy_csv_field(per_iter_valid, energy_gpu_j_per_iter) << ","
+              << (gpu_route ? (energy.window_reliable ? "1" : "0") : "NaN") << "\n";
 }
 
 static void emit_csv_summary_row(const char* route,
@@ -3156,7 +3196,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          "NaN", "NaN", "NaN", cpu_err, first_nf_cpu,
                          "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_cpu);
     emit_csv_energy_row("CPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan, e_cpu,
-                        stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+                        stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters),
+                        /*gpu_route=*/false);
     if (csv_enabled) {
         write_csv_row(csv, under_ncu ? "NCU_cpu_fp32" : "cpu_fp32", opt.kahan, opt.nx, opt.ny, opt.iters,
                      cpu.ms, cpu.gflops, cpu_err, first_nf_cpu, "NA");
@@ -3171,7 +3212,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_gpu_fp32);
     print_energy_metrics(e_gpu_fp32);
     emit_csv_energy_row("GPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan, e_gpu_fp32,
-                        stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+                        stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters),
+                        /*gpu_route=*/true);
     if (csv_enabled) {
         // under_ncu fuerza "NA" en las 3 columnas de energia igual que ya
         // fuerza el prefijo NCU_ en el nombre de ruta: bajo el perfilador
@@ -3248,7 +3290,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                            fp64_storage_result, fp64_storage_evaluable, kFp64StorageUlp);
         print_energy_metrics(e_gpu_fp64);
         emit_csv_energy_row("GPU_FP64", opt.nx, opt.ny, opt.iters, opt.kahan, e_gpu_fp64,
-                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters),
+                            /*gpu_route=*/true);
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_gpu_fp64" : "gpu_fp64", opt.kahan,
                           opt.nx, opt.ny, opt.iters, gpu_fp64.ms, gpu_fp64.gflops,
@@ -3356,7 +3399,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                            fp16_storage_result, fp16_storage_evaluable, kFp16StorageUlp);
         print_energy_metrics(e_fp16);
         emit_csv_energy_row(route_fp16, opt.nx, opt.ny, opt.iters, opt.kahan, e_fp16,
-                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters),
+                            /*gpu_route=*/true);
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
@@ -3440,7 +3484,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                            bf16_storage_result, bf16_storage_evaluable, kBf16StorageUlp);
         print_energy_metrics(e_bf16);
         emit_csv_energy_row(route_bf16, opt.nx, opt.ny, opt.iters, opt.kahan, e_bf16,
-                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters));
+                            stencil_flops(opt.nx, opt.ny) * static_cast<double>(opt.iters),
+                            /*gpu_route=*/true);
         if (csv_enabled) {
             write_csv_row(csv, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.kahan, opt.nx, opt.ny, opt.iters,
                          tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,

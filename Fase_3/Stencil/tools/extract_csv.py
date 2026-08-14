@@ -38,6 +38,7 @@ ENERGY_HEADER = [
     "job_id", "kernel", "nx", "ny", "iters", "kahan", "route",
     "energy_gpu_j", "energy_cpu_j", "energy_total_j", "edp_j_s",
     "joules_per_gflop", "time_total_s", "flops_total_billions",
+    "energy_gpu_j_per_iter", "energy_window_reliable",
 ]
 
 RUN_RE = re.compile(
@@ -204,8 +205,39 @@ def handle_store(parts, rows, job_id, kernel):
     rows.append(row)
 
 
-def handle_energy(parts, rows, summary_rows, summary_by_route, context, job_id, kernel):
-    parts = pad(parts, 13)
+def new_energy_filter_stats():
+    return {"filas_gpu": 0, "aceptadas": 0, "ventana_corta": 0, "gpu_invalido": 0}
+
+
+# El contador de energia de NVML se cuantiza en saltos del orden de ~20-25 ms
+# de GPU cargada (ver REGIMEN DE VALIDEZ en tools/power_sampling.h), asi que
+# una ventana corta produce un numero que no es comparable con el de otra ruta.
+# Esas filas se EXCLUYEN del promedio anulando energy_gpu_j_per_iter -- que es
+# la columna con la que se comparan formatos entre si, y cualquier media
+# posterior salta los NaN sola -- en vez de borrar la fila: energy_gpu_j y
+# energy_window_reliable se conservan crudos para poder auditar el descarte.
+# El motivo se contabiliza y se reporta al terminar: el filtrado nunca es
+# silencioso.
+def apply_energy_window_filter(row, stats):
+    if row["energy_window_reliable"] == "NaN":
+        # Ruta CPU -- que fija gpu_valid sin leer NVML y no tiene ventana de
+        # GPU que juzgar -- o log anterior a estas columnas. En ambos casos
+        # energy_gpu_j_per_iter ya viene NaN desde el binario.
+        return
+    stats["filas_gpu"] += 1
+    if row["energy_gpu_j"] == "NaN":
+        motivo = "gpu_invalido"
+    elif row["energy_window_reliable"] != "1":
+        motivo = "ventana_corta"
+    else:
+        stats["aceptadas"] += 1
+        return
+    row["energy_gpu_j_per_iter"] = "NaN"
+    stats[motivo] += 1
+
+
+def handle_energy(parts, rows, summary_rows, summary_by_route, context, job_id, kernel, stats):
+    parts = pad(parts, 15)
     route = clean(parts[1])
     row = identity(context, job_id, kernel, "route", route)
     row["nx"] = clean(parts[2])
@@ -224,7 +256,10 @@ def handle_energy(parts, rows, summary_rows, summary_by_route, context, job_id, 
         "joules_per_gflop": clean(parts[10]),
         "time_total_s": clean(parts[11]),
         "flops_total_billions": clean(parts[12]),
+        "energy_gpu_j_per_iter": clean(parts[13]),
+        "energy_window_reliable": clean(parts[14]),
     })
+    apply_energy_window_filter(row, stats)
     rows.append(row)
 
     summary = ensure_summary_row(summary_rows, summary_by_route, context, job_id, kernel, route)
@@ -245,6 +280,7 @@ def read_log(path, job_id, kernel):
     horizon_rows = []
     store_rows = []
     energy_rows = []
+    energy_filter_stats = new_energy_filter_stats()
 
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for raw_line in handle:
@@ -266,9 +302,10 @@ def read_log(path, job_id, kernel):
                 handle_store(parts, store_rows, job_id, kernel)
             elif token == "CSV_ENERGY":
                 handle_energy(parts, energy_rows, summary_rows, summary_by_route,
-                              context, job_id, kernel)
+                              context, job_id, kernel, energy_filter_stats)
 
-    return drift_rows, summary_rows, horizon_rows, store_rows, energy_rows
+    return (drift_rows, summary_rows, horizon_rows, store_rows, energy_rows,
+            energy_filter_stats)
 
 
 def write_csv(path, header, rows):
@@ -277,6 +314,18 @@ def write_csv(path, header, rows):
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def report_energy_filter(stats):
+    descartadas = stats["ventana_corta"] + stats["gpu_invalido"]
+    print("[extract_csv] energia GPU: %d filas de ruta GPU, %d aceptadas para "
+          "promediar, %d descartadas (ventana_corta=%d, gpu_invalido=%d)."
+          % (stats["filas_gpu"], stats["aceptadas"], descartadas,
+             stats["ventana_corta"], stats["gpu_invalido"]))
+    if descartadas > 0:
+        print("[extract_csv] descartar = energy_gpu_j_per_iter -> NaN. "
+              "energy_gpu_j y energy_window_reliable quedan crudos en el CSV "
+              "para auditar el descarte.")
 
 
 def main():
@@ -288,9 +337,8 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
-    drift_rows, summary_rows, horizon_rows, store_rows, energy_rows = read_log(
-        args.input, args.job_id, args.kernel
-    )
+    (drift_rows, summary_rows, horizon_rows, store_rows, energy_rows,
+     energy_filter_stats) = read_log(args.input, args.job_id, args.kernel)
 
     outputs = [
         (os.path.join(args.outdir, "drift_%s_%s.csv" % (args.kernel, args.job_id)), DRIFT_HEADER, drift_rows),
@@ -301,6 +349,8 @@ def main():
     ]
     for path, header, rows in outputs:
         write_csv(path, header, rows)
+
+    report_energy_filter(energy_filter_stats)
 
 
 if __name__ == "__main__":
