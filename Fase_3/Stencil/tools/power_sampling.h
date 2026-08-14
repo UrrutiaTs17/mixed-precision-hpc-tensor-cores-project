@@ -24,9 +24,37 @@ typedef void* nvmlDevice_t;
 // grid sizes the window (0.2-2.1 ms) is routinely shorter than a single
 // sampling interval, so the old thread-based sampler produced NaN in the
 // large majority of runs. A counter delta needs no samples "inside" the
-// window -- one read before, one read after, subtract -- so it is exact
-// regardless of how short the window is. See Fase_2/telemetry.cuh
-// (EnergyProbe) for the same technique applied to a different CSV schema.
+// window -- one read before, one read after, subtract. See
+// Fase_2/telemetry.cuh (EnergyProbe) for the same technique applied to a
+// different CSV schema.
+//
+// REGIMEN DE VALIDEZ DEL CONTADOR. El delta es exacto como resta, pero el
+// contador que se resta no es continuo: lo alimenta el sensor de potencia
+// onboard, que en A100/H100 refresca del orden de cada 20-25 ms. El
+// acumulado avanza entonces a SALTOS discretos de (potencia x periodo de
+// refresco), no linealmente con el tiempo. Consecuencia: el delta es fiable
+// cuando la ventana medida abarca decenas de refrescos, y NO lo es cuando
+// dura uno o dos, porque ahi el error de cuantizacion es del orden del propio
+// valor medido -- e incluso puede caer entera entre dos saltos y devolver 0 J
+// con la lectura marcada valida.
+//
+// Evidencia medida (job 5153: NX=NY=4096, ITERS 30/120/480,
+// CHECKPOINT_EVERY=0, 12 ventanas GPU de 10 a 125 ms):
+//   - piso duro de 3.842 J, sin ningun valor entre 0 y 3.8 J;
+//   - tres de las doce ventanas devolvieron exactamente 0 J;
+//   - la energia no escala con la ventana (23.2 ms -> 4.905 J frente a
+//     33.6 ms -> 4.306 J);
+//   - la potencia implicita del MISMO kernel varia 2x segun la longitud de la
+//     ventana (GPU_FP32: 139 W a 27.6 ms frente a 75 W a 114.7 ms).
+// No es un defecto de este codigo, del handle NVML ni de la exclusion de
+// checkpoints: es el paso de cuantizacion del contador.
+//
+// MITIGACION: es de PROTOCOLO, no de instrumentacion. Se mide sobre ventanas
+// largas (ver kEnergyWindowReliableSeconds) y se normaliza por iteracion; los
+// tramos cortos se emiten marcados como no fiables en vez de promediarse. En
+// particular NO se vuelve al muestreo periodico en hilo: leeria el MISMO
+// sensor, con el mismo refresco, y reintroduciria los NaN en ventanas cortas
+// sin ganar resolucion real.
 struct PowerBuffer {
     nvmlDevice_t device;
     bool nvml_enabled;
@@ -39,6 +67,21 @@ struct PowerBuffer {
     double accumulated_window_s;  // running total of closed-segment wall-clock durations since the last clear
 };
 
+// Ventana minima POR TRAMO de energia para que el delta del contador sea
+// comparable entre rutas. El sensor refresca cada ~20-25 ms (ver REGIMEN DE
+// VALIDEZ arriba), asi que cada tramo arrastra un error de hasta un salto
+// completo, y con n tramos el error absoluto es de ~n saltos: solo se diluye
+// si la ventana total crece con n. De ahi el criterio que usa
+// EnergyMeasurement::window_reliable:
+//     time_total_s >= kEnergyWindowReliableSeconds * gpu_segment_count
+// Con 500 ms por tramo se cubren >= 20 refrescos y el error de cuantizacion
+// queda en <= ~5% (un salto perdido o de mas sobre veinte). Por debajo de ~10
+// refrescos (~250 ms) ese error pasa del 10% y la medicion deja de servir
+// para comparar formatos entre si, que es justo para lo que existe
+// energy_gpu_j_per_iter. Sin checkpointing hay un unico tramo y el criterio
+// se reduce a "la ventana dura al menos 500 ms".
+static constexpr double kEnergyWindowReliableSeconds = 0.500;
+
 struct RAEnergySnapshot {
     double energy_j;
     unsigned long long timestamp_ns;
@@ -48,6 +91,14 @@ struct RAEnergySnapshot {
 struct EnergyMeasurement {
     bool gpu_valid = false;
     bool cpu_valid = false;
+    // Numero de tramos de energia GPU que se sumaron en energy_gpu_j. Con
+    // checkpointing activo la ventana se parte en varios tramos y cada uno
+    // arrastra su propio error de cuantizacion del contador, asi que la
+    // fiabilidad depende de cuantos son, no solo de cuanto duran en total.
+    // Vale 0 en rutas que no leyeron NVML (la ruta CPU).
+    int gpu_segment_count = 0;
+    // gpu_valid && time_total_s >= kEnergyWindowReliableSeconds * gpu_segment_count
+    bool window_reliable = false;
     double time_total_s = 0.0;
     double energy_gpu_j = 0.0;
     double energy_cpu_j = 0.0;

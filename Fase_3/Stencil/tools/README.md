@@ -23,6 +23,33 @@ the corresponding capture failed. It is not an interpolated or smoothed value.
 RAPL counters are cumulative and may show only small raw changes for very
 short benchmarks.
 
+### `energy_gpu_j_per_iter` and `energy_window_reliable`
+
+NVML's energy counter is fed by the onboard power sensor, which refreshes every
+~20-25 ms, so the counter advances in discrete jumps rather than continuously.
+A delta taken over a window that spans only one or two refreshes carries a
+quantization error of the same order as the value itself — measured in job
+5153, where 12 GPU windows of 10-125 ms produced a hard floor of 3.842 J,
+three readings of exactly 0 J, and 2x swings in implied power for the same
+kernel. The fix is procedural, not instrumental: measure over long windows and
+normalize per iteration.
+
+`energy_window_reliable` is `1` when the GPU energy window is long enough for
+that error to fall to ~5% or less, namely
+`time_total_s >= 0.500 s * <number of energy segments>` (checkpointing splits
+the window into several segments, and each one carries its own quantization
+error). `energy_gpu_j_per_iter` is `energy_gpu_j / iters` — the quantity that
+is comparable across runs with different `ITERS`, and therefore the one used
+for GPU-vs-GPU comparisons between formats.
+
+The extractor **excludes unreliable rows from any downstream average** by
+blanking `energy_gpu_j_per_iter` to `NaN` when `energy_window_reliable` is not
+`1` or when the NVML read was invalid. `energy_gpu_j` and
+`energy_window_reliable` are left raw so the discard can be audited, and the
+number of rows dropped per reason is printed on stdout. Both columns are `NaN`
+on `CPU_FP32` rows: that route sets `gpu_valid` without reading NVML, so there
+is no GPU window to judge.
+
 Historical logs that only contain `CSV_DRIFT`, `CSV_REGION`, and `CSV_ONSET`
 are accepted. In that case the extractor writes drift rows and partial summary
 rows, while horizon, store, and energy files contain only their headers.
