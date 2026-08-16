@@ -13,6 +13,7 @@ DRIFT_HEADER = [
 SUMMARY_HEADER = [
     "job_id", "kernel", "nx", "ny", "iters", "kahan", "route",
     "t_iter_ms", "t_total_ms", "gflops", "speedup_cpu", "speedup_fp32",
+    "speedup_fp64_gpu",
     "t_kernel_ms", "t_convert_ms", "t_checkpoint_ms", "rel_l2",
     "rel_linf", "max_abs", "rel_l2_prop", "rel_linf_prop",
     "first_nonfinite", "store_rel_norm", "store_rel_max_guarded",
@@ -142,8 +143,22 @@ def handle_drift(parts, rows, summary_rows, summary_by_route, context, job_id, k
     rows.append(row)
 
 
+# Campos de una linea CSV_SUMMARY contando el token inicial. speedup_fp64_gpu se
+# inserto justo despues de speedup_fp32, en la posicion 11, de modo que un log
+# anterior a esa columna trae 29 campos en vez de 30. Rellenarlo por la derecha
+# con pad() leeria todo el esquema corrido una posicion (t_kernel_ms entraria en
+# speedup_fp64_gpu, y asi hasta el final), asi que se le abre el hueco en su
+# sitio antes de repartir los valores.
+SUMMARY_FIELD_COUNT = 30
+SUMMARY_LEGACY_FIELD_COUNT = 29
+SPEEDUP_FP64_GPU_INDEX = 11
+
+
 def handle_summary(parts, rows, summary_by_route, context, job_id, kernel):
-    parts = pad(parts, 29)
+    if len(parts) == SUMMARY_LEGACY_FIELD_COUNT:
+        parts = (parts[:SPEEDUP_FP64_GPU_INDEX] + ["NaN"]
+                 + parts[SPEEDUP_FP64_GPU_INDEX:])
+    parts = pad(parts, SUMMARY_FIELD_COUNT)
     route = clean(parts[1])
     context["nx"] = clean(parts[2])
     context["ny"] = clean(parts[3])
@@ -151,7 +166,7 @@ def handle_summary(parts, rows, summary_by_route, context, job_id, kernel):
     context["kahan"] = clean(parts[5])
     row = ensure_summary_row(rows, summary_by_route, context, job_id, kernel, route)
     row.update(identity(context, job_id, kernel, "route", route))
-    for field, value in zip(SUMMARY_VALUE_FIELDS, parts[6:29]):
+    for field, value in zip(SUMMARY_VALUE_FIELDS, parts[6:SUMMARY_FIELD_COUNT]):
         row[field] = clean(value)
 
 

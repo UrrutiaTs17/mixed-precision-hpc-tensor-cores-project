@@ -2473,6 +2473,7 @@ static void emit_csv_summary_row(const char* route,
                                  double gflops,
                                  const std::string& speedup_cpu,
                                  const std::string& speedup_fp32,
+                                 const std::string& speedup_fp64_gpu,
                                  const std::string& t_kernel_ms,
                                  const std::string& t_convert_ms,
                                  const std::string& t_checkpoint_ms,
@@ -2488,7 +2489,8 @@ static void emit_csv_summary_row(const char* route,
     std::cout << "CSV_SUMMARY," << route << "," << nx << "," << ny << "," << iters << ","
               << kahan_label(kahan) << "," << fmt_csv_num(t_iter_ms) << ","
               << fmt_csv_num(t_iter_ms * iters) << "," << fmt_csv_num(gflops) << ","
-              << speedup_cpu << "," << speedup_fp32 << "," << t_kernel_ms << ","
+              << speedup_cpu << "," << speedup_fp32 << "," << speedup_fp64_gpu << ","
+              << t_kernel_ms << ","
               << t_convert_ms << "," << t_checkpoint_ms << ","
               << fmt_csv_error_num(err, err.rel_l2) << ","
               << fmt_csv_error_num(err, err.rel_linf) << ","
@@ -3172,6 +3174,41 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                                                     ckpt, "GPU_FP32", onset_gpu_fp32,
                                                     first_nf_gpu_fp32, t_checkpoint_ms_gpu_fp32,
                                                     e_gpu_fp32);
+
+    // Ruta GPU_FP64: referencia de maxima precision EN GPU. Se MIDE aqui, justo
+    // despues de GPU_FP32 y antes de las rutas WMMA, para que su ventana de
+    // energia caiga en el mismo regimen termico que el resto de rutas GPU de la
+    // corrida (una referencia medida al final, con la GPU ya caliente, sesgaria
+    // a la baja todo speedup y toda razon de energia calculada contra ella). Se
+    // REPORTA mas abajo, en su posicion de salida de siempre: adelantar solo la
+    // medicion es lo que permite que la fila GPU_FP32 -- que se emite antes --
+    // ya pueda citar speedup_fp64_gpu contra esta referencia.
+    bool ran_gpu_fp64 = false;
+    int onset_gpu_fp64 = -1;
+    int first_nf_gpu_fp64 = INT_MAX;
+    std::vector<double> y_gpu_fp64;
+    double t_checkpoint_ms_gpu_fp64 = 0.0;
+    EnergyMeasurement e_gpu_fp64;
+    Metrics gpu_fp64;
+    if (opt.fp64_gpu) {
+        ran_gpu_fp64 = true;
+        gpu_fp64 = benchmark_gpu_fp64_stencil(
+            input, y_gpu_fp64, opt.nx, opt.ny, opt.iters, ckpt, "GPU_FP64",
+            onset_gpu_fp64, first_nf_gpu_fp64, t_checkpoint_ms_gpu_fp64, e_gpu_fp64);
+    }
+    // Denominador GPU-vs-GPU de la columna speedup_fp64_gpu. Se toma la razon de
+    // t_iter y no la de t_total porque todas las rutas de una corrida comparten
+    // el mismo iters: la razon es identica y no arrastra el redondeo del
+    // producto. Si la ruta GPU_FP64 no corrio (--fp64-gpu off) el denominador es
+    // NaN y fmt_csv_num propaga "NaN" a la columna, que es la misma disciplina
+    // que ya sigue speedup_fp32 cuando su referencia falta: nunca 0, nunca una
+    // columna omitida.
+    const double t_iter_ms_fp64_ref =
+        ran_gpu_fp64 ? gpu_fp64.ms : std::numeric_limits<double>::quiet_NaN();
+    auto speedup_fp64_gpu_field = [&](double t_iter_ms) {
+        return fmt_csv_num(t_iter_ms_fp64_ref / t_iter_ms);
+    };
+
     // Metrica primaria: contra el ground truth FP64 (objetivo especifico #3);
     // secundaria: contra la CPU FP32 (trazabilidad con corridas previas).
     const ErrorMetrics cpu_err        = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
@@ -3191,8 +3228,10 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     print_first_nonfinite("Primera iteracion no finita : ", first_nf_cpu, opt.iters);
     print_energy_metrics(e_cpu);
     std::cout << "\n";
+    // speedup_fp32 y speedup_fp64_gpu son razones GPU-vs-GPU: en la fila de la
+    // ruta de CPU salen NaN, no un numero calculado contra otro dispositivo.
     emit_csv_summary_row("CPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan,
-                         cpu.ms, cpu.gflops, fmt_csv_num(1.0), "NaN",
+                         cpu.ms, cpu.gflops, fmt_csv_num(1.0), "NaN", "NaN",
                          "NaN", "NaN", "NaN", cpu_err, first_nf_cpu,
                          "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_cpu);
     emit_csv_energy_row("CPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan, e_cpu,
@@ -3207,6 +3246,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                                first_nf_gpu_fp32, opt.iters, t_checkpoint_ms_gpu_fp32);
     emit_csv_summary_row("GPU_FP32", opt.nx, opt.ny, opt.iters, opt.kahan,
                          gpu.ms, gpu.gflops, fmt_csv_num(cpu.ms / gpu.ms), fmt_csv_num(1.0),
+                         speedup_fp64_gpu_field(gpu.ms),
                          "NaN", "NaN", fmt_csv_num(t_checkpoint_ms_gpu_fp32),
                          gpu_err, first_nf_gpu_fp32,
                          "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", e_gpu_fp32);
@@ -3227,28 +3267,15 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                      energy_field(!under_ncu && e_gpu_fp32.gpu_valid, e_gpu_fp32.edp));
     }
 
-    // Ruta GPU_FP64: referencia de maxima precision EN GPU. Corre justo despues
-    // de GPU_FP32 y antes de las rutas WMMA para que su ventana de energia caiga
-    // en el mismo regimen termico que el resto de rutas GPU de la corrida (una
-    // referencia medida al final, con la GPU ya caliente, sesgaria a la baja
-    // todo speedup y toda razon de energia calculada contra ella).
+    // Reporte de la ruta GPU_FP64 (medida mas arriba, ver el comentario del
+    // bloque que la ejecuta).
     //
     // El error se mide con compare_fp64_ref_vs_fp64 contra el MISMO ground truth
     // FP64 de CPU que usan las demas rutas: no es una comparacion trivial contra
     // si misma, porque el kernel y el bucle de CPU no son bit a bit identicos
     // (el kernel puede contraer 0.25*s - c en un FMA). Lo que mide es
     // exactamente el piso de error alcanzable en GPU para este operador.
-    bool ran_gpu_fp64 = false;
-    int onset_gpu_fp64 = -1;
-    int first_nf_gpu_fp64 = INT_MAX;
-    if (opt.fp64_gpu) {
-        ran_gpu_fp64 = true;
-        std::vector<double> y_gpu_fp64;
-        double t_checkpoint_ms_gpu_fp64 = 0.0;
-        EnergyMeasurement e_gpu_fp64;
-        const Metrics gpu_fp64 = benchmark_gpu_fp64_stencil(
-            input, y_gpu_fp64, opt.nx, opt.ny, opt.iters, ckpt, "GPU_FP64",
-            onset_gpu_fp64, first_nf_gpu_fp64, t_checkpoint_ms_gpu_fp64, e_gpu_fp64);
+    if (ran_gpu_fp64) {
         const ErrorMetrics gpu_fp64_err = compare_fp64_ref_vs_fp64(y_ref, y_gpu_fp64);
         // Estado final promovido a FP32 solo para la comparacion contra la CPU
         // FP32 (columna de trazabilidad); no toca y_gpu_fp64 ni ninguna metrica
@@ -3276,6 +3303,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         emit_csv_summary_row("GPU_FP64", opt.nx, opt.ny, opt.iters, opt.kahan,
                              gpu_fp64.ms, gpu_fp64.gflops,
                              fmt_csv_num(cpu.ms / gpu_fp64.ms), fmt_csv_num(gpu.ms / gpu_fp64.ms),
+                             speedup_fp64_gpu_field(gpu_fp64.ms),
                              "NaN", "NaN", fmt_csv_num(t_checkpoint_ms_gpu_fp64),
                              gpu_fp64_err, first_nf_gpu_fp64,
                              "NaN", "NaN",
@@ -3385,6 +3413,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         emit_csv_summary_row(route_fp16, opt.nx, opt.ny, opt.iters, opt.kahan,
                              tc_fp16.ms, tc_fp16.gflops,
                              fmt_csv_num(cpu.ms / tc_fp16.ms), fmt_csv_num(gpu.ms / tc_fp16.ms),
+                             speedup_fp64_gpu_field(tc_fp16.ms),
                              fmt_csv_num(t_wmma_ms_fp16), fmt_csv_num(t_conv_ms_fp16),
                              fmt_csv_num(t_checkpoint_ms_fp16), tc_fp16_err, first_nf_fp16,
                              fmt_csv_error_num(tc_fp16_prop_err, tc_fp16_prop_err.rel_l2),
@@ -3470,6 +3499,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         emit_csv_summary_row(route_bf16, opt.nx, opt.ny, opt.iters, opt.kahan,
                              tc_bf16.ms, tc_bf16.gflops,
                              fmt_csv_num(cpu.ms / tc_bf16.ms), fmt_csv_num(gpu.ms / tc_bf16.ms),
+                             speedup_fp64_gpu_field(tc_bf16.ms),
                              fmt_csv_num(t_wmma_ms_bf16), fmt_csv_num(t_conv_ms_bf16),
                              fmt_csv_num(t_checkpoint_ms_bf16), tc_bf16_err, first_nf_bf16,
                              fmt_csv_error_num(tc_bf16_prop_err, tc_bf16_prop_err.rel_l2),
