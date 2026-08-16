@@ -158,6 +158,13 @@ fi
 # despreciable frente a los 32G que pide el job (uso actual ~7 GB).
 FP64_GPU="${FP64_GPU:-on}"
 
+# Ruta CPU_FP64: cronometra el patron de oro IEEE 754 (double serial en CPU),
+# referencia de COSTO del proyecto. Implica una segunda pasada FP64 sobre la
+# malla, separada del ground truth para no heredar su instrumentacion; en este
+# barrido de horizonte los ITERS son altos, asi que es la parte mas cara.
+# CPU_FP64=off la omite.
+CPU_FP64="${CPU_FP64:-on}"
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
@@ -181,11 +188,12 @@ TIMEFORMAT=">>> Tiempo real de la corrida: %R s (user %U, sys %S)"
 for KAHAN in ${KAHAN_LIST}; do
     echo
     echo "============================================================"
-    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}, FP64_GPU=${FP64_GPU}"
+    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}, FP64_GPU=${FP64_GPU}, CPU_FP64=${CPU_FP64}"
     echo "============================================================"
     time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
           --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
-          --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}"
+          --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}" \
+          --cpu-fp64 "${CPU_FP64}"
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 

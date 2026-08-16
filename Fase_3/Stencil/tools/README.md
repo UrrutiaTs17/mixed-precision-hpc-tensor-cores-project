@@ -23,6 +23,34 @@ the corresponding capture failed. It is not an interpolated or smoothed value.
 RAPL counters are cumulative and may show only small raw changes for very
 short benchmarks.
 
+### Reference routes and speedups
+
+Every run emits one row per route, and a full run covers all of them:
+`CPU_FP32`, `CPU_FP64`, `GPU_FP32`, `GPU_FP64`, and the two WMMA routes (either
+`WMMA_FP16`/`WMMA_BF16` with `kahan` off or on, or `WMMA_FP16_SP`/`WMMA_BF16_SP`
+under spatial compensation — see below). Each row carries its own raw
+`t_iter_ms`, `t_total_ms`, `gflops` and energy.
+
+**Speedups against an FP64 reference are not emitted as columns.** They are
+ratios of `t_total_ms` between two rows of the same `(job_id, nx, ny, iters,
+kahan)` group, and they are computed downstream in the analysis, from the raw
+times. Only the two historical columns remain: `speedup_cpu` (against
+`CPU_FP32`) and `speedup_fp32` (against `GPU_FP32`, `NaN` on CPU rows).
+
+The `CPU_FP64` route is a **second** FP64 pass over the grid, separate from the
+ground-truth computation that feeds every error column. The ground-truth loop
+also sweeps the grid twice more per iteration (for the overflow-horizon norm and
+the checkpoint finiteness test) and has no warm-up, so timing it would report a
+CPU FP64 cost several times higher than the real one and inflate every speedup
+measured against it. `--cpu-fp64 off` (`CPU_FP64=off` in both sbatch scripts)
+skips the route; the error columns are unaffected either way.
+
+Note that error metrics and energy metrics need **opposite** `ITERS` regimes.
+Errors are only evaluable below the overflow horizon of the format involved
+(FP16 ≈ 29, FP32 and BF16 ≈ 142, FP64 ≈ 1045 at the seeded initial condition),
+while a reliable energy window needs `ITERS` large enough to clear the 500 ms
+threshold below. A single sweep cannot serve both.
+
 ### `energy_gpu_j_per_iter` and `energy_window_reliable`
 
 NVML's energy counter is fed by the onboard power sensor, which refreshes every
