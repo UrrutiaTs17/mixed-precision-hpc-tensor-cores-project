@@ -181,6 +181,17 @@ NY="${NY:-16384}"
 #   sbatch --export=ALL,FP64_GPU=off run_stencil_tc.sbatch
 FP64_GPU="${FP64_GPU:-on}"
 
+# Ruta CPU_FP64: cronometra el patron de oro IEEE 754 (double serial en CPU),
+# referencia de COSTO del proyecto. El ERROR contra FP64 de CPU se mide siempre
+# (es el ground truth de todas las rutas); esta ruta agrega su TIEMPO y su
+# ENERGIA. Cuesta una segunda pasada FP64 sobre la malla, independiente del
+# ground truth para no heredar su instrumentacion, asi que a ITERS grandes es
+# la parte mas cara de la corrida: a 4096^2 escala igual que la referencia FP64
+# que ya se paga, es decir, aproximadamente la duplica.
+# CPU_FP64=off la omite (barridos donde solo interesan las rutas GPU):
+#   sbatch --export=ALL,CPU_FP64=off run_stencil_tc.sbatch
+CPU_FP64="${CPU_FP64:-on}"
+
 # Definiciones compartidas de perfilado (NCU_QUICK_METRICS). Se declara una
 # sola vez en tools/common_ncu.sh (fuera de cualquier Fase_N) y se reutiliza
 # entre los .sbatch de todas las fases; este script corre desde
@@ -253,7 +264,7 @@ echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "NVCC_FLAGS=${NVCC_FLAGS}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP64_GPU=${FP64_GPU}"
+echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP64_GPU=${FP64_GPU} CPU_FP64=${CPU_FP64}"
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no
@@ -381,7 +392,8 @@ for run in "${RUNS[@]}"; do
         # kernel bajo perfil solo alargaria cada llamada a ncu.
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
             --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
-            --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}"
+            --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}" \
+            --cpu-fp64 "${CPU_FP64}"
 
         if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego

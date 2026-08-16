@@ -13,7 +13,6 @@ DRIFT_HEADER = [
 SUMMARY_HEADER = [
     "job_id", "kernel", "nx", "ny", "iters", "kahan", "route",
     "t_iter_ms", "t_total_ms", "gflops", "speedup_cpu", "speedup_fp32",
-    "speedup_fp64_gpu",
     "t_kernel_ms", "t_convert_ms", "t_checkpoint_ms", "rel_l2",
     "rel_linf", "max_abs", "rel_l2_prop", "rel_linf_prop",
     "first_nonfinite", "store_rel_norm", "store_rel_max_guarded",
@@ -143,21 +142,26 @@ def handle_drift(parts, rows, summary_rows, summary_by_route, context, job_id, k
     rows.append(row)
 
 
-# Campos de una linea CSV_SUMMARY contando el token inicial. speedup_fp64_gpu se
-# inserto justo despues de speedup_fp32, en la posicion 11, de modo que un log
-# anterior a esa columna trae 29 campos en vez de 30. Rellenarlo por la derecha
-# con pad() leeria todo el esquema corrido una posicion (t_kernel_ms entraria en
-# speedup_fp64_gpu, y asi hasta el final), asi que se le abre el hueco en su
-# sitio antes de repartir los valores.
-SUMMARY_FIELD_COUNT = 30
-SUMMARY_LEGACY_FIELD_COUNT = 29
-SPEEDUP_FP64_GPU_INDEX = 11
+# Campos de una linea CSV_SUMMARY contando el token inicial. El binario llego a
+# emitir dos columnas derivadas, speedup_fp64_gpu y speedup_fp64_cpu, en las
+# posiciones 11 y 12 (justo tras speedup_fp32); se retiraron porque el speedup
+# contra una referencia FP64 se calcula en el analisis a partir de los tiempos
+# crudos, que es lo que el CSV publica. Los logs generados mientras existieron
+# traen 30 o 31 campos en vez de 29: truncarlos por la derecha con pad() dejaria
+# esas columnas ocupando el sitio de t_kernel_ms y correria todo el resto del
+# esquema, asi que se descartan en su posicion, de la mas reciente a la mas
+# antigua para que los indices no se muevan bajo los pies.
+SUMMARY_FIELD_COUNT = 29
+# (numero de campos del log heredado, indice de la columna sobrante). Las reglas
+# encadenan: una linea de 31 pierde la 12 con la primera, queda en 30 y pierde la
+# 11 con la segunda.
+SUMMARY_LEGACY_DROPS = [(31, 12), (30, 11)]
 
 
 def handle_summary(parts, rows, summary_by_route, context, job_id, kernel):
-    if len(parts) == SUMMARY_LEGACY_FIELD_COUNT:
-        parts = (parts[:SPEEDUP_FP64_GPU_INDEX] + ["NaN"]
-                 + parts[SPEEDUP_FP64_GPU_INDEX:])
+    for legacy_count, drop_at in SUMMARY_LEGACY_DROPS:
+        if len(parts) == legacy_count:
+            parts = parts[:drop_at] + parts[drop_at + 1:]
     parts = pad(parts, SUMMARY_FIELD_COUNT)
     route = clean(parts[1])
     context["nx"] = clean(parts[2])
