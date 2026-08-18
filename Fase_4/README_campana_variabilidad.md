@@ -77,7 +77,10 @@ git status --porcelain      # limpio en archivos versionados
 ```
 
 El lanzador, en este orden: verifica rama, commit y que los fuentes que congela
-estén limpios; consulta los límites **reales** (`scontrol show partition`,
+estén limpios —tolera los artefactos que dejan las corridas previas
+(`stencil_tc`, `logs/`, `results/`, reportes de `ncu`) y acepta un HEAD
+posterior al commit calibrado siempre que los fuentes de la campaña sean
+idénticos a los que midieron los jobs 5200/5201—; consulta los límites **reales** (`scontrol show partition`,
 `scontrol show config` para `MaxArraySize`, `sacctmgr` para `MaxSubmitJobs`) y
 aborta si el walltime no cabe en el `MaxTime` de la partición o si el array
 excede `MaxArraySize`; crea `Fase_4/f4_variabilidad_15r_<FECHA>/` (directorio
