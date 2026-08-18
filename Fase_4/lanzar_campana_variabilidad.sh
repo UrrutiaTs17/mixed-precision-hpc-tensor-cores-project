@@ -100,20 +100,64 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
 fi
 
 # Los fuentes que la campana congela deben estar limpios ademas de versionados:
-# un fichero sin seguimiento ahi dentro cambiaria lo que se compila.
+# un fichero sin seguimiento ahi dentro podria cambiar lo que se compila.
 FUENTES=(Fase_3/Stencil Fase_2/common.cuh tools/common_ncu.sh)
-SUCIO_FUENTES="$(git status --porcelain -- "${FUENTES[@]}")"
+
+# ...salvo los ARTEFACTOS que toda corrida previa deja en Fase_3/Stencil (el
+# binario compilado, logs/, results/, reportes de ncu). En PACCA estan siempre
+# presentes y no alteran lo que se compila: se listan, pero no abortan.
+es_artefacto() {
+    case "$1" in
+        Fase_3/Stencil/stencil_tc|\
+        Fase_3/Stencil/logs|Fase_3/Stencil/logs/|Fase_3/Stencil/logs/*|\
+        Fase_3/Stencil/results|Fase_3/Stencil/results/|Fase_3/Stencil/results/*|\
+        *.out|*.err|*.log|*.ncu-rep|*.nsys-rep|*.qdrep|*__pycache__*) return 0 ;;
+    esac
+    return 1
+}
+
+SUCIO_FUENTES=""
+ARTEFACTOS=""
+while IFS= read -r _linea; do
+    [[ -z "${_linea}" ]] && continue
+    _estado="${_linea:0:2}"
+    _ruta="${_linea:3}"
+    _ruta="${_ruta#\"}"; _ruta="${_ruta%\"}"
+    if [[ "${_estado}" == "??" ]] && es_artefacto "${_ruta}"; then
+        ARTEFACTOS+="${_linea}"$'\n'
+    else
+        SUCIO_FUENTES+="${_linea}"$'\n'
+    fi
+done < <(git status --porcelain -- "${FUENTES[@]}")
+
 if [[ -n "${SUCIO_FUENTES}" ]]; then
     msg "Cambios (o ficheros sin seguimiento) en los fuentes de la campana:"
-    printf '%s\n' "${SUCIO_FUENTES}"
+    printf '%s' "${SUCIO_FUENTES}"
     die "los fuentes que se congelan no estan limpios; no se lanza."
 fi
+if [[ -n "${ARTEFACTOS}" ]]; then
+    msg "[i] Artefactos de corridas anteriores en los fuentes (no se congelan, no bloquean):"
+    printf '%s' "${ARTEFACTOS}" | sed 's/^/      /'
+fi
 
+# Calibracion del walltime: lo que importa no es que HEAD sea exactamente el
+# commit calibrado, sino que los FUENTES de la campana sean los mismos que
+# midieron los jobs 5200/5201. Un commit posterior que solo toque Fase_4 (o el
+# README) no invalida nada.
 if [[ "${COMMIT}" != "${COMMIT_CALIBRADO}" ]]; then
-    msg "AVISO: HEAD=${COMMIT}"
-    msg "       El walltime se calibro sobre ${COMMIT_CALIBRADO} (jobs 5200/5201)."
-    msg "       Exporte ACEPTAR_COMMIT_DISTINTO=1 si aun asi desea lanzar."
-    [[ "${ACEPTAR_COMMIT_DISTINTO:-0}" == "1" ]] || die "commit distinto al calibrado"
+    if git rev-parse --verify --quiet "${COMMIT_CALIBRADO}^{commit}" >/dev/null &&
+       git diff --quiet "${COMMIT_CALIBRADO}" HEAD -- "${FUENTES[@]}"; then
+        msg "[i] HEAD=${COMMIT}"
+        msg "    != commit calibrado ${COMMIT_CALIBRADO}, pero los fuentes de la"
+        msg "    campana son IDENTICOS a los de ese commit: el walltime calibrado"
+        msg "    sobre los jobs 5200/5201 sigue siendo valido."
+    else
+        msg "AVISO: HEAD=${COMMIT}"
+        msg "       Los fuentes difieren de ${COMMIT_CALIBRADO}, sobre el que se"
+        msg "       calibro el walltime (jobs 5200/5201)."
+        msg "       Exporte ACEPTAR_COMMIT_DISTINTO=1 si aun asi desea lanzar."
+        [[ "${ACEPTAR_COMMIT_DISTINTO:-0}" == "1" ]] || die "fuentes distintos a los calibrados"
+    fi
 fi
 
 command -v sbatch >/dev/null || die "sbatch no disponible: ejecute este script en PACCA"
