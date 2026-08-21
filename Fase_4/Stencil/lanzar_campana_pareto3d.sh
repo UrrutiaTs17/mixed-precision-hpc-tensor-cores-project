@@ -36,7 +36,17 @@
 #
 # Variables reconocidas (todas con default): NX NY OP_MODE ALPHA CI_MODE CI_P
 #   FP64_GPU CPU_FP64 CAMPAIGN_ID WALL_EXPLORATORIO WALL_ENERGY WALL_NUMERIC
-#   CHECKPOINT_ITERS ARCHIVE_ITERS DRY_RUN
+#   CHECKPOINT_ITERS ARCHIVE_ITERS DRY_RUN SBATCH_EXTRA
+#
+# SBATCH_EXTRA antepone flags a cada sbatch de la fase. Su uso previsto es
+# encadenar el piloto y la campana en una sola sesion sin esperar 6-9 h:
+#   ./lanzar_campana_pareto3d.sh piloto
+#   SBATCH_EXTRA="--dependency=afterok:$(tail -2 estado/piloto.jobs | paste -sd:)" \
+#     ./lanzar_campana_pareto3d.sh campana
+# La campana queda encolada y SLURM solo la arranca si las numericas del piloto
+# terminan bien. Ojo: eso automatiza la ESPERA, no la REVISION -- la puerta
+# estado/piloto.validado hay que crearla igual, y conviene que diga la verdad
+# sobre que no hubo revision manual.
 
 set -euo pipefail
 
@@ -72,7 +82,9 @@ rojo()  { printf '\033[31m%s\033[0m\n' "$*"; }
 verde() { printf '\033[32m%s\033[0m\n' "$*"; }
 bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 
-morir() { rojo "ERROR: $*"; exit 1; }
+# A stderr: cmd_campana llama a exigir_exploratorio_ok con >/dev/null para
+# silenciar su mensaje de exito, y en stdout eso se tragaba tambien el error.
+morir() { rojo "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Seguimiento: comandos con el JOB ID real ya sustituido
@@ -102,14 +114,24 @@ imprimir_seguimiento() {
 
 enviar() {   # imprime el comando y devuelve el job id por stdout
     local desc="$1"; shift
+    # SBATCH_EXTRA: flags sueltos que se anteponen a los del script, separados por
+    # espacios. Existe para encadenar fases sin esperar a que la anterior termine:
+    #   SBATCH_EXTRA="--dependency=afterok:123:124" ... $0 campana
+    # Se parte con `read -ra` en vez de expandir sin comillas para que un valor
+    # vacio no inyecte un argumento vacio, y se expande con la forma
+    # ${a[@]+"${a[@]}"} porque `set -u` aborta ante un array vacio en bash <4.4.
+    local extra=()
+    if [[ -n "${SBATCH_EXTRA:-}" ]]; then
+        read -ra extra <<< "${SBATCH_EXTRA}"
+    fi
     echo "  -> ${desc}" >&2
-    echo "     sbatch $*" >&2
+    echo "     sbatch ${extra[*]-} $*" >&2
     if [[ "${DRY_RUN}" == "1" ]]; then
         echo "DRYRUN$(date +%s%N | tail -c 5)"
         return 0
     fi
     local salida
-    salida="$(sbatch "$@")" || morir "sbatch fallo para ${desc}"
+    salida="$(sbatch ${extra[@]+"${extra[@]}"} "$@")" || morir "sbatch fallo para ${desc}"
     echo "${salida}" | grep -oE '[0-9]+$'
 }
 
