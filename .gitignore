@@ -72,3 +72,7 @@ out/
 
 # CLion
 cmake-build-*/
+
+# Cache de bytecode de los scripts de analisis (tools/*.py)
+__pycache__/
+*.pyc
