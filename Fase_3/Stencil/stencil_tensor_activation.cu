@@ -3968,16 +3968,45 @@ static OverflowFitResult fit_overflow_model(const std::vector<double>& linf_per_
     return result;
 }
 
+// Amplificacion por iteracion del modo Nyquist (kx = ky = pi) bajo el operador
+// activo. Es monomode_amplification evaluada en el vertice de la zona de
+// Brillouin: cos(pi) = -1, asi que g(pi,pi) = c_center - 4*c_neigh.
+//   estres   : -1 - 4*(0.25)      = -2.0     -> |g| = 2, el modo CRECE
+//   difusivo : (1-4a) - 4a        = 1 - 8a   -> |g| <= 1 para todo a en (0, 1/4]
+static double nyquist_amplification(const StencilOperator& op) {
+    return center_coeff_d(op) - 4.0 * neighbor_coeff_d(op);
+}
+
+// El horizonte de overflow solo esta definido para operadores que AMPLIFICAN el
+// modo Nyquist: es el canal por el que el ruido de redondeo crece hasta
+// desbordar el formato, y toda la prediccion de
+// compute_overflow_horizon_from_reference se apoya en ese crecimiento.
+//
+// Con |g(pi,pi)| <= 1 el modo decae y no hay nada que desbordar. Peor: el
+// ajuste log-lineal no se queda sin datos, se engancha al modo dominante que
+// SI sobreviva -- bajo la CI monomodo, el propio monomodo, cuyo lambda no tiene
+// relacion con el que la formula supone. Medido a 512^2 con alpha=3/16 y p=5:
+// lambda=0.9986 con R^2=1.000000, que es exactamente el g del monomodo
+// (0.998583) y no el g(pi,pi) = -0.5 del operador. La prediccion resultante
+// (horizonte de 16 iteraciones para FP16) es un numero bien formado y sin
+// significado, y salia etiquetado 'ok' en CSV_HORIZON.
+static bool horizon_applies(const StencilOperator& op) {
+    return std::fabs(nyquist_amplification(op)) > 1.0;
+}
+
 // Prediccion de horizonte de overflow por formato, mas el ajuste que la
 // calibro (ver OverflowFitResult). Si fit.valid es false no hay prediccion:
 // pred_* quedan en 0.0 y el llamador (print_overflow_horizon) no debe
-// imprimirlos.
+// imprimirlos. Si applicable es false tampoco la hay, por una razon distinta:
+// el operador no amplifica el modo Nyquist (ver horizon_applies).
 struct OverflowHorizonPrediction {
     OverflowFitResult fit;
     double pred_fp16 = 0.0;
     double pred_bf16 = 0.0;
     double pred_fp32 = 0.0;
     double pred_fp64 = 0.0;
+    bool applicable = true;
+    double lambda_nyquist = 0.0;
 };
 
 // Calcula horizonte de overflow predicho para cada formato, basandose en el
@@ -3992,11 +4021,18 @@ struct OverflowHorizonPrediction {
 // print_overflow_horizon.
 static OverflowHorizonPrediction compute_overflow_horizon_from_reference(
         const std::vector<double>& linf_per_iter,
-        double u0_linf) {
+        double u0_linf,
+        const StencilOperator& op) {
     OverflowHorizonPrediction result;
+    result.lambda_nyquist = nyquist_amplification(op);
+    result.applicable = horizon_applies(op);
+    // El ajuste se calcula siempre: aunque el operador sea contractivo, lambda
+    // y R^2 son un diagnostico util (delatan a que modo se engancho). Lo que no
+    // se calcula en ese caso es la prediccion, que es la parte que careceria de
+    // significado.
     result.fit = fit_overflow_model(linf_per_iter);
-    if (!result.fit.valid) {
-        return result;  // sin ajuste: ninguna prediccion es confiable
+    if (!result.applicable || !result.fit.valid) {
+        return result;  // sin horizonte definido, o sin ajuste confiable
     }
 
     const double A = result.fit.A;
@@ -4006,10 +4042,12 @@ static OverflowHorizonPrediction compute_overflow_horizon_from_reference(
     const double semilla_fp64 = std::max(A, kFp64SeedFloor * u0_linf);
 
     // Calculos en espacio logaritmico, nunca divide (previene overflow en FP64).
-    // La formula asume implicitamente log2(lambda) = 1 (lambda = 2.0, el
-    // valor teorico del operador en (pi,pi)): si el ajuste diverge de eso,
-    // print_overflow_horizon emite ADVERTENCIA pero la prediccion sigue
-    // usando 2.0, nunca el lambda_medido fuera de rango.
+    // La formula asume implicitamente log2(lambda) = 1, es decir lambda = 2.0:
+    // el g(pi,pi) del operador de estres, unico operador en alcance que
+    // amplifica el modo Nyquist (el difusivo tiene |g(pi,pi)| = |1-8a| <= 1 y
+    // horizon_applies ya lo filtro arriba). Si el ajuste diverge de ese 2.0,
+    // print_overflow_horizon emite ADVERTENCIA pero la prediccion sigue usando
+    // el valor teorico, nunca el lambda_medido fuera de rango.
     result.pred_fp16 = std::log2(kFp16Max) - std::log2(semilla_fp16);
     result.pred_bf16 = std::log2(kBf16Max) - std::log2(semilla_bf16);
     result.pred_fp32 = std::log2(kFp32Max) - std::log2(semilla_fp32);
@@ -4040,6 +4078,24 @@ static void print_overflow_horizon(const OverflowHorizonPrediction& horizon,
                                    bool ran_gpu_fp64, int n_gpu_fp64) {
     std::cout << "=========== HORIZONTE DE OVERFLOW (Fase 3) ===========\n";
     const OverflowFitResult& fit = horizon.fit;
+    if (!horizon.applicable) {
+        std::cout << "NO APLICA: el operador contrae el modo Nyquist, g(pi,pi) = "
+                  << fmt_sci(horizon.lambda_nyquist) << " (|g| <= 1).\n"
+                     "El horizonte de overflow solo esta definido para operadores que lo\n"
+                     "AMPLIFICAN: sin crecimiento no hay formato que desbordar. No se predice\n"
+                     "horizonte; las filas CSV_HORIZON salen con NaN y estado\n"
+                     "'contractive_operator'.\n";
+        if (fit.valid) {
+            // Se imprime como diagnostico, con la etiqueta que impide leerlo
+            // como el modo Nyquist: bajo un operador contractivo el ajuste se
+            // engancha al modo dominante que sobreviva, no a Nyquist.
+            std::cout << "  Ajuste asintotico (modo dominante, NO Nyquist): n=" << fit.n_points
+                      << " puntos, R^2=" << fmt_sci(fit.r_squared)
+                      << ", lambda=" << fmt_sci(fit.lambda) << "\n";
+        }
+        std::cout << "=======================================================\n\n";
+        return;
+    }
     if (!fit.valid) {
         std::cout << "AJUSTE NO DISPONIBLE (se requieren >=" << kMinOverflowFitPoints
                   << " iteraciones finitas de referencia FP64 en la ventana asintotica"
@@ -4074,8 +4130,14 @@ static void print_overflow_horizon(const OverflowHorizonPrediction& horizon,
     std::cout << "    FP32                             : " << std::scientific << kFp32SeedFloor << "\n";
     std::cout << "    FP64                             : " << std::scientific << kFp64SeedFloor << "\n";
 
-    if (std::fabs(fit.lambda - 2.0) / 2.0 > 0.05) {
-        std::cout << "  ADVERTENCIA: lambda_medido diverge >5% del valor teorico 2.0\n"
+    // El valor teorico se toma del operador activo y no de un 2.0 fijo. Con el
+    // 2.0 cableado, el operador difusivo disparaba esta advertencia diciendo
+    // "revisar la formula del stencil" cuando la formula era correcta y lo
+    // erroneo era la referencia contra la que se comparaba.
+    const double lambda_teorico = std::fabs(horizon.lambda_nyquist);
+    if (std::fabs(fit.lambda - lambda_teorico) / lambda_teorico > 0.05) {
+        std::cout << "  ADVERTENCIA: lambda_medido diverge >5% del valor teorico "
+                  << fmt_sci(lambda_teorico) << "\n"
                   << "  Revisar condicion inicial o formula del stencil.\n";
     }
     std::cout << "=======================================================\n\n";
@@ -4093,12 +4155,20 @@ static void emit_csv_horizon_row(const char* format,
                                  double predicted,
                                  int measured_n,
                                  const OverflowFitResult& fit,
+                                 bool applicable,
                                  double a_nyq_ic,
                                  double seed_floor) {
     const bool fit_ok = fit.valid;
+    // h_predicho solo se emite si ADEMAS el horizonte esta definido para el
+    // operador activo. lambda/R^2/A si se emiten aunque no lo este: son el
+    // ajuste medido, no una prediccion derivada de el. El numero de columnas no
+    // cambia en ningun caso -- extract_csv.py cuenta campos.
+    const bool pred_ok = fit_ok && applicable;
+    const char* estado = !applicable ? "contractive_operator"
+                                     : (fit_ok ? "ok" : "insufficient_points");
     std::cout << "CSV_HORIZON," << format << "," << nx << "," << ny << "," << iters << ","
               << kahan_label(kahan) << ","
-              << (fit_ok ? fmt_csv_num(predicted) : "NaN") << ","
+              << (pred_ok ? fmt_csv_num(predicted) : "NaN") << ","
               << csv_measured_horizon_field(measured_n) << ","
               << (fit_ok ? fmt_csv_num(fit.lambda) : "NaN") << ","
               << (fit_ok ? fmt_csv_num(fit.r_squared) : "NaN") << ","
@@ -4106,7 +4176,7 @@ static void emit_csv_horizon_row(const char* format,
               << (fit_ok ? fmt_csv_num(fit.A) : "NaN") << ","
               << fmt_csv_num(a_nyq_ic) << ","
               << fmt_csv_num(seed_floor) << ","
-              << (fit_ok ? "ok" : "insufficient_points") << "\n";
+              << estado << "\n";
 }
 
 static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
@@ -4131,14 +4201,14 @@ static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
     // etiqueta.
     emit_csv_horizon_row(wmma_route_label(comp_mode, "FP16", "FP16_SP"),
                          nx, ny, iters, kahan, horizon.pred_fp16, n_fp16,
-                         fit, a_nyq_ic, kFp16SeedFloor);
+                         fit, horizon.applicable, a_nyq_ic, kFp16SeedFloor);
     emit_csv_horizon_row(wmma_route_label(comp_mode, "BF16", "BF16_SP"),
                          nx, ny, iters, kahan, horizon.pred_bf16, n_bf16,
-                         fit, a_nyq_ic, kBf16SeedFloor);
+                         fit, horizon.applicable, a_nyq_ic, kBf16SeedFloor);
     emit_csv_horizon_row("FP32", nx, ny, iters, kahan, horizon.pred_fp32, n_gpu_fp32,
-                         fit, a_nyq_ic, kFp32SeedFloor);
+                         fit, horizon.applicable, a_nyq_ic, kFp32SeedFloor);
     emit_csv_horizon_row("FP64", nx, ny, iters, kahan, horizon.pred_fp64, n_fp64,
-                         fit, a_nyq_ic, kFp64SeedFloor);
+                         fit, horizon.applicable, a_nyq_ic, kFp64SeedFloor);
     // Fila de la RUTA GPU_FP64, distinta de la fila "FP64" de arriba (que es la
     // referencia FP64 de CPU). Se etiqueta con el nombre de ruta completo y no
     // con un nombre de formato porque es lo que la desambigua de esa otra fila
@@ -4148,7 +4218,7 @@ static void emit_csv_horizon_rows(const OverflowHorizonPrediction& horizon,
     // diverguio".
     if (ran_gpu_fp64) {
         emit_csv_horizon_row("GPU_FP64", nx, ny, iters, kahan, horizon.pred_fp64, n_gpu_fp64,
-                             fit, a_nyq_ic, kFp64SeedFloor);
+                             fit, horizon.applicable, a_nyq_ic, kFp64SeedFloor);
     }
 }
 
@@ -4898,7 +4968,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     // Calibracion del horizonte de overflow desde la referencia FP64: ajuste
     // de modelo log-lineal en el regimen asintotico (ver OverflowFitResult).
     const OverflowHorizonPrediction horizon =
-        compute_overflow_horizon_from_reference(linf_per_iter, u0_linf);
+        compute_overflow_horizon_from_reference(linf_per_iter, u0_linf, op);
 
     print_overflow_horizon(horizon, a_nyq,
                           first_nf_fp16, first_nf_bf16, first_nf_gpu_fp32, first_nf_fp64_ref,
