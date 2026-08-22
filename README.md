@@ -22,38 +22,51 @@ Este proyecto investiga el impacto numérico y energético de la computación en
 ## Fases del Proyecto
 
 1. **Fase 1**: Construcción de línea base analítica (FP64 y FP32)
-2. **Fase 2**: Integración de precisión mixta y activación de Tensor Cores
-3. **Fase 3**: Cuantificación del drift numérico y suma compensada (Kahan)
-4. **Fase 4**: Telemetría energética y análisis del Frente de Pareto
+2. **Fase 2**: Integración de precisión mixta y activación de Tensor Cores (throughput, sin encadenar iteraciones)
+3. **Fase 3**: Encadenamiento genuino de iteraciones en el Stencil 2D (salida(i) → entrada(i+1)) para cuantificar drift numérico acumulado, horizonte de overflow por formato y consumo energético (NVML), comparando suma compensada Kahan local frente a compensación espacial
+4. **Fase 4**: Campañas de variabilidad estadística y análisis del Frente de Pareto 3D (rendimiento-energía-error) sobre el operador de estrés difusivo
 
 ## Herramientas Utilizadas
 
 - **Compilador**: NVIDIA nvcc (CUDA)
 - **Bibliotecas**: cuBLAS, cuDNN, CUTLASS
 - **Profiling**: NVIDIA Nsight Compute
-- **Telemetría**: NVML (GPU), RAPL (CPU)
-- **Métricas**: Normas L₂ y L∞, Energy-Delay Product (EDP)
+- **Telemetría**: NVML (GPU, por contador de energía de 2 lecturas), RAPL (CPU)
+- **Post-procesamiento**: Python 3 (biblioteca estándar) para extracción y resumen de CSV
+- **Métricas**: Normas L₂ y L∞, horizonte de overflow (n*), Energy-Delay Product (EDP)
+- **Ejecución**: SLURM (sbatch) sobre el clúster PACCA — la compilación CUDA no se realiza en local
 
 ## Estructura del Repositorio
 
 ```
 mixed-precision-hpc-tensor-cores-project/
-├── Fase_1/                  # Línea base analítica
-│   ├── GEMM/
-│   ├── Convolution/
-│   └── Stencil2D/
-├── Fase_2/                  # Precisión mixta y activación de Tensor Cores
+├── Fase_1/                        # Línea base analítica (FP64 y FP32)
+│   ├── GEMM/                      # gemm_compare_balanced.cu + run_gemm_fase1.sbatch
+│   ├── Convolution/                # cudnn_conv_balanced.cu + run_conv_fase1.sbatch
+│   └── Stencil2D/                  # stencil2d_baseline.cu + run_stencil_fase1.sbatch
+├── Fase_2/                        # Precisión mixta y activación de Tensor Cores
 │   ├── GEMM/
 │   ├── Convolution/
 │   ├── Stencil/
-│   └── common.cuh           # Utilidades compartidas (CHECK_CUDA, timer, métricas)
-├── Fase_3/                  # Cuantificación del drift numérico (encadenamiento genuino)
+│   ├── common.cuh                  # Utilidades compartidas (CHECK_CUDA, CudaEventTimer, Metrics, ErrorMetrics, compare_*)
+│   └── telemetry.cuh
+├── Fase_3/                        # Encadenamiento genuino: drift, horizonte de overflow y energía
 │   └── Stencil/
+│       ├── stencil_tensor_activation.cu  # rutas CPU_FP32/FP64, GPU_FP32/FP64 y WMMA FP16/BF16 (Kahan local o compensación espacial)
+│       ├── run_stencil_tc.sbatch         # barrido de métricas dentro del horizonte finito (checkpoints, energía NVML)
+│       ├── run_stencil_horizon.sbatch    # medición del horizonte de overflow real por formato
+│       ├── stencil_jobs.sh               # orquestador de la campaña de cierre (sub-campañas, ver --help)
+│       └── tools/
+│           ├── extract_csv.py            # separa el log de cada job en CSV de drift/horizonte/energía/resumen
+│           ├── power_sampling.h          # energía GPU vía contador NVML (2 lecturas, sin hilo de muestreo)
+│           └── README.md                 # semántica detallada de columnas CSV y de las rutas de referencia
 ├── tools/
 │   └── common_ncu.sh        # Definiciones compartidas de perfilado con Nsight Compute
 ├── README.md
 └── .gitignore
 ```
+
+> Fase 4 se desarrolla en la rama `fase4-estadistica-variabilidad` y aún no se integra a `main`.
 
 ## Ambiente Requerido
 
@@ -62,19 +75,24 @@ mixed-precision-hpc-tensor-cores-project/
 - cuBLAS y cuDNN compatible con CUDA
 - Herramientas de profiling de NVIDIA
 
-## Compilación
+## Compilación y Ejecución
+
+La compilación y ejecución de los kernels CUDA se realiza en el clúster PACCA vía SLURM, no en local:
 
 ```bash
-# Con nvcc en el directorio respectivo
-nvcc -O3 kernel.cu -o kernel_executable -lcublas
+# Desde el directorio de la fase correspondiente
+sbatch run_stencil_tc.sbatch
 ```
+
+Cada `.sbatch` invoca `nvcc` con los flags de arquitectura y enlazado (cuBLAS, cuDNN, NVML) que correspondan a esa fase.
 
 ## Métricas Principales
 
-- **Throughput (TFLOPS)**: Operaciones en punto flotante por segundo
-- **Latencia**: Tiempo de ejecución
-- **EDP (Energy-Delay Product)**: Producto energía × tiempo
-- **Error Numérico**: Desviación respecto a FP64 (referencia)
+- **Throughput (TFLOPS/GFLOPS)**: Operaciones en punto flotante por segundo
+- **Latencia**: Tiempo de ejecución por iteración y total
+- **Horizonte de overflow (n\*)**: Iteración en la que una ruta deja de ser finita
+- **EDP (Energy-Delay Product)** y **energía por iteración**: Producto energía × tiempo y consumo GPU normalizado
+- **Error Numérico**: Desviación (L₂, L∞) respecto al patrón FP64 (referencia)
 
 ## Equipo
 

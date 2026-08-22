@@ -182,6 +182,9 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
         "1 64 64 64 64 3 3 1 1 1 1 1 1 2"
     )
 else
+    # La ruta 2 (cuDNN "clasico") corre con CUDNN_FMA_MATH desde el codigo, de
+    # modo que el speedup TC se mide contra FP32 escalar y no contra TF32, que
+    # es lo que cuDNN elige por defecto en Ampere.
     # N=1 en ambas corridas: con launch-skip=3, NCU salta exactamente los 3
     # warmups del benchmark (1 llamada wmma_gemm_kernel por iteracion con N=1).
     # Run 1: M=1024, N=65536, K=9216  -> ~1236 GFLOPs -> ~6.6 ms por kernel en A100
