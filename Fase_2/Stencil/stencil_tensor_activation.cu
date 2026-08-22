@@ -45,6 +45,17 @@ using namespace nvcuda;
 
 constexpr int kTile = 16;
 constexpr int kWarpThreads = 32;
+
+// Warps (= tiles 16x16) por bloque. La version original lanzaba bloques de un
+// solo warp: con nx=ny=4096 eso son 65 536 bloques de 32 hilos, y el A100 se
+// satura en el limite de 32 bloques residentes por SM (32 warps de los 64
+// disponibles = 50 % de ocupancia) mucho antes de quedarse sin registros o
+// shared memory. Agrupando 4 warps por bloque el mismo trabajo cabe en 16 384
+// bloques de 128 hilos y el SM llega a su techo de warps. Es el mismo valor que
+// ya usa Fase_3/Stencil (kWarpsPerBlock), de modo que las dos fases quedan con
+// la misma geometria de lanzamiento y sus tiempos siguen siendo comparables.
+constexpr int kWarpsPerBlock = 4;
+
 constexpr int kWarmupIters = 3;
 constexpr int kConversionThreads = 256;
 
@@ -297,7 +308,11 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMalloc(&d_out, count * sizeof(float)));
     CHECK_CUDA(cudaMemcpy(d_in, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 
-    dim3 block(16, 16);
+    // 32 hilos en x: cada fila de hilos cubre una linea de cache de 128 B del
+    // grid FP32. Con el (16,16) original una fila pedia solo 64 B, de modo que
+    // el kernel (limitado por ancho de banda) usaba la mitad de cada
+    // transaccion de 128 B del A100.
+    dim3 block(32, 8);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     for (int i = 0; i < kWarmupIters; ++i) {
@@ -378,21 +393,42 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
                                              const T* identity_neg,
                                              int nx,
                                              int ny) {
-    const int x0 = 1 + blockIdx.x * kTile;
-    const int y0 = 1 + blockIdx.y * kTile;
+    // Cada warp del bloque resuelve un tile 16x16 independiente. El grid es 1D
+    // sobre tiles linealizados; el warp deriva su (x0, y0) de tile_id.
+    const int warp_id = threadIdx.x / kWarpThreads;
+    const int lane    = threadIdx.x % kWarpThreads;
+    const int tiles_x = (nx - 2 + kTile - 1) / kTile;
+    const int tiles_y = (ny - 2 + kTile - 1) / kTile;
+    const int tile_id = blockIdx.x * kWarpsPerBlock + warp_id;
+
+    // El ultimo bloque puede recibir menos de kWarpsPerBlock tiles reales.
+    // Salir aqui es seguro: este kernel solo sincroniza a nivel de warp
+    // (__syncwarp), nunca con __syncthreads, asi que ningun otro warp del
+    // bloque queda esperando a los que retornan.
+    if (tile_id >= tiles_x * tiles_y) {
+        return;
+    }
+
+    const int x0 = 1 + (tile_id % tiles_x) * kTile;
+    const int y0 = 1 + (tile_id / tiles_x) * kTile;
     const bool full_tile = (x0 + kTile - 1 < nx - 1) && (y0 + kTile - 1 < ny - 1);
 
     if (full_tile) {
-        __shared__ __align__(32) T tc_tiles[5 * kTile * kTile];
-        __shared__ __align__(32) float out_tile[kTile * kTile];
+        // Shared por bloque, particionada por warp: cada warp usa su propia
+        // rebanada de 5 tiles de entrada + 1 tile de salida.
+        __shared__ __align__(32) T tc_tiles[kWarpsPerBlock * 5 * kTile * kTile];
+        __shared__ __align__(32) float out_tiles[kWarpsPerBlock * kTile * kTile];
 
-        T* left_tile = tc_tiles + 0 * kTile * kTile;
-        T* right_tile = tc_tiles + 1 * kTile * kTile;
-        T* up_tile = tc_tiles + 2 * kTile * kTile;
-        T* down_tile = tc_tiles + 3 * kTile * kTile;
-        T* center_tile = tc_tiles + 4 * kTile * kTile;
+        T* warp_tiles = tc_tiles + warp_id * 5 * kTile * kTile;
+        float* out_tile = out_tiles + warp_id * kTile * kTile;
 
-        for (int linear = threadIdx.x; linear < kTile * kTile; linear += blockDim.x) {
+        T* left_tile = warp_tiles + 0 * kTile * kTile;
+        T* right_tile = warp_tiles + 1 * kTile * kTile;
+        T* up_tile = warp_tiles + 2 * kTile * kTile;
+        T* down_tile = warp_tiles + 3 * kTile * kTile;
+        T* center_tile = warp_tiles + 4 * kTile * kTile;
+
+        for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
             const int local_x = linear % kTile;
             const int local_y = linear / kTile;
             const int x = x0 + local_x;
@@ -437,7 +473,7 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         wmma::store_matrix_sync(out_tile, acc_frag, kTile, wmma::mem_row_major);
         __syncwarp();
 
-        for (int linear = threadIdx.x; linear < kTile * kTile; linear += blockDim.x) {
+        for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
             const int local_x = linear % kTile;
             const int local_y = linear / kTile;
             out[idx2d(x0 + local_x, y0 + local_y, nx)] = out_tile[linear];
@@ -445,7 +481,7 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         return;
     }
 
-    for (int linear = threadIdx.x; linear < kTile * kTile; linear += blockDim.x) {
+    for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
         const int local_x = linear % kTile;
         const int local_y = linear / kTile;
         const int x = x0 + local_x;
@@ -544,8 +580,13 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMemcpy(d_identity_neg, identity_neg.data(), identity_neg.size() * sizeof(T),
                           cudaMemcpyHostToDevice));
 
-    dim3 block(kWarpThreads);
-    dim3 grid((nx - 2 + kTile - 1) / kTile, (ny - 2 + kTile - 1) / kTile);
+    // Grid 1D sobre tiles linealizados: kWarpsPerBlock tiles (= warps) por bloque.
+    const int tiles_x = (nx - 2 + kTile - 1) / kTile;
+    const int tiles_y = (ny - 2 + kTile - 1) / kTile;
+    const int total_tiles = tiles_x * tiles_y;
+
+    dim3 block(kWarpsPerBlock * kWarpThreads);
+    dim3 grid((total_tiles + kWarpsPerBlock - 1) / kWarpsPerBlock);
 
     for (int i = 0; i < kWarmupIters; ++i) {
         stencil2d_wmma_kernel<T><<<grid, block>>>(d_in_tc, d_out, d_identity_pos,
@@ -607,7 +648,8 @@ static void print_configuration(const Options& opt) {
               << static_cast<long long>(opt.nx - 2) * static_cast<long long>(opt.ny - 2)
               << "\n";
     std::cout << "Iteraciones                : " << opt.iters << "\n";
-    std::cout << "Tile Tensor Core           : 16x16 con WMMA\n";
+    std::cout << "Tile Tensor Core           : " << kTile << "x" << kTile
+              << " con WMMA, " << kWarpsPerBlock << " warps/bloque\n";
     std::cout << "Acumulacion TC             : FP32\n";
     std::cout << "===================================================\n\n";
 }

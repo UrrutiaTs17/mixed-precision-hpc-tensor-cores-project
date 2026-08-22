@@ -45,8 +45,17 @@ struct Options {
 
 struct Metrics {
     double milliseconds = 0.0;
-    double gflops = 0.0;
+    double tflops = 0.0;
 };
+
+// TFLOP/s = FLOP / segundos / 1e12, con segundos = ms * 1e-3:
+//   TFLOP/s = FLOP / (ms * 1e-3) / 1e12 = FLOP / (ms * 1e9)
+// La version anterior dividia por (ms * 1e12), es decir calculaba GFLOP/s pero
+// rotulaba el resultado como TFLOP/s: reportaba 1000x menos de lo real
+// (0.0103552 en vez de 10.3552 TFLOP/s para M=N=K=12288 FP32).
+inline double tflops_from_ms(double flop, double ms) {
+    return flop / (ms * 1e9);
+}
 
 void print_usage(const char* prog) {
     std::cout << "Uso: " << prog << " [--m M] [--n N] [--k K] [--iters I] [--double]\n";
@@ -200,8 +209,8 @@ Metrics run_cpu_blas_float(int m, int n, int k,
     auto end = std::chrono::high_resolution_clock::now();
 
     double ms = std::chrono::duration<double, std::milli>(end - start).count() / iters;
-    double gflops = gemm_operations(m, n, k) / (ms * 1e12);
-    return {ms, gflops};
+    double tflops = tflops_from_ms(gemm_operations(m, n, k), ms);
+    return {ms, tflops};
 }
 
 Metrics run_cpu_blas_double(int m, int n, int k,
@@ -231,8 +240,8 @@ Metrics run_cpu_blas_double(int m, int n, int k,
     auto end = std::chrono::high_resolution_clock::now();
 
     double ms = std::chrono::duration<double, std::milli>(end - start).count() / iters;
-    double gflops = gemm_operations(m, n, k) / (ms * 1e12);
-    return {ms, gflops};
+    double tflops = tflops_from_ms(gemm_operations(m, n, k), ms);
+    return {ms, tflops};
 }
 
 Metrics run_gpu_cublas_float(int m, int n, int k,
@@ -299,8 +308,8 @@ Metrics run_gpu_cublas_float(int m, int n, int k,
     CHECK_CUDA(cudaFree(dC));
 
     double ms = static_cast<double>(total_ms) / iters;
-    double gflops = gemm_operations(m, n, k) / (ms * 1e12);
-    return {ms, gflops};
+    double tflops = tflops_from_ms(gemm_operations(m, n, k), ms);
+    return {ms, tflops};
 }
 
 Metrics run_gpu_cublas_double(int m, int n, int k,
@@ -367,8 +376,8 @@ Metrics run_gpu_cublas_double(int m, int n, int k,
     CHECK_CUDA(cudaFree(dC));
 
     double ms = static_cast<double>(total_ms) / iters;
-    double gflops = gemm_operations(m, n, k) / (ms * 1e12);
-    return {ms, gflops};
+    double tflops = tflops_from_ms(gemm_operations(m, n, k), ms);
+    return {ms, tflops};
 }
 
 void print_experiment_header(const Options& opt, const char* precision_name) {
@@ -403,9 +412,9 @@ void run_experiment_float(const Options& opt) {
     std::cout << std::fixed << std::setprecision(7);
     std::cout << "---------------- RESULTADOS ----------------\n";
     std::cout << "CPU BLAS  - tiempo medio  : " << cpu.milliseconds << " ms\n";
-    std::cout << "CPU BLAS  - rendimiento   : " << cpu.gflops << " TFLOP/s\n";
+    std::cout << "CPU BLAS  - rendimiento   : " << cpu.tflops << " TFLOP/s\n";
     std::cout << "GPU cuBLAS- tiempo medio  : " << gpu.milliseconds << " ms\n";
-    std::cout << "GPU cuBLAS- rendimiento   : " << gpu.gflops << " TFLOP/s\n";
+    std::cout << "GPU cuBLAS- rendimiento   : " << gpu.tflops << " TFLOP/s\n";
     std::cout << "Speedup GPU/CPU           : " << (cpu.milliseconds / gpu.milliseconds) << "x\n";
     std::cout << "Error max abs             : " << max_err << "\n";
     std::cout << "Error relativo L2         : " << rel_err << "\n";
@@ -435,9 +444,9 @@ void run_experiment_double(const Options& opt) {
     std::cout << std::fixed << std::setprecision(7);
     std::cout << "---------------- RESULTADOS ----------------\n";
     std::cout << "CPU BLAS  - tiempo medio  : " << cpu.milliseconds << " ms\n";
-    std::cout << "CPU BLAS  - rendimiento   : " << cpu.gflops << " TFLOP/s\n";
+    std::cout << "CPU BLAS  - rendimiento   : " << cpu.tflops << " TFLOP/s\n";
     std::cout << "GPU cuBLAS- tiempo medio  : " << gpu.milliseconds << " ms\n";
-    std::cout << "GPU cuBLAS- rendimiento   : " << gpu.gflops << " TFLOP/s\n";
+    std::cout << "GPU cuBLAS- rendimiento   : " << gpu.tflops << " TFLOP/s\n";
     std::cout << "Speedup GPU/CPU           : " << (cpu.milliseconds / gpu.milliseconds) << "x\n";
     std::cout << "Error max abs             : " << max_err << "\n";
     std::cout << "Error relativo L2         : " << rel_err << "\n";

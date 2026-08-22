@@ -7,13 +7,16 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --exclusive
-# Subido de 01:00:00 a 02:00:00 (bloque 5): la corrida ahora se duplica
-# (--kahan off y --kahan on, ver KAHAN_LIST mas abajo); Kahan no toca CPU
-# FP32/FP64 (las referencias, el costo dominante de esta corrida) asi que la
-# segunda pasada las recalcula de forma redundante -- el tiempo total sube
-# aprox. al doble del de una sola pasada. Sin datos de wall-time medidos de
-# esta corrida en PACCA para calibrar con precision, 02:00:00 da margen frente
-# a duplicar un limite que ya se asumia ajustado a una sola pasada.
+# Subido de 01:00:00 a 02:00:00 (bloque 5): con KAHAN_LIST="off on" la corrida
+# se duplica; Kahan no toca CPU FP32/FP64 (las referencias, el costo dominante
+# de esta corrida) asi que la segunda pasada las recalcula de forma redundante
+# -- el tiempo total sube aprox. al doble del de una sola pasada. Sin datos de
+# wall-time medidos de esta corrida en PACCA para calibrar con precision,
+# 02:00:00 da margen frente a duplicar un limite que ya se asumia ajustado a
+# una sola pasada.
+# El limite se CONSERVA aunque el default actual (SPATIAL_COMP=on) fuerce
+# KAHAN_LIST=off y por tanto una sola pasada: SPATIAL_COMP=off restaura las dos
+# pasadas, y es esa la configuracion que necesita las 2 horas.
 #SBATCH --time=02:00:00
 
 set -euo pipefail
@@ -22,7 +25,9 @@ cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 if [[ ! -f stencil_tensor_activation.cu && -f Stencil/stencil_tensor_activation.cu ]]; then
     cd Stencil
 fi
-mkdir -p logs
+mkdir -p logs results
+JOB_ID="${SLURM_JOB_ID:-manual}"
+RESULTS_LOG="results/run_${JOB_ID}.log"
 
 # Job separado del barrido de metricas (run_stencil_tc.sbatch): ese barrido
 # corre a 16384^2 dentro de la ventana finita (ITERS_LIST <= 120, todas las
@@ -35,7 +40,13 @@ mkdir -p logs
 # los puntos) ese costo cabe holgado en la ventana de este job.
 # No corre ncu: el objetivo es el texto de n* por stdout (primera iteracion
 # no finita de cada ruta), no perfilar Tensor Cores -- para eso esta
-# run_stencil_tc.sbatch.
+# run_stencil_tc.sbatch. TODO el perfilado NCU del stencil vive alli (variables
+# RUN_NCU / ITERS_NCU / NCU_COMP_LIST); este script no acepta RUN_NCU y
+# exportarlo aqui no tiene efecto alguno.
+#
+# Politica de compensacion por defecto: ESPACIAL (--spatial-comp on, ver
+# SPATIAL_COMP mas abajo). Las rutas WMMA salen etiquetadas WMMA_FP16_SP /
+# WMMA_BF16_SP. Para las rutas de Kahan local: SPATIAL_COMP=off.
 
 # Arquitectura por defecto para A100.
 # Puedes sobrescribirla con:
@@ -43,6 +54,26 @@ mkdir -p logs
 CUDA_ARCH="${CUDA_ARCH:-80}"  # A100=80, RTX 3050=86, V100=70
 
 NVCC="${NVCC:-/opt/ohpc/pub/devtools/nvidia/hpc_sdk/Linux_x86_64/23.1/compilers/bin/nvcc}"
+
+# NVML es opcional: cuando nvml.h y la biblioteca del driver estan visibles,
+# se habilita la telemetria y se enlaza con libnvidia-ml. Si PACCA no expone
+# alguno de los dos, el mismo fuente compila con el stub sin telemetria.
+NVML_FLAGS=()
+# El driver NVIDIA suele instalarse como -lnvidia-ml; PACCA puede sobreescribir
+# este valor con -lnvml si su modulo ofrece ese alias.
+NVML_LINK_FLAG="${NVML_LINK_FLAG:--lnvidia-ml}"
+if [[ "${DISABLE_NVML_TELEMETRY:-0}" != "1" ]] &&
+   "${NVCC}" -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
+   (ldconfig -p 2>/dev/null | grep -Eq 'lib(nvidia-ml|nvml)\.so' ||
+    [[ -f /usr/lib64/libnvidia-ml.so || -f /usr/lib64/libnvml.so ||
+       -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so ||
+       -f /usr/lib/x86_64-linux-gnu/libnvml.so ]]); then
+    NVML_FLAGS=(-DUSE_NVML_TELEMETRY "${NVML_LINK_FLAG}" -lpthread)
+    echo "NVML habilitado para telemetria GPU."
+else
+    NVML_FLAGS=(-lpthread)
+    echo "NVML no disponible para el enlace; se usara el stub de telemetria GPU."
+fi
 
 # Dimensiones y horizonte del barrido: NX/NY 16x mas chicos que el barrido de
 # metricas para que la referencia CPU FP64 encadenada sea viable a
@@ -68,11 +99,71 @@ TC="${TC:-both}"
 # ruta (unas pocas decenas de MB cada uno, no escalan con ITERS).
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
 
-# Diseno factorial {fp16,bf16} x {kahan off,on} (bloque 5): esta es la corrida
-# donde SI importa si Kahan extiende n* de FP16 mas alla de 28 (pregunta
-# explicita del bloque). --kahan off primero preserva el orden de no-regresion
-# de las cifras ya validadas (bloque de gates).
+# Diseno factorial {fp16,bf16} x {kahan off,on} (bloque 5): la corrida donde
+# SI importa si Kahan extiende n* de FP16 mas alla de 28 (pregunta explicita
+# del bloque). --kahan off primero preserva el orden de no-regresion de las
+# cifras ya validadas (bloque de gates).
+# OJO: con el default actual (SPATIAL_COMP=on, ver abajo) esta lista se fuerza
+# a "off" y el barrido factorial de Kahan NO corre. Para recuperarlo hay que
+# pedir explicitamente SPATIAL_COMP=off.
 KAHAN_LIST="${KAHAN_LIST:-off on}"
+
+# Politica de compensacion POR DEFECTO: error feedback ESPACIAL (CompMode en
+# stencil_tensor_activation.cu). El default se invirtio de "off" a "on" porque
+# es la unica de las tres politicas que efectivamente mitiga el error medido:
+#
+#   - Kahan LOCAL (--kahan on, comp[idx] por celda) es indistinguible de no
+#     compensar: rel_l2 coincide hasta la 4a cifra significativa con --kahan
+#     off en todo el trayecto y NO mueve el horizonte (FP16=28, BF16=138),
+#     verificado a nx=4096/8192/16384 (jobs 4501/4502 y 4511-4514). Cuesta
+#     ~1.97x en t_iter_ms a cambio de nada.
+#   - Compensacion ESPACIAL (--spatial-comp on) baja rel_l2 ~5-6 ordenes de
+#     magnitud (FP16: 7.76e-02 -> 3.15e-07; BF16: 6.01e-01 -> 3.16e-07 a
+#     nx=16384) y lleva el horizonte de BF16 de 138 a 142, igualando
+#     exactamente el de FP32 clasico. Cuesta ~1.56x, MENOS que Kahan local.
+#
+# La ruta de Kahan local se conserva intacta y activable: es la evidencia de
+# que la tecnica estandar de la literatura NO basta para este operador, y el
+# plan de grado pide evaluar Kahan y su overhead.
+#
+# COMO REPRODUCIR LA COMPARACION LOCAL-vs-ESPACIAL (ya no es el camino por
+# defecto): SPATIAL_COMP=off es la unica via para obtener las rutas de Kahan
+# local con kahan off y on, porque SPATIAL_COMP=on fuerza KAHAN_LIST=off (el
+# binario rechaza --kahan on junto con --spatial-comp on: son politicas
+# alternativas, no capas acumulables, y con `set -e` esa combinacion mataria
+# el job). Es decir:
+#   sbatch run_stencil_horizon.sbatch                          -> WMMA_*_SP
+#   sbatch --export=ALL,SPATIAL_COMP=off run_stencil_horizon.sbatch
+#                                        -> WMMA_FP16/BF16 con kahan off y on
+# Se expone aqui (y no solo en el barrido de metricas) porque medir si una
+# politica mueve el horizonte n* exige ITERS grande, que es justo lo que este
+# barrido hace y el de metricas no.
+SPATIAL_COMP="${SPATIAL_COMP:-on}"
+if [[ "${SPATIAL_COMP}" == "on" ]]; then
+    KAHAN_LIST="off"
+fi
+
+# Ruta GPU_FP64 (referencia de maxima precision EN GPU): ON por defecto, con los
+# MISMOS NX/NY/ITERS que las rutas WMMA de este barrido, para que sus filas se
+# puedan unir por (nx, ny, iters) igual que en run_stencil_tc.sbatch.
+#
+# Aqui aporta ademas algo que el barrido de metricas no puede dar: con
+# ITERS=1200 esta es la unica corrida donde el horizonte n* de la ruta FP64 de
+# GPU es observable, y por tanto donde se puede contrastar contra el n* de la
+# referencia FP64 de CPU (fila CSV_HORIZON "FP64" vs fila "GPU_FP64"): misma
+# prediccion de formato, dos implementaciones distintas del mismo operador.
+#
+# Costo de memoria a 4096^2: estado final (134 MB) + buffer D2H de checkpoint
+# (134 MB) + copia en double del input (134 MB) ~= 0.4 GB host y 268 MB en GPU,
+# despreciable frente a los 32G que pide el job (uso actual ~7 GB).
+FP64_GPU="${FP64_GPU:-on}"
+
+# Ruta CPU_FP64: cronometra el patron de oro IEEE 754 (double serial en CPU),
+# referencia de COSTO del proyecto. Implica una segunda pasada FP64 sobre la
+# malla, separada del ground truth para no heredar su instrumentacion; en este
+# barrido de horizonte los ITERS son altos, asi que es la parte mas cara.
+# CPU_FP64=off la omite.
+CPU_FP64="${CPU_FP64:-on}"
 
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
@@ -86,14 +177,41 @@ echo "Compilando stencil_tc (Fase_3/Stencil, incluye Fase_2/common.cuh por ruta 
 "${NVCC}" -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
-    --allow-unsupported-compiler
+    --allow-unsupported-compiler "${NVML_FLAGS[@]}"
 
 TIMEFORMAT=">>> Tiempo real de la corrida: %R s (user %U, sys %S)"
+# Una sola invocacion de tee envuelve TODO el bucle de KAHAN_LIST, en vez de
+# reabrirse por cada pasada: mismo fix aplicado en run_stencil_tc.sbatch (ver
+# comentario ahi) para que ninguna pasada dependa de que su propia invocacion
+# de tee sobreviva intacta.
+{
 for KAHAN in ${KAHAN_LIST}; do
     echo
     echo "============================================================"
-    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
+    echo "Barrido de horizonte: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}, FP64_GPU=${FP64_GPU}, CPU_FP64=${CPU_FP64}"
     echo "============================================================"
-    { time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
-          --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}"; } 2>&1
+    time ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
+          --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
+          --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}" \
+          --cpu-fp64 "${CPU_FP64}"
+done
+} 2>&1 | tee -a "${RESULTS_LOG}"
+
+echo
+echo "Extrayendo CSVs desde ${RESULTS_LOG}..."
+python3 tools/extract_csv.py \
+    --input  "${RESULTS_LOG}" \
+    --outdir "results" \
+    --job-id "${JOB_ID}" \
+    --kernel stencil
+
+echo "CSVs generados:"
+for csv_path in \
+    "results/drift_stencil_${JOB_ID}.csv" \
+    "results/summary_stencil_${JOB_ID}.csv" \
+    "results/horizon_stencil_${JOB_ID}.csv" \
+    "results/store_stencil_${JOB_ID}.csv" \
+    "results/energy_stencil_${JOB_ID}.csv"; do
+    rows=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "${csv_path}")
+    echo "  ${csv_path}: ${rows} filas"
 done

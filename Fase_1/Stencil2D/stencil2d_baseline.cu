@@ -36,6 +36,12 @@ struct Options {
 struct Metrics {
     double milliseconds = 0.0;
     double gflops = 0.0;
+    // Total crudo del cronometro y numero de iteraciones promediadas. Se
+    // imprimen junto al promedio para poder distinguir una coincidencia real de
+    // tiempos entre binarios de un error de transcripcion al comparar tablas:
+    // el promedio solo, redondeado, no permite hacer esa distincion.
+    double total_ms = 0.0;
+    int iters = 0;
 };
 
 __host__ __device__ inline int idx(int x, int y, int nx) {
@@ -192,9 +198,10 @@ Metrics run_cpu_stencil(const std::vector<T>& in, std::vector<T>& out,
     }
     auto end = std::chrono::high_resolution_clock::now();
 
-    double ms = std::chrono::duration<double, std::milli>(end - start).count() / iters;
+    double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    double ms = total_ms / iters;
     double gflops = stencil_operations(nx, ny) / (ms * 1.0e6);
-    return {ms, gflops};
+    return {ms, gflops, total_ms, iters};
 }
 
 template <typename T>
@@ -209,7 +216,11 @@ Metrics run_gpu_stencil(const std::vector<T>& in, std::vector<T>& out,
     CUDA_CHECK(cudaMalloc(&d_out, bytes));
     CUDA_CHECK(cudaMemcpy(d_in, in.data(), bytes, cudaMemcpyHostToDevice));
 
-    dim3 block(16, 16);
+    // 32 hilos en x: cada fila de hilos cubre una linea de cache de 128 B (FP32)
+    // o 256 B (FP64). Con el (16,16) original una fila pedia solo media linea,
+    // desperdiciando la mitad de cada transaccion en un kernel que esta limitado
+    // por ancho de banda de memoria.
+    dim3 block(32, 8);
     dim3 grid((nx + block.x - 1) / block.x,
               (ny + block.y - 1) / block.y);
 
@@ -240,7 +251,7 @@ Metrics run_gpu_stencil(const std::vector<T>& in, std::vector<T>& out,
 
     double ms = static_cast<double>(total_ms) / iters;
     double gflops = stencil_operations(nx, ny) / (ms * 1.0e6);
-    return {ms, gflops};
+    return {ms, gflops, static_cast<double>(total_ms), iters};
 }
 
 template <typename T>
@@ -300,6 +311,8 @@ void run_experiment(const Options& opt, const char* precision_name) {
     std::cout << "CPU serial - tiempo medio : " << cpu.milliseconds << " ms\n";
     std::cout << "CPU serial - rendimiento  : " << cpu.gflops << " GFLOP/s\n";
     std::cout << "GPU CUDA   - tiempo medio : " << gpu.milliseconds << " ms\n";
+    std::cout << "GPU CUDA   - tiempo total : " << gpu.total_ms << " ms en "
+              << gpu.iters << " iteraciones\n";
     std::cout << "GPU CUDA   - rendimiento  : " << gpu.gflops << " GFLOP/s\n";
     std::cout << "Speedup GPU/CPU           : " << (cpu.milliseconds / gpu.milliseconds) << "x\n";
     std::cout << "Error max abs             : " << std::scientific << max_err << "\n";
