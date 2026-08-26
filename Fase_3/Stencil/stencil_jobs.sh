@@ -41,6 +41,10 @@
 #                         replicas de Bloque A y B con RUN_KIND=energy a
 #                         ITERS=400, mas 1 control a ITERS=1000.
 #
+#   --sub-g-horizonte-fino 2 jobs por malla (default 4): curva de error con paso
+#                         de checkpoint fino (1 en vez de 20), para que FP16
+#                         tenga mas de un punto antes de desbordar en n*=28.
+#
 # Campana COMPLETA: regenera Fase 3 entera desde cero, en UN solo directorio y
 # con UN solo manifiesto, sin depender de ninguna corrida anterior.
 #
@@ -124,6 +128,21 @@ Uso: stencil_jobs.sh <flag>
                          replicas y WALL_CONTROL (default 04:00:00) para el
                          control.
 
+--- Horizonte de alta resolucion ---
+
+  --sub-g-horizonte-fino 2 jobs por malla (default 4 jobs) de
+                         run_stencil_horizon.sbatch con paso de checkpoint fino,
+                         para resolver la curva de FP16 (n*=28), que con el paso
+                         20 estandar deja UN solo punto finito.
+                         Ajustable por entorno:
+                           ITERS_FINO   default 160  (cubre FP16/BF16/FP32)
+                           PASO_FINO    default 1
+                           MALLAS_FINO  default "4096 8192"
+                           MEM_FINO     default: sin override de --mem
+                         NO recalcula n*: FP64 no diverge en 160 iters y sale
+                         con fit_status=insufficient_points. n* viene de
+                         --sub-b-horizonte.
+
 --- Campana completa ---
 
   --campana-completa     --todo + --sub-d-replicas + --sub-e-kahan-horizonte
@@ -146,7 +165,7 @@ MODO="${1:-}"
 case "${MODO}" in
     --sub-a-exploratorio|--sub-a-completa|--sub-b-horizonte|--todo) ;;
     --sub-c-energia|--sub-d-replicas|--sub-e-kahan-horizonte|--validacion-final) ;;
-    --sub-f-energia|--campana-completa) ;;
+    --sub-f-energia|--campana-completa|--sub-g-horizonte-fino) ;;
     ""|-h|--help)
         uso
         exit 0
@@ -170,6 +189,12 @@ WALL_CONTROL="${WALL_CONTROL:-04:00:00}"
 # equivalentes que existian (6325/6326) la dispersion de WMMA_BF16 ya era del
 # 7.24%, y con n=2 no se puede distinguir esa cifra del ruido.
 REPLICAS="${REPLICAS:-5}"
+
+# Parametros de --sub-g-horizonte-fino (ver la funcion para el razonamiento).
+ITERS_FINO="${ITERS_FINO:-160}"
+PASO_FINO="${PASO_FINO:-1}"
+MALLAS_FINO="${MALLAS_FINO:-4096 8192}"
+MEM_FINO="${MEM_FINO:-}"
 [[ "${REPLICAS}" =~ ^[0-9]+$ && "${REPLICAS}" -ge 1 ]] \
     || die "REPLICAS debe ser un entero >= 1 (recibido: ${REPLICAS})"
 
@@ -454,8 +479,14 @@ lanzar_tc() {
     msg "  [${sub}] ${nombre}: JobID ${jid}  (--time ${wall}, export ${export_vars})"
 }
 
+# extra (7mo arg, opcional) se anade tal cual al final de --export.
+# mem  (8vo arg, opcional) sobreescribe el "#SBATCH --mem=32G" del script: los
+# checkpoints se retienen en memoria de host y su consumo escala como
+# ITERS/CHECKPOINT_EVERY, asi que una ventana fina no cabe en el presupuesto
+# por defecto (calculado en el .sbatch para 4096^2 y paso 20).
 lanzar_horizon() {
     local sub="$1" grupo="$2" nombre="$3" nx="$4" spatial="$5" kahan_off_explicito="$6"
+    local extra="${7:-}" mem="${8:-}"
     local jobdir="${CDIR}/jobs/${grupo}/${nombre}"
     preparar_dir_job "${jobdir}" "run_stencil_horizon.sbatch"
 
@@ -463,21 +494,31 @@ lanzar_horizon() {
     if [[ "${kahan_off_explicito}" == "1" ]]; then
         export_vars="${export_vars},KAHAN_LIST=off"
     fi
+    [[ -n "${extra}" ]] && export_vars="${export_vars},${extra}"
+
+    # El campo walltime del CSV no puede llevar comas (no va entrecomillado):
+    # el override de memoria se anexa con '+' para que el mapa siga teniendo 8
+    # columnas y aun asi registre el recurso real con el que se envio el job.
+    local sbatch_args=(--parsable --export="${export_vars}")
+    local wall_label="02:00:00(default)"
+    if [[ -n "${mem}" ]]; then
+        sbatch_args+=(--mem="${mem}")
+        wall_label="${wall_label}+mem${mem}"
+    fi
+
     local jid
-    jid=$(cd "${jobdir}" && sbatch --parsable \
-            --export="${export_vars}" \
-            run_stencil_horizon.sbatch)
+    jid=$(cd "${jobdir}" && sbatch "${sbatch_args[@]}" run_stencil_horizon.sbatch)
     JIDS+=("${jid}")
 
     printf '%s,%s,%s,%s,"%s",%s,%s,%s\n' \
         "${sub}" "${grupo}" "${nombre}" "run_stencil_horizon.sbatch" \
-        "${export_vars}" "02:00:00(default)" "${jid}" "jobs/${grupo}/${nombre}" >> "${MAPA}"
+        "${export_vars}" "${wall_label}" "${jid}" "jobs/${grupo}/${nombre}" >> "${MAPA}"
 
     {
-        echo "| ${sub} | ${nombre} | \`${jid}\` | 02:00:00 (default del script) |"
+        echo "| ${sub} | ${nombre} | \`${jid}\` | ${wall_label} |"
     } >> "${CDIR}/MANIFIESTO.md"
 
-    msg "  [${sub}] ${nombre}: JobID ${jid}  (export ${export_vars})"
+    msg "  [${sub}] ${nombre}: JobID ${jid}  (${wall_label}, export ${export_vars})"
 
     sleep 2
 }
@@ -550,6 +591,37 @@ sub_f_energia() {
         "RUN_KIND=energy,ITERS_LIST=1000"
 }
 
+# Horizonte de ALTA RESOLUCION. Con CHECKPOINT_EVERY=20 sobre ITERS=1200, FP16
+# (n*=28) deja UN solo punto finito: el de n=20, porque el siguiente checkpoint
+# ya desbordo. Aqui se invierte el reparto -- pocas iteraciones, paso fino --
+# que es donde vive la informacion.
+#
+# ITERS=160 cubre la divergencia de FP16 (28), BF16 (138) y FP32 (142). FP64 no
+# diverge ahi (n*~1044) y su fila de horizon_stencil sale con
+# fit_status=insufficient_points, que es el degradado limpio de
+# emit_csv_horizon_row. Estos jobs NO recalculan n*: eso lo dan los jobs largos
+# de --sub-b-horizonte.
+#
+# Mallas por defecto 4096 y 8192, no 16384: el error es invariante con la malla
+# (medido sobre los jobs 6328/6330/6332, las diferencias van del 0.23% al 2.1%,
+# inapreciables en un eje log de 10 decadas), y un snapshot a 16384^2 pesa 2.1
+# GB contra 134 MB a 4096^2. Anadir 16384 solo cuesta memoria sin aportar curva.
+#
+# Todo ajustable sin tocar el script:
+#   ITERS_FINO   (default 160)   PASO_FINO  (default 1)
+#   MALLAS_FINO  (default "4096 8192")      MEM_FINO (default: sin override)
+sub_g_horizonte_fino() {
+    local n=0
+    for NX_G in ${MALLAS_FINO}; do n=$((n + 2)); done
+    msg "Enviando sub-g-horizonte-fino (${n} jobs: mallas '${MALLAS_FINO}', ITERS=${ITERS_FINO}, paso ${PASO_FINO})..."
+    for NX_G in ${MALLAS_FINO}; do
+        lanzar_horizon "G-horizonte-fino" "g_horizonte_fino" "nx${NX_G}_off" "${NX_G}" "off" "1" \
+            "ITERS=${ITERS_FINO},CHECKPOINT_EVERY=${PASO_FINO}" "${MEM_FINO}"
+        lanzar_horizon "G-horizonte-fino" "g_horizonte_fino" "nx${NX_G}_on"  "${NX_G}" "on"  "0" \
+            "ITERS=${ITERS_FINO},CHECKPOINT_EVERY=${PASO_FINO}" "${MEM_FINO}"
+    done
+}
+
 # SPATIAL_COMP=off SIN KAHAN_LIST explicito: es la unica via para que el script
 # use su default "off on" y corra por fin la rama kahan=on del horizonte.
 sub_e_kahan_horizonte() {
@@ -583,6 +655,9 @@ case "${MODO}" in
         ;;
     --sub-f-energia)
         sub_f_energia
+        ;;
+    --sub-g-horizonte-fino)
+        sub_g_horizonte_fino
         ;;
     --campana-completa)
         # Orden: primero lo que responde preguntas que hoy NO estan contestadas
