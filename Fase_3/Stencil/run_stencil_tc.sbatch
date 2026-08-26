@@ -101,6 +101,52 @@ ITERS_LIST="${ITERS_LIST:-10 50 100 120}"
 # checkpoints en 5,10,15,20,25,... -- el ultimo antes de n*~28 (FP16, el
 # formato que diverge mas temprano) cae en 25, bien dentro del rango finito.
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
+
+# --- Tipo de corrida: energetica vs numerica --------------------------------
+# Portado de Fase 4 (RUN_KIND en Fase_4/Stencil/run_stencil_pareto3d.sbatch).
+# El gate de energy_window_reliable es IDENTICO en los dos .cu:
+#
+#     window_reliable  <=>  time_total_s >= 0.5 s * gpu_segment_count
+#
+# y cada checkpoint abre un tramo, porque el contador NVML se cuantiza POR
+# TRAMO y no sobre la suma (ver REGIMEN DE VALIDEZ en tools/power_sampling.h).
+# Con CHECKPOINT_EVERY=5 e ITERS=120 son 24 tramos: 12 s de ventana exigidos
+# contra los ~0.9 s que dura la ruta GPU mas lenta a 16384^2. Por eso las 156
+# filas de energia de los jobs 6325-6333 salieron con reliable=0 pese a que
+# NVML SI estaba midiendo (energy_gpu_j no fue NaN ni una sola vez): no fallo
+# el contador, fallo el protocolo. Sin checkpoints hay UN tramo y el umbral
+# baja a 0.5 s totales.
+#
+#   energy  -> sin checkpoints ni perfilado. Se REPLICA: es la unica via para
+#              reportar Cv, y cualquier instrumentacion contamina por igual
+#              t_iter_ms y la ventana de energia.
+#   numeric -> con checkpoints (comportamiento historico, default). Una sola
+#              corrida basta: el error es determinista.
+#
+# Las dos variables se fuerzan DESPUES de leer el entorno, a proposito: un
+# --export=ALL arrastra el CHECKPOINT_EVERY o el RUN_NCU que quedara exportado
+# de otra sesion, y una sola corrida instrumentada dentro de la campana
+# energetica arruina la replica sin dejar rastro evidente en el CSV.
+RUN_KIND="${RUN_KIND:-numeric}"
+case "${RUN_KIND}" in
+    energy)
+        if [[ "${CHECKPOINT_EVERY}" != "0" ]]; then
+            echo "AVISO: RUN_KIND=energy ignora CHECKPOINT_EVERY=${CHECKPOINT_EVERY} y lo fija en 0."
+        fi
+        CHECKPOINT_EVERY=0
+        if [[ "${RUN_NCU}" != "0" ]]; then
+            echo "AVISO: RUN_KIND=energy ignora RUN_NCU=${RUN_NCU}: perfilar invalida la energia."
+        fi
+        RUN_NCU=0
+        ;;
+    numeric)
+        ;;
+    *)
+        echo "ERROR: RUN_KIND debe ser 'energy' o 'numeric' (recibido: ${RUN_KIND})." >&2
+        exit 2
+        ;;
+esac
+
 # Restriccion de tiempo: NCU solo se corre para el valor de ITERS de la lista
 # que coincida con ITERS_NCU, no para todos -- perfilar en cada ITERS
 # multiplicaria el tiempo de cola. Reportes por corrida perfilada: 9 = FP32
@@ -239,6 +285,10 @@ echo "NVCC=${NVCC}"
 echo "NCU=${NCU}"
 echo "SMOKE_TEST=${SMOKE_TEST}"
 echo "RUN_NCU=${RUN_NCU}"
+# RUN_KIND y CHECKPOINT_EVERY se imprimen juntos: en RUN_KIND=energy el segundo
+# ya viene forzado a 0, y es el par que decide si la ventana de energia sera
+# fiable. Dejarlo en el .out permite auditarlo sin releer el CSV.
+echo "RUN_KIND=${RUN_KIND} (CHECKPOINT_EVERY=${CHECKPOINT_EVERY}, ITERS_LIST=\"${ITERS_LIST}\")"
 
 nvidia-smi || true
 
