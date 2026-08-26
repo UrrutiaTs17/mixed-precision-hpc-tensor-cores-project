@@ -41,6 +41,20 @@
 #                         replicas de Bloque A y B con RUN_KIND=energy a
 #                         ITERS=400, mas 1 control a ITERS=1000.
 #
+# Campana COMPLETA: regenera Fase 3 entera desde cero, en UN solo directorio y
+# con UN solo manifiesto, sin depender de ninguna corrida anterior.
+#
+#   --campana-completa    --todo + --sub-d-replicas + --sub-e-kahan-horizonte
+#                         + --sub-f-energia (8+5+1+11 = 25 jobs con REPLICAS=5)
+#
+# Deliberadamente NO incluye:
+#   --sub-a-exploratorio  solo media walltime; ya se conoce (job 6325: 00:31:52).
+#   --sub-c-energia       superada por --sub-f-energia. Repetirla solo produciria
+#                         mas filas con energy_window_reliable=0.
+#   perfilado NCU         RUN_NCU=1 invalida tiempo y energia en la MISMA corrida
+#                         (ver under_ncu en el .cu y RUN_KIND=energy). Tiene que
+#                         ser una campana aparte, nunca mezclada con esta.
+#
 # Se ejecuta EN PACCA, desde cualquier punto del repositorio.
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -110,6 +124,20 @@ Uso: stencil_jobs.sh <flag>
                          replicas y WALL_CONTROL (default 04:00:00) para el
                          control.
 
+--- Campana completa ---
+
+  --campana-completa     --todo + --sub-d-replicas + --sub-e-kahan-horizonte
+                         + --sub-f-energia. Con REPLICAS=5 son 25 jobs:
+                           8  error (bloques A/B) + horizonte (3 mallas x 2)
+                           5  replicas con checkpoints (Cv de t_iter_ms)
+                           1  Kahan sobre el horizonte a 16384^2
+                          11  energia con RUN_KIND=energy + control
+                         Regenera Fase 3 entera en UN directorio y UN
+                         manifiesto. No incluye --sub-a-exploratorio,
+                         --sub-c-energia (superada por F) ni perfilado NCU
+                         (invalida tiempo y energia; va en campana aparte).
+                         Con REPLICAS=3 son 21 jobs.
+
 Sin flag: imprime este uso y sale sin lanzar nada.
 USO_EOF
 }
@@ -118,7 +146,7 @@ MODO="${1:-}"
 case "${MODO}" in
     --sub-a-exploratorio|--sub-a-completa|--sub-b-horizonte|--todo) ;;
     --sub-c-energia|--sub-d-replicas|--sub-e-kahan-horizonte|--validacion-final) ;;
-    --sub-f-energia) ;;
+    --sub-f-energia|--campana-completa) ;;
     ""|-h|--help)
         uso
         exit 0
@@ -555,6 +583,17 @@ case "${MODO}" in
         ;;
     --sub-f-energia)
         sub_f_energia
+        ;;
+    --campana-completa)
+        # Orden: primero lo que responde preguntas que hoy NO estan contestadas
+        # (energia y la rama Kahan del horizonte), despues lo que reproduce
+        # resultados que ya existen. Si hay que cancelar la campana a medias,
+        # lo perdido es lo reproducible.
+        sub_f_energia
+        sub_e_kahan_horizonte
+        sub_a_completa
+        sub_b_horizonte
+        sub_d_replicas
         ;;
     --validacion-final)
         sub_c_energia
