@@ -16,12 +16,20 @@
 // 2. GPU CUDA FP32 clasico, sin Tensor Cores.
 // 3. GPU Tensor Core con WMMA: entradas FP16/BF16 y salida/acumulacion FP32.
 //
-// La ruta WMMA reescribe cada tile interior 16x16 como cinco operaciones MMA:
-// left*cnI + right*cnI + cnI*up + cnI*down + center*ccI, donde cn/cc son el
-// coeficiente de vecino y el de centro del operador activo (ver OpMode: stress
-// da cn=0.25, cc=-1.0; diffusive da cn=alpha, cc=1-4*alpha).
-// Es una adaptacion didactica para validar activacion de Tensor Cores en stencil;
-// no pretende ser el stencil mas eficiente posible en memoria.
+// La ruta WMMA expresa cada tile interior 16x16 como DOS operaciones MMA:
+//
+//     Y = X H + V X
+//
+// donde X es el tile del estado, H es tridiagonal con el coeficiente de centro
+// en la diagonal y el de vecino en las dos subdiagonales (desplazamiento en x,
+// multiplicacion por la derecha), y V lleva el coeficiente de vecino en las dos
+// subdiagonales y cero en la diagonal (desplazamiento en y, multiplicacion por
+// la izquierda). cn/cc son los coeficientes del operador activo (ver OpMode:
+// stress da cn=0.25, cc=-1.0; diffusive da cn=alpha, cc=1-4*alpha).
+// H y V solo alcanzan a las vecinas internas al tile; las cuatro bandas
+// exteriores (16 valores por lado, sin esquinas diagonales, que el stencil de 5
+// puntos no usa) se cargan aparte y se suman en FP32 tras el mma.
+// Carga por tile completo: 256 + 4*16 = 320 valores de 16 bits.
 //
 // Fase 3 (este archivo): a diferencia de Fase_2/Stencil/stencil_tensor_activation.cu
 // -que congela la validacion de activacion de Tensor Cores y relanza --iters veces
@@ -849,13 +857,14 @@ static double stencil_flops(int nx, int ny, double flops_per_cell) {
 }
 
 // Nota metodologica: el TFLOPS reportado para la ruta WMMA NO es comparable en
-// terminos absolutos al TFLOPS de GEMM (Fase_2/GEMM). Aqui cada tile 16x16 solo
-// ejecuta 5 MMA 16x16x16 para reproducir un escalado elemento a elemento via
-// matrices identidad (ver comentario superior del archivo); el costo esta
-// dominado por el movimiento de datos a shared memory (carga de 5 tiles T y
-// escritura del tile de salida), no por computo dense real como en GEMM. El
-// numero sirve para comparar las tres rutas de Stencil entre si (CPU, GPU FP32,
-// GPU WMMA), no para comparar Stencil contra GEMM.
+// terminos absolutos al TFLOPS de GEMM (Fase_2/GEMM). Aqui cada tile 16x16
+// ejecuta 2 MMA 16x16x16 (Y = X H + V X, ver comentario superior del archivo)
+// sobre matrices H y V que son tridiagonales: la mayor parte de sus 4096
+// productos son contra ceros estructurales, a diferencia de la GEMM densa. El
+// gflops_utiles cuenta el trabajo UTIL del stencil (flops_per_cell por celda
+// interior), no las operaciones que el Tensor Core emite. El numero sirve para
+// comparar las rutas de Stencil entre si (CPU, GPU FP32, GPU FP64, GPU WMMA),
+// no para comparar Stencil contra GEMM.
 static Metrics build_metrics(int nx, int ny, double avg_ms, double flops_per_cell) {
     Metrics m;
     m.ms = avg_ms;
@@ -2496,40 +2505,118 @@ static __nv_bfloat16 make_tc_value_bfloat16(float x) {
 }
 
 template <typename T>
-static void initialize_scaled_identity(std::vector<T>& mat, float scale);
-
+static T make_tc_value(float x);
 template <>
-void initialize_scaled_identity<__half>(std::vector<__half>& mat, float scale) {
-    std::fill(mat.begin(), mat.end(), make_tc_value_half(0.0f));
-    for (int i = 0; i < kTile; ++i) {
-        mat[i * kTile + i] = make_tc_value_half(scale);
-    }
-}
-
+__half make_tc_value<__half>(float x) { return make_tc_value_half(x); }
 template <>
-void initialize_scaled_identity<__nv_bfloat16>(std::vector<__nv_bfloat16>& mat, float scale) {
-    std::fill(mat.begin(), mat.end(), make_tc_value_bfloat16(0.0f));
-    for (int i = 0; i < kTile; ++i) {
-        mat[i * kTile + i] = make_tc_value_bfloat16(scale);
-    }
-}
+__nv_bfloat16 make_tc_value<__nv_bfloat16>(float x) { return make_tc_value_bfloat16(x); }
 
-// Bytes de shared por WARP (no por bloque): tc_tiles[5][16][16] en T +
-// out_tile[16][16] en float. Con T de 2 bytes da 2560 + 1024 = 3584 B/warp
-// (confirmado por NCU: tamano estatico de shared con 1 warp/bloque). Usadas
-// tanto por el kernel (para particionar smem_raw) como por el host (para
-// dimensionar el shared dinamico del lanzamiento) -- una sola definicion
-// evita que ambos lados se desincronicen.
+// ---------------------------------------------------------------------------
+// Operadores H y V: el stencil como DOS productos matriciales
+// ---------------------------------------------------------------------------
+//
+// Sea X el tile 16x16 del estado, indexado X[i][j] = u(x0+j, y0+i) (i recorre
+// y, j recorre x). El stencil de 5 puntos sobre las celdas INTERIORES del tile
+// es
+//
+//   Y[i][j] = c_c*X[i][j] + c_n*( X[i][j-1] + X[i][j+1] + X[i-1][j] + X[i+1][j] )
+//
+// Los dos primeros vecinos desplazan la COLUMNA (eje x) y los dos ultimos la
+// FILA (eje y). Un desplazamiento de columna es una multiplicacion POR LA
+// DERECHA; uno de fila, una multiplicacion POR LA IZQUIERDA. De ahi:
+//
+//   (X H)[i][j] = sum_k X[i][k] H[k][j]
+//               = c_c*X[i][j] + c_n*X[i][j-1] + c_n*X[i][j+1]
+//     con H[k][j] = c_c si k=j;  c_n si k=j-1;  c_n si k=j+1;  0 en otro caso
+//
+//   (V X)[i][j] = sum_k V[i][k] X[k][j]
+//               = c_n*X[i-1][j] + c_n*X[i+1][j]
+//     con V[i][k] = c_n si k=i-1;  c_n si k=i+1;  0 en otro caso
+//
+// Sumando:  Y = X H + V X.
+//
+// El termino central va en H y NO en V (poner c_c en ambas lo contaria dos
+// veces). Ambas matrices son simetricas y tridiagonales -- V sin diagonal --,
+// asi que su transpuesta es irrelevante para el layout.
+//
+// Esto sustituye a la formulacion anterior, que multiplicaba CINCO tiles
+// desplazados por matrices identidad escaladas: cinco mma_sync y cinco tiles
+// materializados en shared, donde ahora bastan DOS mma_sync y UN tile. Las
+// identidades solo servian para que el Tensor Core copiara y escalara, que es
+// trabajo que el hardware no acelera; H y V, en cambio, ponen el stencil dentro
+// del propio producto matricial.
+//
+// Limitacion estructural, resuelta aparte: H y V solo alcanzan a las vecinas
+// que caen DENTRO del tile. Las cuatro bandas exteriores (columna x0-1, columna
+// x0+16, fila y0-1, fila y0+16) no aparecen en X y se suman despues, en FP32.
+// Las esquinas diagonales del halo no hacen falta: el stencil de 5 puntos no
+// las usa.
 template <typename T>
-__host__ __device__ constexpr size_t wmma_tc_tiles_bytes() {
-    return 5 * kTile * kTile * sizeof(T);
+static void initialize_horizontal_operator(std::vector<T>& mat, const StencilOperator& op) {
+    std::fill(mat.begin(), mat.end(), make_tc_value<T>(0.0f));
+    for (int k = 0; k < kTile; ++k) {
+        for (int j = 0; j < kTile; ++j) {
+            float v = 0.0f;
+            if (k == j) v = op.center;
+            else if (k == j - 1 || k == j + 1) v = op.neighbor;
+            if (v != 0.0f) mat[k * kTile + j] = make_tc_value<T>(v);
+        }
+    }
+}
+
+template <typename T>
+static void initialize_vertical_operator(std::vector<T>& mat, const StencilOperator& op) {
+    std::fill(mat.begin(), mat.end(), make_tc_value<T>(0.0f));
+    for (int i = 0; i < kTile; ++i) {
+        for (int k = 0; k < kTile; ++k) {
+            if (k == i - 1 || k == i + 1) mat[i * kTile + k] = make_tc_value<T>(op.neighbor);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Presupuesto de shared por WARP
+// ---------------------------------------------------------------------------
+//
+//   offset 0                    X        256*sizeof(T)   (512 B en FP16/BF16)
+//   offset 512                  out      256*sizeof(float)          1024 B
+//   offset 1536                 bandas   4*16*sizeof(T)              128 B
+//   -------------------------------------------------- Off / Local: 1664 B
+//   offset 1664                 comp     256*sizeof(float)          1024 B
+//   offset 2688                 comp_b   4*16*sizeof(float)          256 B
+//   -------------------------------------------------- Spatial:     2944 B
+//
+// Contra los 3584 B/warp del diseno anterior (cinco tiles + salida). Los dos
+// totales son multiplos de 32, de modo que el bloque de CADA warp arranca
+// alineado a 32 B y el puntero de X cumple el requisito de alineacion de
+// wmma::load_matrix_sync (256 bits). El ldm de X es kTile = 16 elementos = 32
+// bytes en 16 bits, multiplo de 16 B, tambien valido.
+//
+// El espacio de la compensacion espacial solo se reserva en CompMode::Spatial:
+// Off y Local no lo pagan.
+template <typename T>
+__host__ __device__ constexpr size_t wmma_x_tile_bytes() {
+    return kTile * kTile * sizeof(T);
 }
 __host__ __device__ constexpr size_t wmma_out_tile_bytes() {
     return kTile * kTile * sizeof(float);
 }
 template <typename T>
-__host__ __device__ constexpr size_t wmma_warp_shared_bytes() {
-    return wmma_tc_tiles_bytes<T>() + wmma_out_tile_bytes();
+__host__ __device__ constexpr size_t wmma_bands_bytes() {
+    return 4 * kTile * sizeof(T);
+}
+__host__ __device__ constexpr size_t wmma_comp_center_bytes() {
+    return kTile * kTile * sizeof(float);
+}
+__host__ __device__ constexpr size_t wmma_comp_bands_bytes() {
+    return 4 * kTile * sizeof(float);
+}
+template <typename T>
+__host__ __device__ constexpr size_t wmma_warp_shared_bytes(CompMode mode) {
+    return wmma_x_tile_bytes<T>() + wmma_out_tile_bytes() + wmma_bands_bytes<T>()
+         + ((mode == CompMode::Spatial)
+                ? (wmma_comp_center_bytes() + wmma_comp_bands_bytes())
+                : 0);
 }
 
 // kMode (parametro de plantilla, no runtime): elige la politica de
@@ -2551,18 +2638,20 @@ __host__ __device__ constexpr size_t wmma_warp_shared_bytes() {
 //            estan en ping-pong. nullptr en los modos Off/Local, donde nunca se
 //            dereferencia (por eso __restrict__ aqui es valido: en Spatial
 //            comp y comp_prev nunca apuntan al mismo buffer).
-// identity_neighbor / identity_center son las dos matrices identidad escaladas
-// por los coeficientes del operador activo (ver initialize_scaled_identity y
-// OpMode): con --op-mode stress valen 0.25*I y -1.0*I, exactamente como antes.
-// c_neigh / c_center son los MISMOS dos escalares, necesarios en las ramas que
-// no pasan por los Tensor Cores (tile parcial/borde) y en la correccion
-// espacial, que se calcula en FP32 fuera del mma.
+// horizontal_op / vertical_op son las matrices H y V del operador activo (ver
+// initialize_horizontal_operator / initialize_vertical_operator): H lleva el
+// coeficiente central y los dos vecinos horizontales, V los dos verticales, y
+// juntas producen el stencil como Y = X H + V X con DOS mma_sync.
+// c_neigh / c_center son los MISMOS dos escalares de los que se derivan H y V,
+// necesarios en las ramas que no pasan por los Tensor Cores (tile
+// parcial/borde), en la correccion de las bandas exteriores del tile y en la
+// compensacion espacial, todas ellas calculadas en FP32 fuera del mma.
 template <typename T, CompMode kMode>
 __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                                              float* __restrict__ out_fp32,
                                              T* __restrict__ out_tc,
-                                             const T* __restrict__ identity_neighbor,
-                                             const T* __restrict__ identity_center,
+                                             const T* __restrict__ horizontal_op,
+                                             const T* __restrict__ vertical_op,
                                              int nx,
                                              int ny,
                                              float c_neigh,
@@ -2604,64 +2693,94 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
     __syncthreads();
 
     if (full_tile) {
-        // smem_raw es la shared dinamica de TODO el bloque (kWarpsPerBlock *
-        // wmma_warp_shared_bytes<T>(), fijada por el host al lanzar); cada
-        // warp toma su propia porcion via warp_id, sin solaparse con las
-        // demas: tc_tiles primero, out_tile justo despues, igual que las
-        // dos declaraciones estaticas que reemplazan (mismo tamano/layout).
+        // Particion de la shared dinamica del BLOQUE. Cada warp toma su propia
+        // region de wmma_warp_shared_bytes<T>(kMode) bytes, en el orden
+        // documentado junto a esos helpers: X, out, bandas y -- solo en
+        // Spatial -- los residuos. El tamano por warp es multiplo de 32 B, de
+        // modo que el X de cada warp queda alineado a 32 B: es el requisito de
+        // wmma::load_matrix_sync, que ademas exige ldm multiplo de 16 B (aqui
+        // kTile = 16 elementos = 32 B en 16 bits).
         extern __shared__ __align__(32) char smem_raw[];
-        T* tc_tiles = reinterpret_cast<T*>(smem_raw + warp_id * wmma_warp_shared_bytes<T>());
-        float* out_tile = reinterpret_cast<float*>(smem_raw + warp_id * wmma_warp_shared_bytes<T>()
-                                                    + wmma_tc_tiles_bytes<T>());
+        char* const warp_base = smem_raw + warp_id * wmma_warp_shared_bytes<T>(kMode);
+        T* x_tile = reinterpret_cast<T*>(warp_base);
+        float* out_tile = reinterpret_cast<float*>(warp_base + wmma_x_tile_bytes<T>());
+        T* bands = reinterpret_cast<T*>(warp_base + wmma_x_tile_bytes<T>()
+                                                  + wmma_out_tile_bytes());
+        T* band_l = bands + 0 * kTile;
+        T* band_r = bands + 1 * kTile;
+        T* band_u = bands + 2 * kTile;
+        T* band_d = bands + 3 * kTile;
 
-        T* left_tile = tc_tiles + 0 * kTile * kTile;
-        T* right_tile = tc_tiles + 1 * kTile * kTile;
-        T* up_tile = tc_tiles + 2 * kTile * kTile;
-        T* down_tile = tc_tiles + 3 * kTile * kTile;
-        T* center_tile = tc_tiles + 4 * kTile * kTile;
-
+        // 256 valores del tile central + 4*16 de las bandas exteriores = 320
+        // lecturas globales de 16 bits por tile completo. La formulacion
+        // anterior, con cinco tiles desplazados, hacia 5*256 = 1280.
         for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
             const int local_x = linear % kTile;
             const int local_y = linear / kTile;
-            const int x = x0 + local_x;
-            const int y = y0 + local_y;
+            x_tile[linear] = in[idx2d(x0 + local_x, y0 + local_y, nx)];
+        }
+        // full_tile garantiza x0 >= 1 y x0+kTile-1 <= nx-2 (idem en y), luego
+        // x0-1 >= 0 y x0+kTile <= nx-1: las cuatro bandas caen dentro de la
+        // malla y no necesitan guarda de rango. Las esquinas diagonales del
+        // halo NO se cargan: el stencil de 5 puntos no las usa.
+        for (int b = lane; b < kTile; b += kWarpThreads) {
+            band_l[b] = in[idx2d(x0 - 1,     y0 + b,     nx)];
+            band_r[b] = in[idx2d(x0 + kTile, y0 + b,     nx)];
+            band_u[b] = in[idx2d(x0 + b,     y0 - 1,     nx)];
+            band_d[b] = in[idx2d(x0 + b,     y0 + kTile, nx)];
+        }
 
-            left_tile[linear] = in[idx2d(x - 1, y, nx)];
-            right_tile[linear] = in[idx2d(x + 1, y, nx)];
-            up_tile[linear] = in[idx2d(x, y - 1, nx)];
-            down_tile[linear] = in[idx2d(x, y + 1, nx)];
-            center_tile[linear] = in[idx2d(x, y, nx)];
+        // Residuos de la compensacion espacial: 256 centrales + 64 de banda,
+        // cargados UNA vez y reutilizados desde shared por las cinco lecturas
+        // que antes iban a global por celda. Siguen en FP32; no se cuantizan.
+        float* comp_tile = nullptr;
+        float* comp_band_l = nullptr;
+        float* comp_band_r = nullptr;
+        float* comp_band_u = nullptr;
+        float* comp_band_d = nullptr;
+        if constexpr (kMode == CompMode::Spatial) {
+            comp_tile = reinterpret_cast<float*>(warp_base + wmma_x_tile_bytes<T>()
+                                                           + wmma_out_tile_bytes()
+                                                           + wmma_bands_bytes<T>());
+            float* cb = comp_tile + kTile * kTile;
+            comp_band_l = cb + 0 * kTile;
+            comp_band_r = cb + 1 * kTile;
+            comp_band_u = cb + 2 * kTile;
+            comp_band_d = cb + 3 * kTile;
+            for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
+                const int local_x = linear % kTile;
+                const int local_y = linear / kTile;
+                comp_tile[linear] = comp_prev[idx2d(x0 + local_x, y0 + local_y, nx)];
+            }
+            for (int b = lane; b < kTile; b += kWarpThreads) {
+                comp_band_l[b] = comp_prev[idx2d(x0 - 1,     y0 + b,     nx)];
+                comp_band_r[b] = comp_prev[idx2d(x0 + kTile, y0 + b,     nx)];
+                comp_band_u[b] = comp_prev[idx2d(x0 + b,     y0 - 1,     nx)];
+                comp_band_d[b] = comp_prev[idx2d(x0 + b,     y0 + kTile, nx)];
+            }
         }
         __syncwarp();
 
+        // Y = X H + V X: exactamente DOS mma_sync por tile interior completo.
+        // X entra como matrix_a en el primero y como matrix_b en el segundo;
+        // es el mismo tile de shared en ambos casos, cargado en fragmentos
+        // distintos. El acumulador es FP32, igual que antes.
         wmma::fragment<wmma::matrix_a, kTile, kTile, kTile, T, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, kTile, kTile, kTile, T, wmma::row_major> b_frag;
-        wmma::fragment<wmma::matrix_a, kTile, kTile, kTile, T, wmma::row_major> id_a_frag;
-        wmma::fragment<wmma::matrix_b, kTile, kTile, kTile, T, wmma::row_major> id_neigh_b_frag;
-        wmma::fragment<wmma::matrix_b, kTile, kTile, kTile, T, wmma::row_major> id_center_b_frag;
         wmma::fragment<wmma::accumulator, kTile, kTile, kTile, float> acc_frag;
 
         wmma::fill_fragment(acc_frag, 0.0f);
 
-        wmma::load_matrix_sync(id_neigh_b_frag, identity_neighbor, kTile);
-        wmma::load_matrix_sync(id_center_b_frag, identity_center, kTile);
-        wmma::load_matrix_sync(id_a_frag, identity_neighbor, kTile);
+        wmma::load_matrix_sync(a_frag, x_tile, kTile);           // A = X
+        wmma::load_matrix_sync(b_frag, horizontal_op, kTile);    // B = H
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);      // acc  = X H
 
-        wmma::load_matrix_sync(a_frag, left_tile, kTile);
-        wmma::mma_sync(acc_frag, a_frag, id_neigh_b_frag, acc_frag);
+        wmma::load_matrix_sync(a_frag, vertical_op, kTile);      // A = V
+        wmma::load_matrix_sync(b_frag, x_tile, kTile);           // B = X
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);      // acc += V X
 
-        wmma::load_matrix_sync(a_frag, right_tile, kTile);
-        wmma::mma_sync(acc_frag, a_frag, id_neigh_b_frag, acc_frag);
-
-        wmma::load_matrix_sync(b_frag, up_tile, kTile);
-        wmma::mma_sync(acc_frag, id_a_frag, b_frag, acc_frag);
-
-        wmma::load_matrix_sync(b_frag, down_tile, kTile);
-        wmma::mma_sync(acc_frag, id_a_frag, b_frag, acc_frag);
-
-        wmma::load_matrix_sync(a_frag, center_tile, kTile);
-        wmma::mma_sync(acc_frag, a_frag, id_center_b_frag, acc_frag);
-
+        // out_tile no solapa a x_tile, asi que este volcado no destruye el
+        // tile que los dos mma acaban de consumir.
         wmma::store_matrix_sync(out_tile, acc_frag, kTile, wmma::mem_row_major);
         __syncwarp();
 
@@ -2677,10 +2796,21 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             const int y = y0 + local_y;
             float val = out_tile[linear];
             const int idx = idx2d(x, y, nx);
+
+            // H y V solo alcanzan a las vecinas que caen DENTRO del tile: las
+            // celdas del borde del tile pierden una vecina cada una, que se
+            // suma aqui en FP32 desde las bandas. Las cuatro esquinas del tile
+            // satisfacen dos de estas condiciones a la vez y reciben, como
+            // corresponde, las DOS contribuciones.
+            if (local_x == 0)         val += c_neigh * tc_to_float(band_l[local_y]);
+            if (local_x == kTile - 1) val += c_neigh * tc_to_float(band_r[local_y]);
+            if (local_y == 0)         val += c_neigh * tc_to_float(band_u[local_x]);
+            if (local_y == kTile - 1) val += c_neigh * tc_to_float(band_d[local_x]);
+
             if constexpr (kMode == CompMode::Spatial) {
-                // Los tiles que entraron al Tensor Core son de tipo T: sumarles
-                // el residuo FP32 antes del mma lo destruiria al reconvertir a
-                // 16 bits. Como el operador es LINEAL, la correccion se calcula
+                // El estado que entro al Tensor Core es de tipo T: sumarle el
+                // residuo FP32 antes del mma lo destruiria al reconvertir a 16
+                // bits. Como el operador es LINEAL, la correccion se calcula
                 // aparte en FP32 y se suma al acumulador ya volcado:
                 //   L(v + c) = L(v) + L(c)
                 // donde L es el mismo Laplaciano de 5 puntos, v el estado
@@ -2688,13 +2818,17 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                 // v+c en cada vecina (que es lo que hace la rama escalar de
                 // abajo), sin sacar el trabajo pesado de los Tensor Cores ni
                 // tocar la formula del stencil.
-                // full_tile garantiza 1 <= x,y <= nx-2/ny-2, asi que las cuatro
-                // vecinas caen dentro del arreglo.
-                const float cu = comp_prev[idx2d(x, y - 1, nx)];
-                const float cd = comp_prev[idx2d(x, y + 1, nx)];
-                const float cl = comp_prev[idx2d(x - 1, y, nx)];
-                const float cr = comp_prev[idx2d(x + 1, y, nx)];
-                const float cc = comp_prev[idx];
+                // Los cinco residuos salen de shared: los interiores del tile
+                // central y los del borde de las bandas ya cargadas.
+                const float cc = comp_tile[linear];
+                const float cl = (local_x > 0)         ? comp_tile[linear - 1]
+                                                       : comp_band_l[local_y];
+                const float cr = (local_x < kTile - 1) ? comp_tile[linear + 1]
+                                                       : comp_band_r[local_y];
+                const float cu = (local_y > 0)         ? comp_tile[linear - kTile]
+                                                       : comp_band_u[local_x];
+                const float cd = (local_y < kTile - 1) ? comp_tile[linear + kTile]
+                                                       : comp_band_d[local_x];
                 val += fmaf(c_neigh, cu + cd + cl + cr, c_center * cc);
             }
             out_tc[idx] = compensated_store<T, kMode>(val, comp, idx);
@@ -2986,8 +3120,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     float* d_out_fp32 = nullptr;
     T* d_in_tc = nullptr;
     T* d_out_tc = nullptr;
-    T* d_identity_neighbor = nullptr;
-    T* d_identity_center = nullptr;
+    T* d_horizontal = nullptr;
+    T* d_vertical = nullptr;
     int* d_first_nf = nullptr;
     // d_comp: residuo por celda, en FP32, persistente entre iteraciones (ver
     // compensated_store). Solo se reserva si hay compensacion activa; nullptr
@@ -3009,8 +3143,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMalloc(&d_out_fp32, count * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_in_tc, count * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_out_tc, count * sizeof(T)));
-    CHECK_CUDA(cudaMalloc(&d_identity_neighbor, kTile * kTile * sizeof(T)));
-    CHECK_CUDA(cudaMalloc(&d_identity_center, kTile * kTile * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_horizontal, kTile * kTile * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_vertical, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
     if (comp_enabled) {
         CHECK_CUDA(cudaMalloc(&d_comp, count * sizeof(float)));
@@ -3024,36 +3158,42 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
 
-    // Las dos identidades escaladas son la forma en que el operador entra a los
-    // Tensor Cores: el mma no puede tomar un escalar, asi que el coeficiente
-    // viaja como la diagonal de una matriz 16x16. Salen de los MISMOS dos
-    // escalares que usan las ramas escalares del kernel (op.neighbor /
-    // op.center), no de literales duplicados que pudieran divergir de ellos.
-    std::vector<T> identity_neighbor(kTile * kTile);
-    std::vector<T> identity_center(kTile * kTile);
-    initialize_scaled_identity<T>(identity_neighbor, op.neighbor);
-    initialize_scaled_identity<T>(identity_center, op.center);
-    CHECK_CUDA(cudaMemcpy(d_identity_neighbor, identity_neighbor.data(),
-                          identity_neighbor.size() * sizeof(T), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_identity_center, identity_center.data(),
-                          identity_center.size() * sizeof(T), cudaMemcpyHostToDevice));
+    // H y V son la forma en que el operador entra a los Tensor Cores: el mma no
+    // toma escalares, asi que los coeficientes viajan como las bandas de dos
+    // matrices 16x16 (ver initialize_horizontal_operator /
+    // initialize_vertical_operator y la derivacion de Y = X H + V X). Salen de
+    // los MISMOS dos escalares que usan las ramas escalares del kernel y las
+    // rutas FP32/FP64 (op.neighbor / op.center), no de literales duplicados que
+    // pudieran divergir de ellos. Una sola transferencia host->device por
+    // benchmark: el operador no cambia entre iteraciones.
+    std::vector<T> horizontal(kTile * kTile);
+    std::vector<T> vertical(kTile * kTile);
+    initialize_horizontal_operator<T>(horizontal, op);
+    initialize_vertical_operator<T>(vertical, op);
+    CHECK_CUDA(cudaMemcpy(d_horizontal, horizontal.data(),
+                          horizontal.size() * sizeof(T), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_vertical, vertical.data(),
+                          vertical.size() * sizeof(T), cudaMemcpyHostToDevice));
 
     // gridDim.x ya no es tiles_x/tiles_y (2D, 1 tile = 1 bloque): es 1D,
     // ceil(total_tiles / kWarpsPerBlock), con kWarpsPerBlock tiles por
     // bloque (ver derivacion de tile_id/tiles_x dentro del kernel, misma
-    // formula de tiles_x/tiles_y que aqui). shared_bytes es dinamica (antes
-    // era estatica, __shared__ T tc_tiles[...]/float out_tile[...] por
-    // bloque): kWarpsPerBlock * wmma_warp_shared_bytes<T>() = 4*3584 = 14336
-    // B, muy por debajo de 48 KiB (no requiere
-    // cudaFuncAttributeMaxDynamicSharedMemorySize).
+    // formula de tiles_x/tiles_y que aqui). shared_bytes es dinamica y depende
+    // del modo de compensacion: 4*1664 = 6656 B por bloque en Off/Local y
+    // 4*2944 = 11776 B en Spatial, contra los 4*3584 = 14336 B que pedia la
+    // formulacion de cinco tiles en TODOS los modos. Muy por debajo de 48 KiB,
+    // asi que no requiere cudaFuncAttributeMaxDynamicSharedMemorySize.
     const int tiles_x = (nx - 2 + kTile - 1) / kTile;
     const int tiles_y = (ny - 2 + kTile - 1) / kTile;
     const int total_tiles = tiles_x * tiles_y;
-    static_assert(kWarpsPerBlock * wmma_warp_shared_bytes<T>() <= 49152,
+    // El caso mayor (Spatial) es el que tiene que caber; los otros dos son
+    // estrictamente menores.
+    static_assert(kWarpsPerBlock * wmma_warp_shared_bytes<T>(CompMode::Spatial) <= 49152,
                  "shared por bloque excede 48 KiB estaticos/dinamicos");
     dim3 block(kWarpsPerBlock * kWarpThreads);
     dim3 grid((total_tiles + kWarpsPerBlock - 1) / kWarpsPerBlock);
-    const size_t shared_bytes = static_cast<size_t>(kWarpsPerBlock) * wmma_warp_shared_bytes<T>();
+    const size_t shared_bytes =
+        static_cast<size_t>(kWarpsPerBlock) * wmma_warp_shared_bytes<T>(comp_mode);
 
     // Siembra los DOS buffers de residuo con el error de la conversion inicial
     // FP32 -> T (ver seed_comp_from_conversion_kernel). Los dos, y no solo uno,
@@ -3097,17 +3237,17 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         switch (comp_mode) {
             case CompMode::Local:
                 stencil2d_wmma_kernel<T, CompMode::Local><<<grid, block, shared_bytes>>>(
-                    in_buf, d_out_fp32, out_buf, d_identity_neighbor, d_identity_center,
+                    in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
                     nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf, d_comp, nullptr);
                 break;
             case CompMode::Spatial:
                 stencil2d_wmma_kernel<T, CompMode::Spatial><<<grid, block, shared_bytes>>>(
-                    in_buf, d_out_fp32, out_buf, d_identity_neighbor, d_identity_center,
+                    in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
                     nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf, comp_out, comp_in);
                 break;
             case CompMode::Off:
                 stencil2d_wmma_kernel<T, CompMode::Off><<<grid, block, shared_bytes>>>(
-                    in_buf, d_out_fp32, out_buf, d_identity_neighbor, d_identity_center,
+                    in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
                     nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf, nullptr, nullptr);
                 break;
         }
@@ -3411,8 +3551,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaFree(d_out_fp32));
     CHECK_CUDA(cudaFree(d_in_tc));
     CHECK_CUDA(cudaFree(d_out_tc));
-    CHECK_CUDA(cudaFree(d_identity_neighbor));
-    CHECK_CUDA(cudaFree(d_identity_center));
+    CHECK_CUDA(cudaFree(d_horizontal));
+    CHECK_CUDA(cudaFree(d_vertical));
     CHECK_CUDA(cudaFree(d_first_nf));
     if (d_comp != nullptr) {
         CHECK_CUDA(cudaFree(d_comp));
