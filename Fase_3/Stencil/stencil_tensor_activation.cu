@@ -83,6 +83,42 @@ constexpr int kConversionThreads = 256;
 // 262144 (gridDim.x = ceil(total_tiles / kWarpsPerBlock)).
 constexpr int kWarpsPerBlock = 4;
 
+// Desplazamiento de alineacion de los buffers del dominio 2D completo.
+//
+// El interior arranca en x = 1, asi que la primera celda interior de la fila y
+// es el elemento idx2d(1, y, nx) = y*nx + 1: IMPAR. Con el puntero de
+// cudaMalloc (alineado a 256 B) la direccion de esa celda es
+//
+//     A(y) = base + sizeof(T) * (y*nx + 1)
+//
+// y ningun acceso vectorizado es representable ahi: para T = __half hace falta
+// A(y) % 16 == 0, es decir y*nx + 1 == 0 (mod 8), imposible con nx multiplo
+// de 8. Desplazando el puntero LOGICO en kAlignOffsetElems elementos,
+//
+//     A(y) = base + sizeof(T) * (kAlignOffsetElems + y*nx + 1)
+//
+// y la condicion pasa a ser kAlignOffsetElems + 1 == 0 (mod V), con V el
+// numero de elementos que caben en 16 B:
+//
+//     T = __half / __nv_bfloat16 (2 B) -> V = 8 -> 15 + 1 = 16 == 0 (mod 8) OK
+//     T = float                  (4 B) -> V = 4 -> 15 + 1 = 16 == 0 (mod 4) OK
+//
+// El mismo 15 sirve para los dos tamanos porque el desplazamiento se cuenta en
+// ELEMENTOS del tipo de cada buffer (30 B en los de 16 bits, 60 B en los FP32),
+// no en bytes. Requiere nx multiplo de 8 (2048/4096/16384 lo son); con otro nx
+// el desplazamiento sigue siendo CORRECTO -- es solo un puntero dentro de una
+// asignacion con padding suficiente -- pero deja de alinear, y la etapa de
+// vectorizacion debera comprobarlo antes de emitir accesos anchos.
+//
+// nx NO se toca: la alineacion se consigue moviendo el origen del buffer, no
+// el stride logico, de modo que idx2d(x, y, nx) y toda la topologia del
+// dominio quedan intactas (el kernel no se entera).
+constexpr size_t kAlignOffsetElems = 15;
+// Capacidad fisica extra por buffer. PAD >= OFFSET para que el ultimo elemento
+// logico (indice count-1 visto desde el puntero desplazado) siga dentro de la
+// asignacion.
+constexpr size_t kAlignPadElems = 16;
+
 enum class TensorCoreMode {
     FP16,
     BF16,
@@ -3278,24 +3314,51 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     const bool comp_enabled = (comp_mode != CompMode::Off);
     const bool comp_pingpong = (comp_mode == CompMode::Spatial);
 
-    CHECK_CUDA(cudaMalloc(&d_in_fp32, count * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_out_fp32, count * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_in_tc, count * sizeof(T)));
-    CHECK_CUDA(cudaMalloc(&d_out_tc, count * sizeof(T)));
+    // Los SEIS buffers que representan el dominio 2D completo se reservan con
+    // kAlignPadElems elementos de mas y se usan a traves de un puntero
+    // desplazado *_aligned (ver kAlignOffsetElems). d_horizontal, d_vertical,
+    // d_first_nf y d_iter_offset NO llevan padding: no son el dominio, sus
+    // accesos no se vectorizan y desplazarlos solo anadiria ruido.
+    //
+    // El puntero base se conserva intacto: es el unico valido para cudaFree
+    // (liberar un puntero desplazado es comportamiento indefinido, ver el
+    // bloque de cudaFree al final de la funcion).
+    CHECK_CUDA(cudaMalloc(&d_in_fp32, (count + kAlignPadElems) * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_out_fp32, (count + kAlignPadElems) * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_in_tc, (count + kAlignPadElems) * sizeof(T)));
+    CHECK_CUDA(cudaMalloc(&d_out_tc, (count + kAlignPadElems) * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_horizontal, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_vertical, kTile * kTile * sizeof(T)));
     CHECK_CUDA(cudaMalloc(&d_first_nf, sizeof(int)));
+
+    // Punteros LOGICOS: todo lo que trabaja sobre el dominio (H2D, D2H,
+    // memset, conversiones, siembra, kernels, ping-pong y captura de grafo)
+    // usa estos; el tamano logico sigue siendo count, nunca count + PAD.
+    float* const d_in_fp32_aligned = d_in_fp32 + kAlignOffsetElems;
+    float* const d_out_fp32_aligned = d_out_fp32 + kAlignOffsetElems;
+    T* const d_in_tc_aligned = d_in_tc + kAlignOffsetElems;
+    T* const d_out_tc_aligned = d_out_tc + kAlignOffsetElems;
+
+    // d_comp/d_comp_prev son condicionales: el desplazado se deja en nullptr
+    // cuando no hay asignacion (nullptr + 15 seria comportamiento indefinido,
+    // y la instanciacion CompMode::Off del kernel nunca lo dereferencia).
+    float* d_comp_aligned = nullptr;
+    float* d_comp_prev_aligned = nullptr;
     if (comp_enabled) {
-        CHECK_CUDA(cudaMalloc(&d_comp, count * sizeof(float)));
-        CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_comp, (count + kAlignPadElems) * sizeof(float)));
+        d_comp_aligned = d_comp + kAlignOffsetElems;
+        CHECK_CUDA(cudaMemset(d_comp_aligned, 0, count * sizeof(float)));
     }
     if (comp_pingpong) {
-        CHECK_CUDA(cudaMalloc(&d_comp_prev, count * sizeof(float)));
-        CHECK_CUDA(cudaMemset(d_comp_prev, 0, count * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_comp_prev, (count + kAlignPadElems) * sizeof(float)));
+        d_comp_prev_aligned = d_comp_prev + kAlignOffsetElems;
+        CHECK_CUDA(cudaMemset(d_comp_prev_aligned, 0, count * sizeof(float)));
     }
 
-    CHECK_CUDA(cudaMemcpy(d_in_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_in_fp32_aligned, in.data(), count * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_out_fp32_aligned, in.data(), count * sizeof(float),
+                          cudaMemcpyHostToDevice));
 
     // H y V son la forma en que el operador entra a los Tensor Cores: el mma no
     // toma escalares, asi que los coeficientes viajan como las bandas de dos
@@ -3345,16 +3408,16 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         if (!comp_pingpong) return;
         const int blocks = static_cast<int>((count + kConversionThreads - 1) / kConversionThreads);
         seed_comp_from_conversion_kernel<T><<<blocks, kConversionThreads>>>(
-            d_in_fp32, d_in_tc, d_comp, static_cast<int>(count));
+            d_in_fp32_aligned, d_in_tc_aligned, d_comp_aligned, static_cast<int>(count));
         seed_comp_from_conversion_kernel<T><<<blocks, kConversionThreads>>>(
-            d_in_fp32, d_in_tc, d_comp_prev, static_cast<int>(count));
+            d_in_fp32_aligned, d_in_tc_aligned, d_comp_prev_aligned, static_cast<int>(count));
         CHECK_CUDA(cudaGetLastError());
     };
 
     // Ambos buffers del ping-pong T arrancan como conversion completa (borde
     // incluido) del input pristino: ver comentario de la funcion.
-    convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
-    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
+    convert_input_to_tc<T>(d_in_fp32_aligned, d_in_tc_aligned, count);
+    convert_input_to_tc<T>(d_in_fp32_aligned, d_out_tc_aligned, count);
     seed_comp_buffers();
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -3363,8 +3426,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // dejo la anterior. Se declaran aqui, antes de launch_wmma, porque la
     // lambda los captura por referencia y el swap ocurre junto al de tc_in/
     // tc_out en cada iteracion (incluido el warm-up).
-    float* comp_out = d_comp;
-    float* comp_in = d_comp_prev;
+    float* comp_out = d_comp_aligned;
+    float* comp_in = d_comp_prev_aligned;
 
     // Elige la instanciacion CompMode del kernel en tiempo de compilacion
     // segun los flags runtime: comp_mode no cambia dentro de esta llamada, asi
@@ -3383,19 +3446,19 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         switch (comp_mode) {
             case CompMode::Local:
                 stencil2d_wmma_kernel<T, CompMode::Local><<<grid, block, shared_bytes, stream>>>(
-                    in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
+                    in_buf, d_out_fp32_aligned, out_buf, d_horizontal, d_vertical,
                     nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf,
-                    d_comp, nullptr, iter_off);
+                    d_comp_aligned, nullptr, iter_off);
                 break;
             case CompMode::Spatial:
                 stencil2d_wmma_kernel<T, CompMode::Spatial><<<grid, block, shared_bytes, stream>>>(
-                    in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
+                    in_buf, d_out_fp32_aligned, out_buf, d_horizontal, d_vertical,
                     nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf,
                     c_out, c_in, iter_off);
                 break;
             case CompMode::Off:
                 stencil2d_wmma_kernel<T, CompMode::Off><<<grid, block, shared_bytes, stream>>>(
-                    in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
+                    in_buf, d_out_fp32_aligned, out_buf, d_horizontal, d_vertical,
                     nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf,
                     nullptr, nullptr, iter_off);
                 break;
@@ -3421,8 +3484,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     const RAEnergySnapshot rapl_warmup_before = rapl_snapshot_now();
     power_buffer_start_sampling(power_buffer);
 
-    T* tc_in = d_in_tc;
-    T* tc_out = d_out_tc;
+    T* tc_in = d_in_tc_aligned;
+    T* tc_out = d_out_tc_aligned;
     for (int i = 0; i < kWarmupIters; ++i) {
         launch_wmma(tc_in, tc_out, i + 1, /*write_fp32_flag=*/false);
         std::swap(tc_in, tc_out);
@@ -3434,9 +3497,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // Reinicia d_in_tc, d_out_tc y d_out_fp32 al estado original: el warm-up
     // encadenado es descartable y no debe alterar el estado que vera el
     // bucle medido (necesario para que --iters 1 coincida con Fase_2/Stencil).
-    convert_input_to_tc<T>(d_in_fp32, d_in_tc, count);
-    convert_input_to_tc<T>(d_in_fp32, d_out_tc, count);
-    CHECK_CUDA(cudaMemcpy(d_out_fp32, in.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    convert_input_to_tc<T>(d_in_fp32_aligned, d_in_tc_aligned, count);
+    convert_input_to_tc<T>(d_in_fp32_aligned, d_out_tc_aligned, count);
+    CHECK_CUDA(cudaMemcpy(d_out_fp32_aligned, in.data(), count * sizeof(float),
+                          cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Reinicia el contador de overflow tras el warm-up: sus iteraciones son
@@ -3454,10 +3518,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // limpiar uno -- cualquiera de los dos puede ser el que lea la primera
     // iteracion medida.
     if (comp_enabled) {
-        CHECK_CUDA(cudaMemset(d_comp, 0, count * sizeof(float)));
+        CHECK_CUDA(cudaMemset(d_comp_aligned, 0, count * sizeof(float)));
     }
     if (comp_pingpong) {
-        CHECK_CUDA(cudaMemset(d_comp_prev, 0, count * sizeof(float)));
+        CHECK_CUDA(cudaMemset(d_comp_prev_aligned, 0, count * sizeof(float)));
         // Vuelve a sembrar el residuo de la conversion inicial: el bucle medido
         // debe arrancar del MISMO estado (T + residuo) que veria sin warm-up.
         seed_comp_buffers();
@@ -3703,7 +3767,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             // record_checkpoint (si esta iteracion es multiplo de
             // checkpoint_every) como para el rastreo de ultima-iteracion-finita
             // de abajo: antes eran dos copias identicas seguidas al mismo buffer.
-            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out_fp32,
+            CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out_fp32_aligned,
                                   count * sizeof(float), cudaMemcpyDeviceToHost));
             if (checkpoint_due(ckpt, iter_number)) {
                 record_checkpoint(ckpt, route_label, iter_number, checkpoint_host_buf, onset_iter);
@@ -3783,7 +3847,8 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         energy_wall_s, flops_total, gpu_segment_count);
     power_buffer_destroy(power_buffer);
     CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32, count * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(out.data(), d_out_fp32_aligned, count * sizeof(float),
+                          cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&first_nonfinite_iter, d_first_nf, sizeof(int), cudaMemcpyDeviceToHost));
 
     // out/out_reduced quedan SIEMPRE con la ultima iteracion medida cruda,
