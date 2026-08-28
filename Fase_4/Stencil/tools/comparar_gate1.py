@@ -54,6 +54,7 @@ SUMMARY_LEGACY = [
 SUMMARY_NUEVAS = [
     "op_mode", "alpha", "ci_mode", "ci_p",
     "cell_updates_per_s", "energy_per_cell_update_j", "reference_role",
+    "execution_mode",
 ]
 
 # Columnas de medicion dentro de SUMMARY_LEGACY: se comparan con tolerancia

@@ -174,6 +174,39 @@ static const char* ci_mode_label(CiMode mode) {
     return (mode == CiMode::Monomode) ? "monomode" : "legacy";
 }
 
+// Forma en que el bucle iterativo de las rutas WMMA entrega el trabajo a la GPU.
+// NO cambia el kernel, la formulacion Y = X H + V X, los coeficientes, las
+// bandas, la compensacion ni el ping-pong: solo cambia quien paga el costo de
+// CPU de poner cada iteracion en el stream.
+//
+//   Normal (--execution-mode normal, por defecto): un cudaLaunchKernel por
+//          iteracion, igual que siempre. Comportamiento historico byte a byte.
+//          Es la unica que instrumenta un par de eventos POR ITERACION, asi que
+//          es la ruta de analisis fino (t kernel/iter, t no atribuido/iter).
+//   Graph  (--execution-mode graph, o --cuda-graph): las iteraciones que no
+//          piden checkpoint se agrupan en bloques de --graph-block y se
+//          reproducen desde un cudaGraphExec_t ya instanciado. El grid, el
+//          bloque, la shared dinamica y los argumentos son EXACTAMENTE los
+//          mismos; lo que desaparece es el trabajo de CPU por lanzamiento.
+//
+// Solo aplica a las rutas WMMA (FP16/BF16). GPU_FP32, GPU_FP64 y las rutas de
+// CPU no se tocan y siguen reportando execution_mode=normal.
+enum class ExecutionMode {
+    Normal,
+    Graph
+};
+
+static const char* execution_mode_label(ExecutionMode mode) {
+    return (mode == ExecutionMode::Graph) ? "cuda_graph" : "normal";
+}
+
+// Tamano por defecto del bloque de iteraciones que entra en un grafo. Debe ser
+// PAR: tras un numero par de iteraciones el ping-pong (tanto el de estado como
+// el de residuos) vuelve a la asignacion de punteros con la que se capturo el
+// grafo, que es lo que permite reproducir el MISMO cudaGraphExec_t k veces sin
+// reinstanciarlo ni reescribir los argumentos de sus nodos.
+constexpr int kDefaultGraphBlock = 32;
+
 struct Options {
     int nx = 2048;
     int ny = 2048;
@@ -256,6 +289,15 @@ struct Options {
     // debe existir (el sbatch lo prepara). Un mkdir aqui enmascararia un
     // RUN_KIND mal configurado escribiendo gigabytes en el cwd del job.
     std::string archive_dir = "archive";
+    // Normal (por defecto) = comportamiento identico al previo, un lanzamiento
+    // por iteracion. Graph: las rutas WMMA reproducen bloques de iteraciones
+    // desde un CUDA Graph preinstanciado (ver ExecutionMode).
+    ExecutionMode execution_mode = ExecutionMode::Normal;
+    // Iteraciones por grafo. Solo tiene efecto con --execution-mode graph;
+    // parse_args rechaza darlo en modo normal en vez de aceptarlo en silencio,
+    // donde no significaria nada (misma regla que --alpha bajo stress). Debe
+    // ser par y > 0 (ver kDefaultGraphBlock).
+    int graph_block = kDefaultGraphBlock;
 };
 
 // Politica efectiva derivada de los dos flags. parse_args ya garantizo que no
@@ -389,7 +431,8 @@ static void print_usage(const char* prog) {
         << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
            " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]"
            " [--spatial-comp off|on] [--op-mode stress|diffusive] [--alpha A]"
-           " [--ci-mode legacy|monomode] [--ci-p P] [--ci-amplitude A]\n\n"
+           " [--ci-mode legacy|monomode] [--ci-p P] [--ci-amplitude A]"
+           " [--execution-mode normal|graph] [--cuda-graph] [--graph-block B]\n\n"
         << "Descripcion:\n"
         << "  Compara CPU FP32, GPU CUDA FP32 y GPU WMMA Tensor Core para stencil 2D.\n"
         << "  La ruta Tensor Core usa operandos FP16/BF16 y acumulacion/salida FP32.\n\n"
@@ -477,6 +520,24 @@ static void print_usage(const char* prog) {
         << "  --archive-dir RUTA (por defecto \"archive\") es donde van esos ficheros y\n"
         << "  el spill de referencia. El directorio debe existir: no se crea aqui, para\n"
         << "  no volcar gigabytes en el cwd si la corrida quedo mal configurada.\n\n"
+        << "  --execution-mode normal|graph (por defecto normal), con --cuda-graph como\n"
+        << "  alias de graph. normal: un lanzamiento de kernel por iteracion,\n"
+        << "  comportamiento historico byte a byte. graph: las rutas WMMA agrupan las\n"
+        << "  iteraciones que NO piden checkpoint en bloques de --graph-block y las\n"
+        << "  reproducen desde un cudaGraphExec_t instanciado ANTES de la region\n"
+        << "  cronometrada, para quitar del camino el costo de CPU por lanzamiento. No\n"
+        << "  cambia el kernel, la formulacion Y = X H + V X, los coeficientes, la\n"
+        << "  compensacion ni el ping-pong: los argumentos de cada nodo son los mismos\n"
+        << "  que en modo normal. Solo aplica a FP16/BF16; GPU_FP32, GPU_FP64 y las\n"
+        << "  rutas de CPU siguen en normal. En modo graph NO se instrumenta un par de\n"
+        << "  eventos por iteracion sino uno por grupo de lanzamiento, asi que para el\n"
+        << "  desglose fino por kernel se debe usar --execution-mode normal.\n\n"
+        << "  --graph-block B (por defecto 32) iteraciones por grafo. Debe ser PAR: el\n"
+        << "  grafo captura una asignacion concreta de los buffers en ping-pong (estado\n"
+        << "  y residuos) y solo un numero par de iteraciones la restituye al final de\n"
+        << "  cada reproduccion. Solo valido con --execution-mode graph (en modo normal\n"
+        << "  es un error, no un no-op silencioso). Si --iters < B no llega a formarse\n"
+        << "  ningun bloque y la corrida degenera a lanzamientos normales.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n"
@@ -485,7 +546,10 @@ static void print_usage(const char* prog) {
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --spatial-comp on\n"
         << "  " << prog << " --nx 16384 --ny 16384 --iters 640 --tc both"
-           " --op-mode diffusive --ci-mode monomode\n";
+           " --op-mode diffusive --ci-mode monomode\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 320 --tc fp16 --cuda-graph\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 320 --tc fp16"
+           " --execution-mode graph --graph-block 64\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -562,6 +626,14 @@ static CiMode parse_ci_mode(const char* value) {
     std::exit(EXIT_FAILURE);
 }
 
+static ExecutionMode parse_execution_mode(const char* value) {
+    if (std::strcmp(value, "normal") == 0) return ExecutionMode::Normal;
+    if (std::strcmp(value, "graph") == 0) return ExecutionMode::Graph;
+
+    std::cerr << "Modo de ejecucion no reconocido: " << value << " (use normal|graph)\n";
+    std::exit(EXIT_FAILURE);
+}
+
 static TensorCoreMode parse_tc_mode(const char* value) {
     if (std::strcmp(value, "fp16") == 0) return TensorCoreMode::FP16;
     if (std::strcmp(value, "bf16") == 0) return TensorCoreMode::BF16;
@@ -588,6 +660,7 @@ static Options parse_args(int argc, char** argv) {
     // combinacion en vez de ignorarla en silencio.
     bool alpha_given = false;
     bool ci_param_given = false;
+    bool graph_block_given = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--nx") == 0) {
             opt.nx = parse_int_arg(i, argc, argv);
@@ -674,6 +747,18 @@ static Options parse_args(int argc, char** argv) {
                 std::exit(EXIT_FAILURE);
             }
             opt.archive_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--execution-mode") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Falta valor para --execution-mode\n";
+                std::exit(EXIT_FAILURE);
+            }
+            opt.execution_mode = parse_execution_mode(argv[++i]);
+        } else if (std::strcmp(argv[i], "--cuda-graph") == 0) {
+            // Alias corto y sin valor de --execution-mode graph.
+            opt.execution_mode = ExecutionMode::Graph;
+        } else if (std::strcmp(argv[i], "--graph-block") == 0) {
+            opt.graph_block = parse_int_arg(i, argc, argv);
+            graph_block_given = true;
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -718,6 +803,25 @@ static Options parse_args(int argc, char** argv) {
     }
     if (ci_param_given && opt.ci_mode != CiMode::Monomode) {
         std::cerr << "--ci-p / --ci-amplitude solo aplican con --ci-mode monomode.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    if (graph_block_given && opt.execution_mode != ExecutionMode::Graph) {
+        std::cerr << "--graph-block solo aplica con --execution-mode graph (o --cuda-graph):"
+                     " en modo normal no hay grafo que dimensionar y aceptarlo en silencio\n"
+                     "dejaria la corrida etiquetada con un tamano de bloque que nunca se"
+                     " uso.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    // Par y > 0: el grafo se captura con una asignacion concreta de punteros del
+    // ping-pong y se reproduce k veces; solo con un numero PAR de iteraciones
+    // por grafo los punteros vuelven al estado de captura al terminar cada
+    // reproduccion (ver kDefaultGraphBlock y build_iteration_graph).
+    if (opt.execution_mode == ExecutionMode::Graph &&
+        (opt.graph_block <= 0 || opt.graph_block % 2 != 0)) {
+        std::cerr << "--graph-block debe ser par y > 0 (recibido " << opt.graph_block
+                  << "): el grafo captura una asignacion fija de los buffers en ping-pong\n"
+                     "y solo un numero par de iteraciones la restituye al final de cada"
+                     " reproduccion.\n";
         std::exit(EXIT_FAILURE);
     }
     // El monomodo u0 = A*sin(2*pi*p*x/(nx-1))*sin(2*pi*p*y/(ny-1)) es el armonico
@@ -2660,7 +2764,8 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                                              bool write_fp32,
                                              int* __restrict__ first_nf,
                                              float* __restrict__ comp,
-                                             const float* __restrict__ comp_prev) {
+                                             const float* __restrict__ comp_prev,
+                                             const int* __restrict__ iter_offset) {
     // Cada warp procesa un tile 16x16 propio e independiente (shared privada
     // por warp, ver smem_raw mas abajo): el bloque ya no es 1 warp = 1 tile,
     // es kWarpsPerBlock warps = kWarpsPerBlock tiles.
@@ -2884,9 +2989,33 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
     }
 
     __syncthreads();
-    if (threadIdx.x == 0) {
-        reduce_and_mark_first_nonfinite(first_nf, iter, blk_bad);
+    // El guardia blk_bad != 0 se adelanta aqui (reduce_and_mark_first_nonfinite
+    // ya lo repite, y con blk_bad == 0 sigue siendo un no-op) para que la
+    // lectura de *iter_offset NO ocurra en el camino comun: solo se paga cuando
+    // esta iteracion produjo algo no finito, que es un evento unico por corrida.
+    //
+    // iter_offset es nullptr en modo normal, donde `iter` YA es la iteracion
+    // global (1..N). Bajo CUDA Graph los nodos del grafo llevan `iter` RELATIVO
+    // al bloque (1..B, horneado en el nodo y por tanto inmutable entre
+    // reproducciones) y *iter_offset lleva cuantas iteraciones globales hay
+    // antes del bloque en curso; la suma reconstruye 1..N sin reinstanciar el
+    // grafo ni reescribir los argumentos de sus nodos. Ver
+    // advance_iteration_offset_kernel.
+    if (threadIdx.x == 0 && blk_bad != 0) {
+        const int global_iter = (iter_offset != nullptr) ? (*iter_offset + iter) : iter;
+        reduce_and_mark_first_nonfinite(first_nf, global_iter, blk_bad);
     }
+}
+
+// Ultimo nodo de cada grafo de iteraciones: adelanta el contador global en
+// exactamente las iteraciones que el grafo acaba de ejecutar. Va DENTRO del
+// grafo (y no como un memcpy del host entre reproducciones) para que reproducir
+// el mismo cudaGraphExec_t k veces seguidas produzca 1..k*B sin intervencion de
+// la CPU, que es justamente el costo que este modo existe para eliminar. Un
+// solo hilo: la escritura no compite con nadie porque la captura en un unico
+// stream serializa este nodo despues de los B kernels del bloque.
+__global__ static void advance_iteration_offset_kernel(int* offset, int delta) {
+    *offset += delta;
 }
 
 template <typename T>
@@ -3104,6 +3233,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  int iters,
                                                  const StencilOperator& op,
                                                  CompMode comp_mode,
+                                                 // Forma de entregar el trabajo a la GPU. No
+                                                 // altera nada numerico: mismo kernel, mismos
+                                                 // argumentos, mismo orden (ver ExecutionMode).
+                                                 ExecutionMode execution_mode,
+                                                 int graph_block,
                                                  const CheckpointContext& ckpt,
                                                  const char* route_label,
                                                  int& onset_iter,
@@ -3123,6 +3257,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     T* d_horizontal = nullptr;
     T* d_vertical = nullptr;
     int* d_first_nf = nullptr;
+    // Contador de iteraciones ya completadas ANTES del bloque de grafo en curso.
+    // Solo se reserva en modo graph; nullptr en modo normal, donde el kernel
+    // recibe la iteracion global directamente como inmediato y nunca lo
+    // dereferencia (ver stencil2d_wmma_kernel / advance_iteration_offset_kernel).
+    int* d_iter_offset = nullptr;
     // d_comp: residuo por celda, en FP32, persistente entre iteraciones (ver
     // compensated_store). Solo se reserva si hay compensacion activa; nullptr
     // en caso contrario (la instanciacion CompMode::Off del kernel nunca lo
@@ -3233,24 +3372,43 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // Cuando comp_mode es Off, d_comp es nullptr y la instanciacion
     // CompMode::Off nunca lo dereferencia; en Local, comp_prev va en nullptr
     // (esa instanciacion tampoco lo dereferencia).
-    auto launch_wmma = [&](T* in_buf, T* out_buf, int iter_num, bool write_fp32_flag) {
+    // Forma general: los buffers de residuo y el stream son explicitos porque la
+    // captura del grafo necesita recorrer el ping-pong sobre punteros propios,
+    // sin tocar comp_out/comp_in (que son el estado vivo del bucle medido).
+    // iter_off es nullptr en todo lanzamiento normal, donde iter_num ya es la
+    // iteracion global; solo los nodos capturados en un grafo lo reciben.
+    auto launch_wmma_on = [&](T* in_buf, T* out_buf, float* c_out, const float* c_in,
+                              int iter_num, bool write_fp32_flag, const int* iter_off,
+                              cudaStream_t stream) {
         switch (comp_mode) {
             case CompMode::Local:
-                stencil2d_wmma_kernel<T, CompMode::Local><<<grid, block, shared_bytes>>>(
+                stencil2d_wmma_kernel<T, CompMode::Local><<<grid, block, shared_bytes, stream>>>(
                     in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
-                    nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf, d_comp, nullptr);
+                    nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf,
+                    d_comp, nullptr, iter_off);
                 break;
             case CompMode::Spatial:
-                stencil2d_wmma_kernel<T, CompMode::Spatial><<<grid, block, shared_bytes>>>(
+                stencil2d_wmma_kernel<T, CompMode::Spatial><<<grid, block, shared_bytes, stream>>>(
                     in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
-                    nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf, comp_out, comp_in);
+                    nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf,
+                    c_out, c_in, iter_off);
                 break;
             case CompMode::Off:
-                stencil2d_wmma_kernel<T, CompMode::Off><<<grid, block, shared_bytes>>>(
+                stencil2d_wmma_kernel<T, CompMode::Off><<<grid, block, shared_bytes, stream>>>(
                     in_buf, d_out_fp32, out_buf, d_horizontal, d_vertical,
-                    nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf, nullptr, nullptr);
+                    nx, ny, op.neighbor, op.center, iter_num, write_fp32_flag, d_first_nf,
+                    nullptr, nullptr, iter_off);
                 break;
         }
+    };
+
+    // Lanzamiento normal sobre el stream por defecto, con el estado vivo del
+    // ping-pong de residuos: es la firma que ya usaban el warm-up y el bucle
+    // medido, sin cambios de comportamiento (stream 0 y iter_off nullptr
+    // reproducen la configuracion anterior exactamente).
+    auto launch_wmma = [&](T* in_buf, T* out_buf, int iter_num, bool write_fp32_flag) {
+        launch_wmma_on(in_buf, out_buf, comp_out, comp_in, iter_num, write_fp32_flag,
+                       nullptr, /*stream=*/0);
     };
 
     // Avanza el ping-pong de residuos junto al de los buffers T. No-op fuera
@@ -3305,6 +3463,72 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         seed_comp_buffers();
         CHECK_CUDA(cudaDeviceSynchronize());
     }
+
+    // ------------------------------------------------------------------
+    // CUDA Graphs: captura e instanciacion, FUERA de la region medida.
+    // ------------------------------------------------------------------
+    // Se hace aqui, despues del warm-up y de la restitucion del estado, y
+    // ANTES de rapl_before / del cronometro / de la ventana de energia: la
+    // captura y la instanciacion son trabajo de CPU puro (la captura no
+    // ejecuta ningun kernel, solo lo registra) y contarlas dentro del tiempo
+    // por iteracion falsearia justamente lo que este modo quiere medir.
+    //
+    // Se instancian DOS grafos, uno por paridad del ping-pong. Un grafo
+    // hornea en sus nodos los punteros con los que se capturo; como cada
+    // iteracion intercambia (tc_in, tc_out) -- y, en Spatial, (comp_in,
+    // comp_out) en el mismo paso, de modo que sus paridades van encadenadas --
+    // el estado de punteros solo tiene dos configuraciones posibles. Tras un
+    // grafo de graph_block iteraciones (PAR, ver parse_args) los punteros
+    // vuelven a la configuracion de captura, asi que reproducir el mismo
+    // cudaGraphExec_t k veces seguidas es correcto; el segundo grafo hace falta
+    // porque un tramo de lanzamientos normales entre checkpoints puede tener
+    // longitud impar y dejar el ping-pong en la otra paridad.
+    const bool use_graph = (execution_mode == ExecutionMode::Graph);
+    cudaStream_t capture_stream = nullptr;
+    cudaGraphExec_t graph_exec[2] = {nullptr, nullptr};
+    if (use_graph) {
+        CHECK_CUDA(cudaMalloc(&d_iter_offset, sizeof(int)));
+        CHECK_CUDA(cudaMemset(d_iter_offset, 0, sizeof(int)));
+        CHECK_CUDA(cudaStreamCreate(&capture_stream));
+
+        auto build_iteration_graph = [&](T* first_in, T* first_out,
+                                         float* first_comp_out, float* first_comp_in) {
+            T* p_in = first_in;
+            T* p_out = first_out;
+            float* c_out = first_comp_out;
+            float* c_in = first_comp_in;
+            CHECK_CUDA(cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal));
+            for (int k = 0; k < graph_block; ++k) {
+                // write_fp32 = false SIEMPRE dentro del grafo: el bucle medido
+                // solo mete en un grafo tramos de iteraciones que no piden
+                // checkpoint ni son la ultima (ver mas abajo), que son
+                // precisamente las que no escriben d_out_fp32.
+                // iter_num = k + 1 es RELATIVO al bloque; la iteracion global la
+                // reconstruye el kernel con *d_iter_offset.
+                launch_wmma_on(p_in, p_out, c_out, c_in, k + 1, /*write_fp32_flag=*/false,
+                               d_iter_offset, capture_stream);
+                std::swap(p_in, p_out);
+                if (comp_pingpong) std::swap(c_in, c_out);
+            }
+            advance_iteration_offset_kernel<<<1, 1, 0, capture_stream>>>(
+                d_iter_offset, graph_block);
+            cudaGraph_t graph = nullptr;
+            CHECK_CUDA(cudaStreamEndCapture(capture_stream, &graph));
+            cudaGraphExec_t exec = nullptr;
+            CHECK_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+            CHECK_CUDA(cudaGraphDestroy(graph));
+            // Sube el grafo al dispositivo por adelantado: sin esto la PRIMERA
+            // reproduccion paga la carga, y esa si caeria dentro de la region
+            // cronometrada.
+            CHECK_CUDA(cudaGraphUpload(exec, 0));
+            return exec;
+        };
+
+        graph_exec[0] = build_iteration_graph(tc_in, tc_out, comp_out, comp_in);
+        graph_exec[1] = build_iteration_graph(tc_out, tc_in, comp_in, comp_out);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+
     power_buffer_stop_sampling(power_buffer);
     power_buffer_samples_clear(power_buffer);
     const RAEnergySnapshot rapl_before = rapl_snapshot_now();
@@ -3331,18 +3555,30 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         return true;
     };
 
-    // Pares de eventos por lanzamiento del kernel WMMA (iters), sin
-    // sincronizar dentro del bucle: se graban en el stream con
-    // cudaEventRecord y solo se leen con cudaEventElapsedTime DESPUES de
-    // timer.stop_and_elapsed_ms(), que ya sincronizo una vez al final. Ya no
-    // existe un kernel de conversion separado dentro del bucle (out_tc se
-    // escribe directamente desde stencil2d_wmma_kernel), asi que
-    // t_conv_ms_out queda en 0: no hay nada que medir por separado.
+    // Pares de eventos por GRUPO DE LANZAMIENTO, sin sincronizar dentro del
+    // bucle: se graban en el stream con cudaEventRecord y solo se leen con
+    // cudaEventElapsedTime DESPUES de timer.stop_and_elapsed_ms(), que ya
+    // sincronizo una vez al final. Ya no existe un kernel de conversion
+    // separado dentro del bucle (out_tc se escribe directamente desde
+    // stencil2d_wmma_kernel), asi que t_conv_ms_out queda en 0: no hay nada
+    // que medir por separado.
+    //
+    // En modo normal un grupo es exactamente una iteracion, asi que hay iters
+    // grupos y la instrumentacion es la de siempre, iteracion por iteracion.
+    // En modo graph un grupo es una tanda de reproducciones consecutivas del
+    // mismo cudaGraphExec_t (>= graph_block iteraciones): instrumentar por
+    // iteracion exigiria nodos de evento dentro del grafo, que reintroducirian
+    // por la puerta de atras el sobrecoste que el modo quiere quitar. Por eso
+    // el desglose fino por kernel es la ruta normal, y en graph esta columna
+    // mide el tiempo de GPU dentro de los grupos (que es lo comparable con
+    // t/iter total). El vector se dimensiona a iters porque un grupo cubre al
+    // menos una iteracion: nunca puede haber mas grupos que iteraciones.
     std::vector<cudaEvent_t> wmma_start(iters), wmma_stop(iters);
     for (int i = 0; i < iters; ++i) {
         CHECK_CUDA(cudaEventCreate(&wmma_start[i]));
         CHECK_CUDA(cudaEventCreate(&wmma_stop[i]));
     }
+    int timed_groups = 0;
 
     CudaEventTimer timer;
     double total_ms = 0.0;
@@ -3379,16 +3615,67 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // mas abajo): sin eso, el tiempo GPU ocioso mientras el host hace el D2H
     // y escanea is_finite_buffer queda contabilizado en total_ms (ver
     // diagnostico: 98% "no atribuido" a 16384^2 con checkpoints activos).
-    for (int i = 0; i < iters; ++i) {
+    // Paridad viva del ping-pong respecto al estado con el que se capturaron
+    // los grafos: 0 = (tc_in, tc_out) coincide con la captura de graph_exec[0].
+    // Cada lanzamiento normal la invierte; una tanda de grafos NO la toca,
+    // porque graph_block es par.
+    int pingpong_parity = 0;
+    for (int i = 0; i < iters;) {
+        // iter_number es la iteracion GLOBAL 1..N que se va a ejecutar en esta
+        // vuelta. Se fija antes del avance de i porque el bloque de checkpoint
+        // de mas abajo corre DESPUES de ese avance y debe seguir hablando de la
+        // iteracion recien ejecutada, no de la siguiente.
+        const int iter_number = i + 1;
         // write_fp32 solo en la ultima iteracion medida o en un checkpoint:
         // es lo unico que necesita d_out_fp32 (comparacion final de error,
         // o CSV_DRIFT contra el snapshot FP64 de esta iteracion).
-        const bool write_fp32 = (i + 1 == iters) || checkpoint_due(ckpt, i + 1);
-        CHECK_CUDA(cudaEventRecord(wmma_start[i]));
-        launch_wmma(tc_in, tc_out, i + 1, write_fp32);
-        CHECK_CUDA(cudaEventRecord(wmma_stop[i]));
+        const bool write_fp32 = (iter_number == iters) || checkpoint_due(ckpt, iter_number);
+
+        // Tramo de grafo: solo cuando la iteracion actual no pide write_fp32.
+        // Se mide cuantas iteraciones consecutivas desde aqui tampoco lo piden
+        // y se cubren con floor(run / graph_block) reproducciones; el resto del
+        // tramo y la propia iteracion de checkpoint caen por la via normal de
+        // abajo. Esto produce exactamente el patron pedido:
+        //   grafo -> iteraciones hasta el checkpoint -> checkpoint -> grafo...
+        // y nunca mete una iteracion write_fp32 dentro de un grafo.
+        if (use_graph && !write_fp32) {
+            int run = 0;
+            while (i + run < iters) {
+                const int it = i + run + 1;
+                if (it == iters || checkpoint_due(ckpt, it)) break;
+                ++run;
+            }
+            const int replays = run / graph_block;
+            if (replays > 0) {
+                // Fija el origen global del primer bloque. Copia sincrona (4 B)
+                // y una sola vez por tanda -- no por reproduccion --, asi que su
+                // costo no escala con iters. El kernel advance_iteration_offset
+                // se encarga del resto desde dentro del grafo.
+                const int base = i;
+                CHECK_CUDA(cudaMemcpy(d_iter_offset, &base, sizeof(int),
+                                      cudaMemcpyHostToDevice));
+                CHECK_CUDA(cudaEventRecord(wmma_start[timed_groups]));
+                for (int r = 0; r < replays; ++r) {
+                    CHECK_CUDA(cudaGraphLaunch(graph_exec[pingpong_parity], /*stream=*/0));
+                }
+                CHECK_CUDA(cudaEventRecord(wmma_stop[timed_groups]));
+                ++timed_groups;
+                // graph_block par => numero par de swaps por reproduccion => el
+                // ping-pong queda como estaba, tanto en punteros como en
+                // paridad. No hay swap que replicar en el host.
+                i += replays * graph_block;
+                continue;
+            }
+        }
+
+        CHECK_CUDA(cudaEventRecord(wmma_start[timed_groups]));
+        launch_wmma(tc_in, tc_out, iter_number, write_fp32);
+        CHECK_CUDA(cudaEventRecord(wmma_stop[timed_groups]));
+        ++timed_groups;
         std::swap(tc_in, tc_out);
         swap_comp();
+        pingpong_parity ^= 1;
+        ++i;
 
         if (write_fp32) {
             // Cierra el tramo cronometrado antes de tocar el host con
@@ -3418,10 +3705,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             // de abajo: antes eran dos copias identicas seguidas al mismo buffer.
             CHECK_CUDA(cudaMemcpy(checkpoint_host_buf.data(), d_out_fp32,
                                   count * sizeof(float), cudaMemcpyDeviceToHost));
-            if (checkpoint_due(ckpt, i + 1)) {
-                record_checkpoint(ckpt, route_label, i + 1, checkpoint_host_buf, onset_iter);
+            if (checkpoint_due(ckpt, iter_number)) {
+                record_checkpoint(ckpt, route_label, iter_number, checkpoint_host_buf, onset_iter);
             }
-            if (archive_due(ckpt, i + 1)) {
+            if (archive_due(ckpt, iter_number)) {
                 // NO se archiva checkpoint_host_buf: ese es d_out_fp32, el
                 // acumulador ANTES del ultimo redondeo de almacenamiento. Lo que
                 // el algoritmo propaga a la iteracion siguiente es el buffer T
@@ -3440,10 +3727,10 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                     std::vector<float> comp_host(count);
                     CHECK_CUDA(cudaMemcpy(comp_host.data(), comp_in, count * sizeof(float),
                                           cudaMemcpyDeviceToHost));
-                    archive_field(*ckpt.archive, route_label, i + 1, nx, ny, "float32",
+                    archive_field(*ckpt.archive, route_label, iter_number, nx, ny, "float32",
                                   build_spatial_reconstructed_field(state_tc, comp_host));
                 } else {
-                    archive_field(*ckpt.archive, route_label, i + 1, nx, ny, "float32",
+                    archive_field(*ckpt.archive, route_label, iter_number, nx, ny, "float32",
                                   reduced_to_float(state_tc));
                 }
             }
@@ -3457,7 +3744,7 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                 out_reduced_last_finite.resize(count);
                 CHECK_CUDA(cudaMemcpy(out_reduced_last_finite.data(), tc_in, count * sizeof(T),
                                       cudaMemcpyDeviceToHost));
-                last_finite_iter = i + 1;
+                last_finite_iter = iter_number;
             }
             const auto ckpt_t1 = std::chrono::high_resolution_clock::now();
             checkpoint_ms_total +=
@@ -3508,11 +3795,17 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     out_last_finite_o = std::move(out_last_finite);
     out_reduced_last_finite_o = std::move(out_reduced_last_finite);
 
+    // Solo se leen los timed_groups pares realmente grabados (en modo normal
+    // timed_groups == iters y esto es el bucle de siempre); los sobrantes se
+    // destruyen sin consultarlos, porque cudaEventElapsedTime sobre un evento
+    // nunca grabado devuelve cudaErrorInvalidResourceHandle.
     double t_wmma_sum_ms = 0.0;
-    for (int i = 0; i < iters; ++i) {
+    for (int i = 0; i < timed_groups; ++i) {
         float ms = 0.0f;
         CHECK_CUDA(cudaEventElapsedTime(&ms, wmma_start[i], wmma_stop[i]));
         t_wmma_sum_ms += ms;
+    }
+    for (int i = 0; i < iters; ++i) {
         CHECK_CUDA(cudaEventDestroy(wmma_start[i]));
         CHECK_CUDA(cudaEventDestroy(wmma_stop[i]));
     }
@@ -3559,6 +3852,15 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     }
     if (d_comp_prev != nullptr) {
         CHECK_CUDA(cudaFree(d_comp_prev));
+    }
+    for (cudaGraphExec_t exec : graph_exec) {
+        if (exec != nullptr) CHECK_CUDA(cudaGraphExecDestroy(exec));
+    }
+    if (capture_stream != nullptr) {
+        CHECK_CUDA(cudaStreamDestroy(capture_stream));
+    }
+    if (d_iter_offset != nullptr) {
+        CHECK_CUDA(cudaFree(d_iter_offset));
     }
 
     return build_metrics(nx, ny, total_ms / iters, op.flops_per_cell);
@@ -3836,7 +4138,18 @@ static void emit_csv_summary_row(const Options& opt,
               << fmt_csv_num(cell_updates_per_s(nx, ny, t_iter_ms)) << ","
               << energy_csv_field(total_valid_energy,
                                   energy_per_cell_update_j(nx, ny, iters, energy.energy_total_j))
-              << "," << reference_role << "\n";
+              << "," << reference_role
+              // execution_mode: se AGREGA al final para no correr ningun indice
+              // existente (los scripts de post-proceso siguen leyendo $1..$36
+              // igual que antes). Se deriva del prefijo de la ruta y no se pasa
+              // por parametro porque --execution-mode graph solo tiene efecto
+              // en las rutas WMMA: CPU_FP32, CPU_FP64, GPU_FP32 y GPU_FP64
+              // corren siempre con un lanzamiento por iteracion, y etiquetarlas
+              // con el modo pedido diria que usaron un grafo que nunca existio.
+              << "," << ((std::strncmp(route, "WMMA", 4) == 0)
+                             ? execution_mode_label(opt.execution_mode)
+                             : execution_mode_label(ExecutionMode::Normal))
+              << "\n";
 }
 
 static void emit_csv_store_row(const char* route,
@@ -3916,7 +4229,7 @@ static const char* kCsvHeader =
     "t_ms_iter_ckpt,gflops_utiles,rel_l2,rel_linf,linf_abs,ref_linf,rel_l2_prop,"
     "rel_linf_prop,n_star,storage_rel_err,energy_j,avg_power_w,edp,"
     "op_mode,alpha,ci_mode,ci_p,cell_updates_per_s,energy_per_cell_update_j,"
-    "reference_role\n";
+    "reference_role,execution_mode\n";
 
 // Abre el CSV en modo append; escribe la cabecera solo si el archivo aun no
 // existe. Si el archivo YA existe con una cabecera distinta a kCsvHeader
@@ -3969,7 +4282,11 @@ static void write_csv_row(std::ofstream& csv, const Options& opt, const std::str
                           const std::string& rel_linf_prop = "NA",
                           const std::string& energy_j = "NA",
                           const std::string& avg_power_w = "NA",
-                          const std::string& edp = "NA") {
+                          const std::string& edp = "NA",
+                          // Solo las rutas WMMA pueden correr bajo CUDA Graph; las
+                          // demas quedan con el valor por defecto porque etiquetarlas
+                          // con el modo pedido diria que usaron un grafo inexistente.
+                          const char* execution_mode = "normal") {
     const int n_star = (first_nf == INT_MAX) ? -1 : first_nf;
     csv << "stencil," << formato << "," << (kahan ? 1 : 0) << "," << nx << "," << ny << ","
         << iters << "," << fmt_sci(t_ms_iter) << "," << fmt_sci(t_ms_iter * iters) << ","
@@ -3984,7 +4301,8 @@ static void write_csv_row(std::ofstream& csv, const Options& opt, const std::str
         << ci_mode_label(opt.ci_mode) << ","
         << (opt.ci_mode == CiMode::Monomode ? std::to_string(opt.ci_p) : std::string("NA")) << ","
         << fmt_sci(cell_updates_per_s(nx, ny, t_ms_iter)) << ","
-        << energy_per_cell_update << "," << reference_role << "\n";
+        << energy_per_cell_update << "," << reference_role << ","
+        << execution_mode << "\n";
 }
 
 // Umbral de overflow por formato (maximo valor finito representable), solo
@@ -4403,6 +4721,19 @@ static void print_configuration(const Options& opt, const StencilOperator& op) {
     if (opt.spatial_comp) {
         std::cout << "  (rutas WMMA reportadas como WMMA_FP16_SP / WMMA_BF16_SP)\n";
     }
+    // Solo describe a las rutas WMMA: las demas no tienen ruta de grafo (ver
+    // ExecutionMode). La columna execution_mode de CSV_SUMMARY sigue la misma
+    // regla, fila por fila.
+    std::cout << "Modo de ejecucion (WMMA)   : " << execution_mode_label(opt.execution_mode)
+              << "\n";
+    if (opt.execution_mode == ExecutionMode::Graph) {
+        std::cout << "  Iteraciones por grafo    : " << opt.graph_block << "\n";
+        if (opt.iters < opt.graph_block) {
+            std::cout << "  AVISO: iters (" << opt.iters << ") < graph-block ("
+                      << opt.graph_block << "): no se forma ningun bloque y la corrida\n"
+                      << "         degenera a lanzamientos normales.\n";
+        }
+    }
     std::cout << "Ruta GPU FP64 (referencia) : " << (opt.fp64_gpu ? "on" : "off") << "\n";
     std::cout << "Ruta CPU FP64 (cronometro) : " << (opt.cpu_fp64 ? "on" : "off") << "\n";
     std::cout << "Operador                   : " << op_mode_label(opt.op_mode) << "\n";
@@ -4521,7 +4852,8 @@ static void run_profile_only(const Options& opt) {
         int first_nf_fp16 = INT_MAX;
         EnergyMeasurement e_unused_fp16;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
-                                                  opt.iters, op, comp_mode_of(opt), ckpt,
+                                                  opt.iters, op, comp_mode_of(opt),
+                                                  opt.execution_mode, opt.graph_block, ckpt,
                                                   fp16_route_label(comp_mode_of(opt)), onset_fp16, first_nf_fp16,
                                                   t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                   t_checkpoint_ms_unused, y_tc_fp16_last_finite_unused,
@@ -4535,7 +4867,8 @@ static void run_profile_only(const Options& opt) {
         int first_nf_bf16 = INT_MAX;
         EnergyMeasurement e_unused_bf16;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
-                                                         opt.iters, op, comp_mode_of(opt), ckpt,
+                                                         opt.iters, op, comp_mode_of(opt),
+                                                         opt.execution_mode, opt.graph_block, ckpt,
                                                          bf16_route_label(comp_mode_of(opt)), onset_bf16, first_nf_bf16,
                                                          t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                          t_checkpoint_ms_unused, y_tc_bf16_last_finite_unused,
@@ -4930,7 +5263,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         EnergyMeasurement e_fp16;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, op, comp_mode,
-            ckpt, route_fp16, onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
+            opt.execution_mode, opt.graph_block, ckpt, route_fp16, onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
             storage_rel_eval_iter_fp16, t_checkpoint_ms_fp16, y_tc_fp16_last_finite,
             y_tc_fp16_reduced_last_finite, e_fp16);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
@@ -4971,6 +5304,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << fmt_pct1(100.0 * t_unattrib_fp16 / tc_fp16.ms) << " %)\n";
         std::cout << "t checkpoints/iter  : " << t_checkpoint_ms_fp16
                   << " ms  (excluido del t/iter reportado)\n";
+        std::cout << "Modo de ejecucion   : " << execution_mode_label(opt.execution_mode)
+                  << (opt.execution_mode == ExecutionMode::Graph
+                          ? "  (" + std::to_string(opt.graph_block) + " iteraciones por grafo)"
+                          : std::string())
+                  << "\n";
         print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
                             "Error rel Linf vs FP64             : ", tc_fp16_err, first_nf_fp16);
         print_propagated_error_metrics(tc_fp16_prop_err, first_nf_fp16);
@@ -5011,7 +5349,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          fmt_sci(tc_fp16_prop_err.rel_l2), fmt_sci(tc_fp16_prop_err.rel_linf),
                          energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.energy_j),
                          energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.avg_power_w),
-                         energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.edp));
+                         energy_field(!under_ncu && e_fp16.gpu_valid, e_fp16.edp),
+                         execution_mode_label(opt.execution_mode));
         }
     }
 
@@ -5024,7 +5363,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         EnergyMeasurement e_bf16;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, op, comp_mode,
-            ckpt, route_bf16, onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
+            opt.execution_mode, opt.graph_block, ckpt, route_bf16, onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
             storage_rel_eval_iter_bf16, t_checkpoint_ms_bf16, y_tc_bf16_last_finite,
             y_tc_bf16_reduced_last_finite, e_bf16);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
@@ -5059,6 +5398,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                   << fmt_pct1(100.0 * t_unattrib_bf16 / tc_bf16.ms) << " %)\n";
         std::cout << "t checkpoints/iter  : " << t_checkpoint_ms_bf16
                   << " ms  (excluido del t/iter reportado)\n";
+        std::cout << "Modo de ejecucion   : " << execution_mode_label(opt.execution_mode)
+                  << (opt.execution_mode == ExecutionMode::Graph
+                          ? "  (" + std::to_string(opt.graph_block) + " iteraciones por grafo)"
+                          : std::string())
+                  << "\n";
         print_error_metrics("Error max abs vs FP64              : ", "Error relativo L2 vs FP64          : ",
                             "Error rel Linf vs FP64             : ", tc_bf16_err, first_nf_bf16);
         print_propagated_error_metrics(tc_bf16_prop_err, first_nf_bf16);
@@ -5099,7 +5443,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                          fmt_sci(tc_bf16_prop_err.rel_l2), fmt_sci(tc_bf16_prop_err.rel_linf),
                          energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.energy_j),
                          energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.avg_power_w),
-                         energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.edp));
+                         energy_field(!under_ncu && e_bf16.gpu_valid, e_bf16.edp),
+                         execution_mode_label(opt.execution_mode));
         }
     }
 
