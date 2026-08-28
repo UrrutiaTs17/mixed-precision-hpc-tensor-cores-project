@@ -87,8 +87,12 @@ echo
 EXTRAE_TIEMPO='{printf "%s %s %s\n", $2, $7, $12}'
 
 # --- Estadistica de las replicas (mediana, min, max, desviacion) ------------
-resumir() {   # stdin: "<ruta> <t_iter_ms>" repetido
-    python3 - "$@" <<'PY'
+# El script se escribe a un FICHERO y no se pasa por heredoc a `python3 -`:
+# con `python3 - <<PY`, el heredoc ES el stdin del interprete (de ahi lee el
+# programa), asi que sys.stdin queda agotado y el fichero de datos redirigido a
+# la funcion nunca se lee. Ese fallo dejo la tabla vacia en el job 6683.
+RESUMIR_PY="${WORK}/resumir.py"
+cat > "${RESUMIR_PY}" <<'PY'
 import sys, statistics as st
 from collections import defaultdict
 d = defaultdict(list)
@@ -97,17 +101,23 @@ for linea in sys.stdin:
     if len(p) < 2: continue
     try: d[p[0]].append(float(p[1]))
     except ValueError: continue
-print(f"  {'ruta':<16} {'n':>2} {'mediana':>11} {'min':>11} {'max':>11} {'desv':>10} {'CV%':>7}")
-print("  " + "-"*72)
+if not d:
+    print("  (sin datos: ningun CSV_SUMMARY extraido de los logs)")
+    sys.exit(0)
+print(f"  {'ruta':<22} {'n':>2} {'mediana':>11} {'min':>11} {'max':>11} {'desv':>10} {'CV%':>7}")
+print("  " + "-"*78)
 for ruta in sorted(d):
     v = d[ruta]
     med = st.median(v)
     sd  = st.stdev(v) if len(v) > 1 else 0.0
     cv  = 100.0*sd/med if med else float('nan')
-    print(f"  {ruta:<16} {len(v):>2} {med:>11.6f} {min(v):>11.6f} {max(v):>11.6f} {sd:>10.6f} {cv:>7.2f}")
+    print(f"  {ruta:<22} {len(v):>2} {med:>11.6f} {min(v):>11.6f} {max(v):>11.6f} {sd:>10.6f} {cv:>7.2f}")
 print()
 print("  Unidades: ms por iteracion. CV% = desviacion/mediana.")
 PY
+
+resumir() {   # $1 = fichero con lineas "<ruta> <t_iter_ms>"
+    python3 "${RESUMIR_PY}" < "$1"
 }
 
 correr_matriz() {   # $1 nx  $2 ny  $3 replicas  $4 etiqueta
@@ -140,7 +150,8 @@ correr_matriz() {   # $1 nx  $2 ny  $3 replicas  $4 etiqueta
 
     echo
     echo "-- ${ETI}: ${NX}x${NY}, ${ITERS} iteraciones medidas, ${REPS} replicas --"
-    resumir < "${acumulado}"
+    echo "  (filas extraidas: $(wc -l < "${acumulado}"))"
+    resumir "${acumulado}"
 }
 
 # ===========================================================================
