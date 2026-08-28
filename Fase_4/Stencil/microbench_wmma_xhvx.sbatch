@@ -7,7 +7,9 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --exclusive
-#SBATCH --time=00:45:00
+#SBATCH --time=03:00:00
+# Las etapas 1 y 2 terminan en minutos; el walltime largo es para la etapa 3,
+# donde CPU_FP32 y la referencia FP64 iteran junto a la GPU (ver su bloque).
 
 # ===========================================================================
 # MICROBENCHMARK de la formulacion WMMA Y = X H + V X
@@ -171,12 +173,28 @@ elif [[ "${ETAPA}" == "3" ]]; then
     # ADVERTENCIA: estas iteraciones extra son SOLO para alargar la ventana
     # energetica. Su rel_l2 no es comparable con el de las etapas 1 y 2, que
     # usan 50 iteraciones. No mezclar ambas cosas al reportar precision.
-    ITERS_E="${ITERS_E:-2000}"
+    # Dimensionado de ITERS_E: la ventana debe llegar a 2 s en la ruta GPU mas
+    # RAPIDA, que es la que antes se queda corta. A 16384^2, GPU_FP32 ronda los
+    # 3 ms/iter, luego 700 iteraciones dan ~2.1 s; las rutas WMMA, mas lentas
+    # por iteracion, quedan holgadamente por encima.
+    #
+    # COSTE: no hay flag que apague CPU_FP32 ni la referencia FP64, y ambas
+    # iteran junto a la GPU. A 700 iteraciones eso son ~7 min de CPU cada una,
+    # por modo de compensacion: la etapa entera ronda los 45 min aunque el
+    # trabajo de GPU sean segundos. Es el precio de una ventana NVML fiable, no
+    # un error de dimensionado. Bajar ITERS_E acorta el job pero mete la
+    # cuantizacion del contador (~4-5 J de salto) dentro de la medida.
+    ITERS_E="${ITERS_E:-700}"
+    MODOS_E="${MODOS_E:-off local spatial}"
     echo "############################################################"
     echo "# ETAPA 3: ventana energetica (${ITERS_E} iteraciones)"
     echo "############################################################"
+    echo "Modos a medir: ${MODOS_E}"
+    echo "Para partirlo en jobs mas cortos: --export=ALL,ETAPA=3,MODOS_E=spatial"
+    echo
     for comp in "off:--kahan off" "local:--kahan on" "spatial:--spatial-comp on"; do
         nombre="${comp%%:*}"; flags="${comp#*:}"
+        [[ " ${MODOS_E} " == *" ${nombre} "* ]] || continue
         log="${S}/energia_${nombre}.log"
         echo "-- ${nombre} --"
         # shellcheck disable=SC2086
