@@ -2805,6 +2805,96 @@ struct alignas(16) TVec8 {
     T v[8];
 };
 
+// ---------------------------------------------------------------------------
+// mma.sync.aligned.m16n8k16 explicito (sm_80+).
+//
+// No es una instruccion distinta de la que ya se ejecutaba: wmma m16n16k16 con
+// acumulador FP32 se baja a EXACTAMENTE dos mma.m16n8k16 (una por mitad de n),
+// con la misma particion del acumulador. Lo que cambia no es la aritmetica sino
+// la VISIBILIDAD del reparto lane->celda, que wmma oculta tras load/store_
+// matrix_sync y que el ISA de PTX especifica. Esa visibilidad es el requisito
+// para swizzlear la shared: store_matrix_sync solo acepta un ldm plano, y un
+// ldm plano es justo lo que hizo fracasar al barrido de padding (job 6735,
+// ninguna de las 5 variantes gano; el padding CREA conflictos en el epilogo
+// escalar, que a ldm = 16 estaba libre de ellos).
+//
+// Reparto de fragmentos (PTX ISA, "Matrix Fragments for mma.m16n8k16"), con
+// gid = lane>>2 (0..7) y tid = lane&3 (0..3):
+//
+//   A (16x16, row-major)   ra0 -> (gid,   2tid) (gid,   2tid+1)
+//                          ra1 -> (gid+8, 2tid) (gid+8, 2tid+1)
+//                          ra2 -> (gid,   2tid+8) (gid,   2tid+9)
+//                          ra3 -> (gid+8, 2tid+8) (gid+8, 2tid+9)
+//   B (16x8,  col-major)   rb0 -> (2tid,   gid) (2tid+1, gid)
+//                          rb1 -> (2tid+8, gid) (2tid+9, gid)
+//   C/D (16x8)             d0,d1 -> (gid,   2tid) (gid,   2tid+1)
+//                          d2,d3 -> (gid+8, 2tid) (gid+8, 2tid+1)
+//
+// Cada par de A y de D son columnas CONTIGUAS de la misma fila: sobre un origen
+// row-major entran y salen con un unico acceso de 32 / 64 bits. El par de B son
+// filas contiguas de la misma columna, separadas por ldm: dos accesos de 16
+// bits y un empaquetado.
+//
+// El sufijo .row.col NO describe como esta la matriz en memoria: describe el
+// orden interno del fragmento, y es la unica combinacion que m16n8k16 admite en
+// sm_80. B[k][n] se sigue leyendo de un origen row-major como src[k*ldm + n],
+// igual que hacia wmma::load_matrix_sync sobre un fragment<matrix_b,row_major>.
+
+__device__ __forceinline__ uint32_t tc_pack2(__half lo, __half hi) {
+    return (static_cast<uint32_t>(__half_as_ushort(hi)) << 16)
+         |  static_cast<uint32_t>(__half_as_ushort(lo));
+}
+__device__ __forceinline__ uint32_t tc_pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return (static_cast<uint32_t>(__bfloat16_as_ushort(hi)) << 16)
+         |  static_cast<uint32_t>(__bfloat16_as_ushort(lo));
+}
+
+// Dos elementos de 16 bits contiguos leidos como un unico acceso de 32 bits.
+// Todos los usos caen en indices de elemento PARES sobre bases alineadas a 32 B
+// (la region de shared de cada warp es multiplo de 32, y cudaMalloc da 256), y
+// kLdX / kTile son pares, asi que la direccion es siempre multiplo de 4.
+__device__ __forceinline__ uint32_t tc_ld32(const void* p) {
+    return *reinterpret_cast<const uint32_t*>(p);
+}
+
+// El tag por puntero nulo selecciona el sufijo del PTX sin construir nada.
+__device__ __forceinline__ void mma_m16n8k16(float (&d)[4],
+                                             const uint32_t (&a)[4],
+                                             const uint32_t (&b)[2],
+                                             const float (&c)[4],
+                                             const __half*) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+    (void)a; (void)b;
+    d[0] = c[0]; d[1] = c[1]; d[2] = c[2]; d[3] = c[3];
+#endif
+}
+__device__ __forceinline__ void mma_m16n8k16(float (&d)[4],
+                                             const uint32_t (&a)[4],
+                                             const uint32_t (&b)[2],
+                                             const float (&c)[4],
+                                             const __nv_bfloat16*) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+    (void)a; (void)b;
+    d[0] = c[0]; d[1] = c[1]; d[2] = c[2]; d[3] = c[3];
+#endif
+}
+
 // Aritmetica del epilogo por CELDA. Se extrae a una sola funcion para que las
 // dos rutas de acceso del kernel -- la vectorizada y la escalar de respaldo --
 // no puedan divergir nunca: hay UNA copia de la formula, no dos.
@@ -3090,10 +3180,76 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
         }
         __syncwarp();
 
-        // Y = X H + V X: exactamente DOS mma_sync por tile interior completo.
-        // X entra como matrix_a en el primero y como matrix_b en el segundo;
-        // es el mismo tile de shared en ambos casos, cargado en fragmentos
-        // distintos. El acumulador es FP32, igual que antes.
+        // Y = X H + V X: exactamente DOS mma por mitad de n y tile interior
+        // completo, es decir las mismas cuatro HMMA.16816 que emitia wmma. X
+        // entra como A en el primero y como B en el segundo; es el mismo tile
+        // de shared, leido con los dos repartos de fragmento. El acumulador es
+        // FP32 y el orden de acumulacion es identico al de antes:
+        //
+        //     acc  = X H + 0        (C = cero, como wmma::fill_fragment)
+        //     acc' = V X + acc
+        //
+        // out_tile no solapa a x_tile, asi que el volcado no destruye el tile
+        // que los mma acaban de consumir.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        const int gid = lane >> 2;      // 0..7  fila base dentro del fragmento
+        const int tid = lane & 3;       // 0..3  par de columnas
+
+        // A = X (shared, row-major, ldm = kLdX). Los cuatro cuadrantes 8x8 en
+        // el orden que exige el fragmento: (0,0), (8,0), (0,8), (8,8).
+        uint32_t ra_x[4];
+        {
+            const T* const p = x_tile + gid * kLdX + 2 * tid;
+            ra_x[0] = tc_ld32(p);
+            ra_x[1] = tc_ld32(p + 8 * kLdX);
+            ra_x[2] = tc_ld32(p + 8);
+            ra_x[3] = tc_ld32(p + 8 * kLdX + 8);
+        }
+        // A = V (global, row-major, ldm = kTile: el operador NO lleva padding).
+        uint32_t ra_v[4];
+        {
+            const T* const p = vertical_op + gid * kTile + 2 * tid;
+            ra_v[0] = tc_ld32(p);
+            ra_v[1] = tc_ld32(p + 8 * kTile);
+            ra_v[2] = tc_ld32(p + 8);
+            ra_v[3] = tc_ld32(p + 8 * kTile + 8);
+        }
+
+        const float zero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        #pragma unroll
+        for (int nh = 0; nh < 2; ++nh) {
+            const int col = nh * 8 + gid;      // columna de B que posee la lane
+
+            uint32_t rb_h[2];                  // B = H
+            rb_h[0] = tc_pack2(horizontal_op[(2 * tid + 0) * kTile + col],
+                               horizontal_op[(2 * tid + 1) * kTile + col]);
+            rb_h[1] = tc_pack2(horizontal_op[(2 * tid + 8) * kTile + col],
+                               horizontal_op[(2 * tid + 9) * kTile + col]);
+
+            uint32_t rb_x[2];                  // B = X
+            rb_x[0] = tc_pack2(x_tile[(2 * tid + 0) * kLdX + col],
+                               x_tile[(2 * tid + 1) * kLdX + col]);
+            rb_x[1] = tc_pack2(x_tile[(2 * tid + 8) * kLdX + col],
+                               x_tile[(2 * tid + 9) * kLdX + col]);
+
+            float acc_h[4], acc[4];
+            mma_m16n8k16(acc_h, ra_x, rb_h, zero4, static_cast<const T*>(nullptr));
+            mma_m16n8k16(acc,   ra_v, rb_x, acc_h, static_cast<const T*>(nullptr));
+
+            // d0,d1 y d2,d3 son columnas contiguas: dos accesos de 64 bits en
+            // vez de cuatro escalares. kLdF es par y el desplazamiento de
+            // columna (nh*8 + 2*tid) tambien, asi que la direccion es multiplo
+            // de 8 B, que es lo que float2 exige.
+            *reinterpret_cast<float2*>(&out_tile[gid * kLdF + nh * 8 + 2 * tid]) =
+                make_float2(acc[0], acc[1]);
+            *reinterpret_cast<float2*>(&out_tile[(gid + 8) * kLdF + nh * 8 + 2 * tid]) =
+                make_float2(acc[2], acc[3]);
+        }
+#else
+        // sm_70 / sm_75 no tienen mma.m16n8k16: se conserva la ruta wmma para
+        // que el fuente siga compilando en esos objetivos (ver CUDA_ARCH en los
+        // sbatch, que admite 70 y 86 ademas de 80).
         wmma::fragment<wmma::matrix_a, kTile, kTile, kTile, T, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, kTile, kTile, kTile, T, wmma::row_major> b_frag;
         wmma::fragment<wmma::accumulator, kTile, kTile, kTile, float> acc_frag;
@@ -3108,9 +3264,8 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
         wmma::load_matrix_sync(b_frag, x_tile, kLdX);            // B = X
         wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);      // acc += V X
 
-        // out_tile no solapa a x_tile, asi que este volcado no destruye el
-        // tile que los dos mma acaban de consumir.
         wmma::store_matrix_sync(out_tile, acc_frag, kLdF, wmma::mem_row_major);
+#endif
         __syncwarp();
 
         // Finitud evaluada sobre el acumulador FP32 (out_tile), antes de
