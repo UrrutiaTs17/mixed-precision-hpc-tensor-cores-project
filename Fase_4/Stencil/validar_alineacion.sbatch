@@ -78,18 +78,43 @@ git -C "${REPO_ROOT}" worktree add --detach "${BASE_TREE}" "${BASE_COMMIT}"
 BIN_BASE="${PWD}/${WORK}/stencil_base"
 BIN_NEW="${PWD}/${WORK}/stencil_nuevo"
 
-compilar() {   # $1 = raiz del arbol, $2 = binario de salida
+compilar() {   # $1 = raiz del arbol, $2 = binario de salida, $3 = log de ptxas
     ( cd "$1/Fase_3/Stencil" && "${NVCC}" -std=c++17 stencil_tensor_activation.cu -o "$2" \
         -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
         -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
-        --allow-unsupported-compiler "${NVML_FLAGS[@]}" )
+        -Xptxas=-v \
+        --allow-unsupported-compiler "${NVML_FLAGS[@]}" ) 2> "$3"
 }
 
-compilar "${BASE_TREE}" "${BIN_BASE}"
+PTX_BASE="${PWD}/${WORK}/ptxas_base.txt"
+PTX_NEW="${PWD}/${WORK}/ptxas_nuevo.txt"
+
+compilar "${BASE_TREE}" "${BIN_BASE}" "${PTX_BASE}"
 echo "  BASE  compilado: $(sha256sum "${BIN_BASE}" | awk '{print $1}')"
-compilar "${REPO_ROOT}" "${BIN_NEW}"
+compilar "${REPO_ROOT}" "${BIN_NEW}" "${PTX_NEW}"
 echo "  NUEVO compilado: $(sha256sum "${BIN_NEW}" | awk '{print $1}')"
 echo "  (los sha256 DEBEN diferir: son revisiones distintas)"
+echo
+
+# --- Presion de registros ---------------------------------------------------
+# El epilogo vectorizado mantiene 8 acumuladores FP32 y 8 valores cuantizados
+# vivos a la vez. Si eso provoca spills, la vectorizacion se paga en trafico a
+# memoria local y el cambio deja de tener sentido: es un criterio de rechazo,
+# no un aviso.
+echo "-- Recursos por kernel WMMA (ptxas) --"
+echo "   BASE:"
+grep -A3 -i "stencil2d_wmma_kernel" "${PTX_BASE}" | sed 's/^/     /' || echo "     (sin lineas)"
+echo "   NUEVO:"
+grep -A3 -i "stencil2d_wmma_kernel" "${PTX_NEW}" | sed 's/^/     /' || echo "     (sin lineas)"
+echo
+spills_nuevo=0
+if grep -qi "spill" "${PTX_NEW}"; then
+    echo "  ATENCION: la revision NUEVA reporta spills:"
+    grep -i "spill" "${PTX_NEW}" | sed 's/^/     /'
+    spills_nuevo=1
+else
+    echo "  OK: cero spill stores y cero spill loads en la revision NUEVA."
+fi
 echo
 
 # ===========================================================================
@@ -165,22 +190,71 @@ done
 
 echo
 # ===========================================================================
+# ETAPA 2b — compute-sanitizer sobre la ruta vectorizada
+# ===========================================================================
+# Los accesos de 128 bits son el riesgo NUEVO: un cast a un tipo de 16 B sobre
+# una direccion que no lo este produce acceso desalineado. La aritmetica dice
+# que estan alineados; esto lo comprueba en el hardware.
+echo "############################################################"
+echo "# ETAPA 2b: compute-sanitizer (memcheck) sobre la ruta vectorizada"
+echo "############################################################"
+
+SANITIZER_BIN=""
+_nvcc_dir="$(dirname "${NVCC}")"
+for cand in "$(command -v compute-sanitizer || true)" \
+            "${_nvcc_dir}/compute-sanitizer" \
+            "${_nvcc_dir}/../../cuda/bin/compute-sanitizer" \
+            "${_nvcc_dir}"/../../cuda/*/bin/compute-sanitizer; do
+    if [[ -n "${cand}" && -x "${cand}" ]]; then SANITIZER_BIN="${cand}"; break; fi
+done
+
+sanit_fallos=0
+if [[ -z "${SANITIZER_BIN}" ]]; then
+    echo "  compute-sanitizer no encontrado; se omite esta etapa (no cuenta como fallo)."
+else
+    echo "  Binario: ${SANITIZER_BIN}"
+    for MODO in "" "--kahan on" "--spatial-comp on"; do
+        etiqueta="sanit_${MODO// /}"
+        [[ -z "${MODO}" ]] && etiqueta="sanit_off"
+        log="${S}/${etiqueta}.log"
+        mkdir -p "${S}"
+        if "${SANITIZER_BIN}" --tool memcheck --error-exitcode 1 \
+             "${BIN_NEW}" --nx 64 --ny 64 --iters 5 --tc both \
+             --fp64-gpu off --cpu-fp64 off ${MODO} > "${log}" 2>&1; then
+            echo "  OK    memcheck ${etiqueta}"
+        else
+            echo "  FALLO memcheck ${etiqueta} (ver ${log})"
+            grep -iE "error|invalid|misaligned" "${log}" | head -10 | sed 's/^/        /'
+            sanit_fallos=$((sanit_fallos + 1))
+        fi
+    done
+fi
+echo
+
+# ===========================================================================
 # ETAPA 3 — Veredicto
 # ===========================================================================
 echo "############################################################"
 echo "# ETAPA 3: veredicto"
 echo "############################################################"
-echo "Casos ejecutados : ${casos}"
-echo "Casos con FALLO  : ${fallos}"
+echo "Casos ejecutados      : ${casos}"
+echo "Casos con FALLO       : ${fallos}"
+echo "memcheck con FALLO    : ${sanit_fallos}"
+echo "Spills en la revision NUEVA: ${spills_nuevo}"
 git -C "${REPO_ROOT}" worktree remove --force "${BASE_TREE}" || true
-if [[ "${fallos}" -eq 0 ]]; then
+total=$((fallos + sanit_fallos + spills_nuevo))
+if [[ "${total}" -eq 0 ]]; then
     echo
-    echo "VEREDICTO: el desplazamiento de punteros NO altera un solo bit."
-    echo "Autorizada la Etapa 4 (vectorizacion de los accesos globales)."
+    echo "VEREDICTO: la revision NUEVA es identica BIT A BIT a la BASE, sin"
+    echo "accesos invalidos y sin spills. Autorizada la medicion de rendimiento."
     exit 0
 else
     echo
-    echo "VEREDICTO: HAY DIFERENCIAS. No continuar con la vectorizacion."
-    echo "Revisa ${WORK}/salidas/<caso>/{base,nuevo}.sha y los .log del caso."
+    echo "VEREDICTO: NO autorizado."
+    # if/then y no [[ ]] && echo: con set -e una condicion falsa abortaria el
+    # script y se perderian las lineas siguientes.
+    if [[ "${fallos}"       -ne 0 ]]; then echo "  - hay diferencias numericas: revisa ${WORK}/salidas/<caso>/{base,nuevo}.sha"; fi
+    if [[ "${sanit_fallos}" -ne 0 ]]; then echo "  - compute-sanitizer reporta accesos invalidos"; fi
+    if [[ "${spills_nuevo}" -ne 0 ]]; then echo "  - ptxas reporta spills: la vectorizacion se paga en memoria local"; fi
     exit 1
 fi
