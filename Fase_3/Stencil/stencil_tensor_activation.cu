@@ -2999,17 +2999,35 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             comp_band_u = cb + 2 * kTile;
             comp_band_d = cb + 3 * kTile;
             if (vec_ok) {
-                // 256 floats / 4 por float4 = 64 vectores, DOS por lane, con el
-                // mismo mapeo lane -> (fila, mitad) que el tile de X para que
-                // ambos recorran la memoria en el mismo orden.
-                const int row = lane >> 1;
-                const int col0 = 8 * (lane & 1);
-                const int lin0 = row * kTile + col0;
-                const int src0 = idx2d(x0 + col0, y0 + row, nx);
-                *reinterpret_cast<float4*>(&comp_tile[lin0]) =
-                    *reinterpret_cast<const float4*>(&comp_prev[src0]);
-                *reinterpret_cast<float4*>(&comp_tile[lin0 + 4]) =
-                    *reinterpret_cast<const float4*>(&comp_prev[src0 + 4]);
+                // 256 floats / 4 por float4 = 64 chunks, DOS por lane.
+                //
+                // El reparto NO es el mismo que el del tile de X, y la
+                // diferencia importa. Con __half caben 8 elementos en 16 B, asi
+                // que 8 x 32 lanes = 256 = el tile ENTERO en UNA instruccion
+                // perfectamente contigua. Con float solo caben 4: 4 x 32 = 128,
+                // media fila-tile, y hacen falta DOS instrucciones. Repartir
+                // entonces "8 floats contiguos por lane" (el mapeo de X) hace
+                // que cada instruccion cubra mitades ENTRELAZADAS de cada fila:
+                // la primera trae los sectores y la segunda los vuelve a pedir.
+                // Acierta en L1, pero duplica las peticiones -- medido en el job
+                // 6727 como -2 % en spatial, el unico modo con comp_prev, frente
+                // al +6 % que las demas cargas vectorizadas dan en local.
+                //
+                // El reparto correcto es por CHUNKS CONTIGUOS ENTRE LANES: la
+                // lane L toma los chunks L y L+32, de modo que las lanes 0..3
+                // cubren la fila 0 completa (64 B seguidos), las 4..7 la fila 1,
+                // y cada instruccion barre 8 filas enteras sin huecos. En shared
+                // el destino es 16*c bytes, lineal, sin conflicto de banco.
+                #pragma unroll
+                for (int t = 0; t < 2; ++t) {
+                    const int c = lane + t * kWarpThreads;   // chunk 0..63
+                    const int el = c * 4;                    // elemento local
+                    const int lrow = el / kTile;
+                    const int lcol = el % kTile;             // 0, 4, 8 o 12
+                    *reinterpret_cast<float4*>(&comp_tile[el]) =
+                        *reinterpret_cast<const float4*>(
+                            &comp_prev[idx2d(x0 + lcol, y0 + lrow, nx)]);
+                }
             } else {
                 for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
                     const int local_x = linear % kTile;
