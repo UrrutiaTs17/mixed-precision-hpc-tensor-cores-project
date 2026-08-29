@@ -2759,6 +2759,69 @@ __host__ __device__ constexpr size_t wmma_warp_shared_bytes(CompMode mode) {
                 : 0);
 }
 
+// Ocho elementos de 16 bits = 16 B: la unidad de acceso de 128 bits de la ruta
+// vectorizada. El alignas(16) es lo que autoriza al compilador a emitir un
+// LDG.128/STG.128 en vez de ocho accesos escalares; sin el, el cast seria
+// legal pero el acceso se desharia en ocho.
+template <typename T>
+struct alignas(16) TVec8 {
+    T v[8];
+};
+
+// Aritmetica del epilogo por CELDA. Se extrae a una sola funcion para que las
+// dos rutas de acceso del kernel -- la vectorizada y la escalar de respaldo --
+// no puedan divergir nunca: hay UNA copia de la formula, no dos.
+//
+// La secuencia es transcripcion literal de la que tenia el bucle escalar:
+// mismo orden de las cuatro correcciones de banda, mismo fmaf explicito, mismos
+// casts y misma posicion. Es parte del objeto experimental y no se toca.
+//
+// Devuelve el valor FP32 corregido y NO almacena nada: la cuantizacion y el
+// calculo del residuo siguen siendo responsabilidad exclusiva de
+// compensated_store, que es la referencia numerica.
+template <typename T, CompMode kMode>
+__device__ __forceinline__ float wmma_epilogue_value(
+        float val, int local_x, int local_y, int linear,
+        const T* band_l, const T* band_r, const T* band_u, const T* band_d,
+        const float* comp_tile,
+        const float* comp_band_l, const float* comp_band_r,
+        const float* comp_band_u, const float* comp_band_d,
+        float c_neigh, float c_center) {
+    // H y V solo alcanzan a las vecinas que caen DENTRO del tile: las celdas
+    // del borde del tile pierden una vecina cada una, que se suma aqui en FP32
+    // desde las bandas. Las cuatro esquinas del tile satisfacen dos de estas
+    // condiciones a la vez y reciben, como corresponde, las DOS contribuciones.
+    if (local_x == 0)         val += c_neigh * tc_to_float(band_l[local_y]);
+    if (local_x == kTile - 1) val += c_neigh * tc_to_float(band_r[local_y]);
+    if (local_y == 0)         val += c_neigh * tc_to_float(band_u[local_x]);
+    if (local_y == kTile - 1) val += c_neigh * tc_to_float(band_d[local_x]);
+
+    if constexpr (kMode == CompMode::Spatial) {
+        // El estado que entro al Tensor Core es de tipo T: sumarle el residuo
+        // FP32 antes del mma lo destruiria al reconvertir a 16 bits. Como el
+        // operador es LINEAL, la correccion se calcula aparte en FP32 y se suma
+        // al acumulador ya volcado:
+        //   L(v + c) = L(v) + L(c)
+        // donde L es el mismo Laplaciano de 5 puntos, v el estado almacenado en
+        // T y c el residuo. Equivale exactamente a leer v+c en cada vecina (que
+        // es lo que hace la rama de tile parcial del kernel), sin sacar el
+        // trabajo pesado de los Tensor Cores ni tocar la formula del stencil.
+        // Los cinco residuos salen de shared: los interiores del tile central y
+        // los del borde de las bandas ya cargadas.
+        const float cc = comp_tile[linear];
+        const float cl = (local_x > 0)         ? comp_tile[linear - 1]
+                                               : comp_band_l[local_y];
+        const float cr = (local_x < kTile - 1) ? comp_tile[linear + 1]
+                                               : comp_band_r[local_y];
+        const float cu = (local_y > 0)         ? comp_tile[linear - kTile]
+                                               : comp_band_u[local_x];
+        const float cd = (local_y < kTile - 1) ? comp_tile[linear + kTile]
+                                               : comp_band_d[local_x];
+        val += fmaf(c_neigh, cu + cd + cl + cr, c_center * cc);
+    }
+    return val;
+}
+
 // kMode (parametro de plantilla, no runtime): elige la politica de
 // compensacion del redondeo de almacenamiento (ver CompMode /
 // compensated_store). comp/comp_prev son nullptr y no se tocan cuando
@@ -2855,20 +2918,67 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
         // 256 valores del tile central + 4*16 de las bandas exteriores = 320
         // lecturas globales de 16 bits por tile completo. La formulacion
         // anterior, con cinco tiles desplazados, hacia 5*256 = 1280.
-        for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
-            const int local_x = linear % kTile;
-            const int local_y = linear / kTile;
-            x_tile[linear] = in[idx2d(x0 + local_x, y0 + local_y, nx)];
+        //
+        // vec_ok: un acceso de 128 bits solo es representable si cada fila del
+        // tile cae en frontera de 16 B. Con el puntero del dominio ya
+        // desplazado (ver kAlignOffsetElems) el indice de la primera celda
+        // interior de la fila y es 16 + y*nx + 16*tile_x, luego la condicion se
+        // reduce a nx multiplo de 8: 16 B son 8 elementos de 16 bits, y para
+        // los buffers FP32 son 4 floats, que nx multiplo de 8 tambien implica.
+        //
+        // La condicion es UNIFORME en todo el grid (nx no depende del tile), asi
+        // que la rama no diverge dentro del warp. Con nx no multiplo de 8 -- las
+        // mallas 63/511 de la validacion pequena -- se toma la ruta escalar, que
+        // es exactamente la de siempre, byte a byte.
+        const bool vec_ok = ((nx & 7) == 0);
+
+        if (vec_ok) {
+            // 256 elementos / 8 por vector = 32 vectores: exactamente uno por
+            // lane. El mapeo lane -> (fila = lane/2, mitad = lane%2) hace que el
+            // lane L escriba los bytes [16L, 16L+16) de x_tile, un patron lineal
+            // que cubre los 32 bancos de shared sin un solo conflicto.
+            const int row = lane >> 1;
+            const int col0 = 8 * (lane & 1);
+            *reinterpret_cast<TVec8<T>*>(&x_tile[row * kTile + col0]) =
+                *reinterpret_cast<const TVec8<T>*>(&in[idx2d(x0 + col0, y0 + row, nx)]);
+        } else {
+            for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
+                const int local_x = linear % kTile;
+                const int local_y = linear / kTile;
+                x_tile[linear] = in[idx2d(x0 + local_x, y0 + local_y, nx)];
+            }
         }
         // full_tile garantiza x0 >= 1 y x0+kTile-1 <= nx-2 (idem en y), luego
         // x0-1 >= 0 y x0+kTile <= nx-1: las cuatro bandas caen dentro de la
         // malla y no necesitan guarda de rango. Las esquinas diagonales del
         // halo NO se cargan: el stencil de 5 puntos no las usa.
-        for (int b = lane; b < kTile; b += kWarpThreads) {
-            band_l[b] = in[idx2d(x0 - 1,     y0 + b,     nx)];
-            band_r[b] = in[idx2d(x0 + kTile, y0 + b,     nx)];
-            band_u[b] = in[idx2d(x0 + b,     y0 - 1,     nx)];
-            band_d[b] = in[idx2d(x0 + b,     y0 + kTile, nx)];
+        //
+        // Las bandas SUPERIOR e INFERIOR son 16 elementos contiguos en x y se
+        // vectorizan igual que el tile: 2 vectores cada una, 4 lanes en total.
+        // Las bandas IZQUIERDA y DERECHA recorren y con paso nx -- un valor por
+        // fila, nunca contiguos --, asi que se quedan escalares por
+        // construccion. No es una limitacion de la alineacion sino del layout:
+        // ningun desplazamiento de puntero las vuelve vectorizables.
+        if (vec_ok) {
+            if (lane < 4) {
+                const int which = lane >> 1;              // 0 = superior, 1 = inferior
+                const int col0 = 8 * (lane & 1);
+                const int y_src = (which == 0) ? (y0 - 1) : (y0 + kTile);
+                T* const dst = (which == 0) ? band_u : band_d;
+                *reinterpret_cast<TVec8<T>*>(&dst[col0]) =
+                    *reinterpret_cast<const TVec8<T>*>(&in[idx2d(x0 + col0, y_src, nx)]);
+            }
+            for (int b = lane; b < kTile; b += kWarpThreads) {
+                band_l[b] = in[idx2d(x0 - 1,     y0 + b, nx)];
+                band_r[b] = in[idx2d(x0 + kTile, y0 + b, nx)];
+            }
+        } else {
+            for (int b = lane; b < kTile; b += kWarpThreads) {
+                band_l[b] = in[idx2d(x0 - 1,     y0 + b,     nx)];
+                band_r[b] = in[idx2d(x0 + kTile, y0 + b,     nx)];
+                band_u[b] = in[idx2d(x0 + b,     y0 - 1,     nx)];
+                band_d[b] = in[idx2d(x0 + b,     y0 + kTile, nx)];
+            }
         }
 
         // Residuos de la compensacion espacial: 256 centrales + 64 de banda,
@@ -2888,11 +2998,29 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             comp_band_r = cb + 1 * kTile;
             comp_band_u = cb + 2 * kTile;
             comp_band_d = cb + 3 * kTile;
-            for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
-                const int local_x = linear % kTile;
-                const int local_y = linear / kTile;
-                comp_tile[linear] = comp_prev[idx2d(x0 + local_x, y0 + local_y, nx)];
+            if (vec_ok) {
+                // 256 floats / 4 por float4 = 64 vectores, DOS por lane, con el
+                // mismo mapeo lane -> (fila, mitad) que el tile de X para que
+                // ambos recorran la memoria en el mismo orden.
+                const int row = lane >> 1;
+                const int col0 = 8 * (lane & 1);
+                const int lin0 = row * kTile + col0;
+                const int src0 = idx2d(x0 + col0, y0 + row, nx);
+                *reinterpret_cast<float4*>(&comp_tile[lin0]) =
+                    *reinterpret_cast<const float4*>(&comp_prev[src0]);
+                *reinterpret_cast<float4*>(&comp_tile[lin0 + 4]) =
+                    *reinterpret_cast<const float4*>(&comp_prev[src0 + 4]);
+            } else {
+                for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
+                    const int local_x = linear % kTile;
+                    const int local_y = linear / kTile;
+                    comp_tile[linear] = comp_prev[idx2d(x0 + local_x, y0 + local_y, nx)];
+                }
             }
+            // Las cuatro bandas de residuo se quedan escalares: izquierda y
+            // derecha por el stride nx (igual que sus homologas en T), y
+            // superior/inferior porque son 32 lecturas sobre las 320 del tile y
+            // no justifican una tercera ruta de acceso.
             for (int b = lane; b < kTile; b += kWarpThreads) {
                 comp_band_l[b] = comp_prev[idx2d(x0 - 1,     y0 + b,     nx)];
                 comp_band_r[b] = comp_prev[idx2d(x0 + kTile, y0 + b,     nx)];
@@ -2930,51 +3058,71 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
         // conversion dentro del bucle); out_fp32 solo cuando write_fp32 (ultima
         // iteracion medida o checkpoint), con la MISMA funcion de conversion
         // que convert_float_to_half_kernel/convert_float_to_bfloat16_kernel.
-        for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
-            const int local_x = linear % kTile;
-            const int local_y = linear / kTile;
-            const int x = x0 + local_x;
-            const int y = y0 + local_y;
-            float val = out_tile[linear];
-            const int idx = idx2d(x, y, nx);
+        if (vec_ok) {
+            // Mapeo lane -> 8 celdas CONTIGUAS en x (fila = lane/2, columnas
+            // 8*(lane%2)..+7). Es el cambio que hace representables los accesos
+            // de 128 bits en la escritura: el bucle anterior (linear = lane,
+            // paso kWarpThreads) daba a cada lane celdas dispersas en filas
+            // distintas, y ocho celdas dispersas no son un vector.
+            //
+            // Cambia QUE lane calcula QUE celda, no COMO se calcula. El trabajo
+            // de cada celda es independiente del de las demas, asi que la
+            // secuencia de operaciones de punto flotante por celda es la misma y
+            // el resultado es identico bit a bit -- no "dentro de tolerancia".
+            const int row = lane >> 1;
+            const int col0 = 8 * (lane & 1);
+            const int lin0 = row * kTile + col0;
+            const int idx0 = idx2d(x0 + col0, y0 + row, nx);
 
-            // H y V solo alcanzan a las vecinas que caen DENTRO del tile: las
-            // celdas del borde del tile pierden una vecina cada una, que se
-            // suma aqui en FP32 desde las bandas. Las cuatro esquinas del tile
-            // satisfacen dos de estas condiciones a la vez y reciben, como
-            // corresponde, las DOS contribuciones.
-            if (local_x == 0)         val += c_neigh * tc_to_float(band_l[local_y]);
-            if (local_x == kTile - 1) val += c_neigh * tc_to_float(band_r[local_y]);
-            if (local_y == 0)         val += c_neigh * tc_to_float(band_u[local_x]);
-            if (local_y == kTile - 1) val += c_neigh * tc_to_float(band_d[local_x]);
+            // El acumulador sale de shared en dos accesos de 128 bits en vez de
+            // ocho escalares.
+            const float4 acc_lo = *reinterpret_cast<const float4*>(&out_tile[lin0]);
+            const float4 acc_hi = *reinterpret_cast<const float4*>(&out_tile[lin0 + 4]);
+            float vals[8] = {acc_lo.x, acc_lo.y, acc_lo.z, acc_lo.w,
+                             acc_hi.x, acc_hi.y, acc_hi.z, acc_hi.w};
+            TVec8<T> quantized;
 
-            if constexpr (kMode == CompMode::Spatial) {
-                // El estado que entro al Tensor Core es de tipo T: sumarle el
-                // residuo FP32 antes del mma lo destruiria al reconvertir a 16
-                // bits. Como el operador es LINEAL, la correccion se calcula
-                // aparte en FP32 y se suma al acumulador ya volcado:
-                //   L(v + c) = L(v) + L(c)
-                // donde L es el mismo Laplaciano de 5 puntos, v el estado
-                // almacenado en T y c el residuo. Equivale exactamente a leer
-                // v+c en cada vecina (que es lo que hace la rama escalar de
-                // abajo), sin sacar el trabajo pesado de los Tensor Cores ni
-                // tocar la formula del stencil.
-                // Los cinco residuos salen de shared: los interiores del tile
-                // central y los del borde de las bandas ya cargadas.
-                const float cc = comp_tile[linear];
-                const float cl = (local_x > 0)         ? comp_tile[linear - 1]
-                                                       : comp_band_l[local_y];
-                const float cr = (local_x < kTile - 1) ? comp_tile[linear + 1]
-                                                       : comp_band_r[local_y];
-                const float cu = (local_y > 0)         ? comp_tile[linear - kTile]
-                                                       : comp_band_u[local_x];
-                const float cd = (local_y < kTile - 1) ? comp_tile[linear + kTile]
-                                                       : comp_band_d[local_x];
-                val += fmaf(c_neigh, cu + cd + cl + cr, c_center * cc);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                vals[j] = wmma_epilogue_value<T, kMode>(
+                    vals[j], col0 + j, row, lin0 + j,
+                    band_l, band_r, band_u, band_d,
+                    comp_tile, comp_band_l, comp_band_r, comp_band_u, comp_band_d,
+                    c_neigh, c_center);
+                // compensated_store queda INTACTA y sigue escribiendo comp[idx]
+                // celda a celda. Vectorizar tambien el residuo obligaria a
+                // partirla en lectura / calculo / escritura, y esa funcion es la
+                // referencia numerica del experimento: no se toca por
+                // rendimiento.
+                quantized.v[j] = compensated_store<T, kMode>(vals[j], comp, idx0 + j);
+                if (!isfinite(vals[j])) blk_bad = 1;    // carrera benigna
             }
-            out_tc[idx] = compensated_store<T, kMode>(val, comp, idx);
-            if (write_fp32) out_fp32[idx] = val;
-            if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
+
+            // out_tc en un unico acceso de 128 bits (8 elementos de 16 bits) y
+            // out_fp32 en dos. Sacarlos fuera del bucle no altera ningun valor:
+            // out_tc, out_fp32 y comp son buffers distintos (__restrict__ en la
+            // firma), asi que el orden entre escrituras independientes es libre.
+            *reinterpret_cast<TVec8<T>*>(&out_tc[idx0]) = quantized;
+            if (write_fp32) {
+                *reinterpret_cast<float4*>(&out_fp32[idx0]) =
+                    make_float4(vals[0], vals[1], vals[2], vals[3]);
+                *reinterpret_cast<float4*>(&out_fp32[idx0 + 4]) =
+                    make_float4(vals[4], vals[5], vals[6], vals[7]);
+            }
+        } else {
+            for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
+                const int local_x = linear % kTile;
+                const int local_y = linear / kTile;
+                const int idx = idx2d(x0 + local_x, y0 + local_y, nx);
+                const float val = wmma_epilogue_value<T, kMode>(
+                    out_tile[linear], local_x, local_y, linear,
+                    band_l, band_r, band_u, band_d,
+                    comp_tile, comp_band_l, comp_band_r, comp_band_u, comp_band_d,
+                    c_neigh, c_center);
+                out_tc[idx] = compensated_store<T, kMode>(val, comp, idx);
+                if (write_fp32) out_fp32[idx] = val;
+                if (!isfinite(val)) blk_bad = 1;    // carrera benigna: todos escriben 1
+            }
         }
     } else {
         for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
