@@ -86,6 +86,30 @@ compilar() {   # $1 = raiz del arbol, $2 = binario de salida, $3 = log de ptxas
         --allow-unsupported-compiler "${NVML_FLAGS[@]}" ) 2> "$3"
 }
 
+# GUARDA CONTRA LA COMPARACION VACIA.
+#
+# Si BASE y NUEVO tienen el MISMO .cu, todos los campos salen identicos por
+# construccion y el veredicto verde no significa nada. Paso el 2026-08-28: un
+# commit que solo tocaba este sbatch dejo BASE_COMMIT=HEAD~1 apuntando al mismo
+# fuente, y el job devolvio 18/18 OK sin haber comparado nada. Se corta aqui.
+CU_REL="Fase_3/Stencil/stencil_tensor_activation.cu"
+SHA_CU_BASE="$(sha256sum "${BASE_TREE}/${CU_REL}" | awk '{print $1}')"
+SHA_CU_NEW="$(sha256sum "${REPO_ROOT}/${CU_REL}" | awk '{print $1}')"
+if [[ "${SHA_CU_BASE}" == "${SHA_CU_NEW}" ]]; then
+    echo
+    echo "ERROR: ${CU_REL} es IDENTICO en las dos revisiones"
+    echo "       (sha256 ${SHA_CU_BASE})."
+    echo "       El A/B seria una tautologia: cualquier resultado saldria OK."
+    echo "       Fija la revision base correcta, p.ej.:"
+    echo "         sbatch --export=ALL,BASE_COMMIT=<hash> validar_alineacion.sbatch"
+    git -C "${REPO_ROOT}" worktree remove --force "${BASE_TREE}" || true
+    exit 1
+fi
+echo "  .cu BASE : ${SHA_CU_BASE}"
+echo "  .cu NUEVO: ${SHA_CU_NEW}"
+echo "  (difieren: la comparacion es real)"
+echo
+
 PTX_BASE="${PWD}/${WORK}/ptxas_base.txt"
 PTX_NEW="${PWD}/${WORK}/ptxas_nuevo.txt"
 
