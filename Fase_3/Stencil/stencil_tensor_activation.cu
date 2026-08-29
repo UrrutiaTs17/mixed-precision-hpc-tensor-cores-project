@@ -2822,8 +2822,15 @@ constexpr int kTileW = kWarpsPerBlock * kTile;      // 64 columnas por bloque
 #ifndef STENCIL_SWIZZLE
 #define STENCIL_SWIZZLE 1
 #endif
+// ldmatrix por defecto ACTIVO. Se decidio con el job 6738, y el motivo no es
+// el que parecia: en `off` solo aporta un 1.3 %, pero en `local` aporta un
+// 11.4 %. Ese modo esta limitado por instrucciones (256 escrituras escalares a
+// comp[] por tile), y calcular swz_x en cada acceso escalar de fragmento le
+// anade ALU sin darle nada a cambio -- alli los conflictos de banco no eran el
+// cuello. ldmatrix reduce eso a UNA direccion por fragmento en vez de cuatro u
+// ocho, y con el swizzle solo (STENCIL_LDMATRIX=0) `local` se hunde un 11 %.
 #ifndef STENCIL_LDMATRIX
-#define STENCIL_LDMATRIX 0
+#define STENCIL_LDMATRIX 1
 #endif
 constexpr bool kSwizzle = (STENCIL_SWIZZLE != 0);
 
