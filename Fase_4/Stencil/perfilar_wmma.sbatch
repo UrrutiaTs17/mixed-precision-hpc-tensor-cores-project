@@ -168,92 +168,34 @@ echo
 echo "############################################################"
 echo "# ETAPA 3: comparativa (FP32 es la referencia que SI satura)"
 echo "############################################################"
-python3 - "${PWD}/${WORK}/csv" <<'PY'
-import csv, glob, os, sys, re
+# El resumen vive en tools/resumir_ncu.py y NO empotrado aqui, para que un
+# fallo de parseo se arregle y se re-ejecute sobre los CSV ya generados sin
+# repetir el perfilado. Paso en el job 6730: ncu escribio los cinco casos
+# correctamente y la tabla salio vacia porque el parser esperaba el formato
+# largo (--page details) y --page raw emite el ancho.
+RESUMIDOR="${REPO_ROOT}/Fase_4/Stencil/tools/resumir_ncu.py"
+if [[ -f "${RESUMIDOR}" ]]; then
+    python3 "${RESUMIDOR}" "${PWD}/${WORK}/csv" || {
+        echo "  El resumidor fallo. Los CSV siguen intactos; reintenta con:"
+        echo "    python3 ${RESUMIDOR} ${PWD}/${WORK}/csv --debug"
+    }
+else
+    echo "  AVISO: no se encontro ${RESUMIDOR}; los CSV crudos quedan sin resumir."
+fi
 
-carpeta = sys.argv[1]
-datos = {}   # etiqueta -> {metrica: valor}
-for ruta in sorted(glob.glob(os.path.join(carpeta, "*.csv"))):
-    etq = os.path.basename(ruta).rsplit("_", 1)[0]
-    with open(ruta, newline="") as fh:
-        # ncu --csv antepone lineas de aviso antes de la cabecera real
-        lineas = [l for l in fh if l.strip()]
-    inicio = next((i for i, l in enumerate(lineas) if '"ID"' in l or l.startswith("ID,")), None)
-    if inicio is None:
-        continue
-    for fila in csv.DictReader(lineas[inicio:]):
-        nombre = (fila.get("Metric Name") or "").strip()
-        bruto = (fila.get("Metric Value") or "").strip().replace(",", "")
-        if not nombre:
-            continue
-        try:
-            datos.setdefault(etq, {})[nombre] = float(bruto)
-        except ValueError:
-            datos.setdefault(etq, {})[nombre] = bruto
-
-if not datos:
-    print("  Sin datos: revisa los .err de salidas/")
-    sys.exit(0)
-
-FILAS = [
-    ("DRAM % del pico",        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed", "{:.1f}"),
-    ("SM % del pico",          "sm__throughput.avg.pct_of_peak_sustained_elapsed",       "{:.1f}"),
-    ("ocupancia alcanzada %",  "sm__warps_active.avg.pct_of_peak_sustained_active",      "{:.1f}"),
-    ("registros/hilo",         "launch__registers_per_thread",                           "{:.0f}"),
-    ("DRAM leidos (MB)",       "dram__bytes_read.sum",                                   "{:.1f}"),
-    ("DRAM escritos (MB)",     "dram__bytes_write.sum",                                  "{:.1f}"),
-    ("sectores/request ld",    "l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio", "{:.2f}"),
-    ("sectores/request st",    "l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_st.ratio", "{:.2f}"),
-    ("bytes/sector ld %",      "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct", "{:.1f}"),
-    ("bytes/sector st %",      "smsp__sass_average_data_bytes_per_sector_mem_global_op_st.pct", "{:.1f}"),
-    ("acierto L1 %",           "l1tex__t_sector_hit_rate.pct",                           "{:.1f}"),
-    ("stall long_scoreboard",  "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio", "{:.2f}"),
-    ("stall wait",             "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio",           "{:.2f}"),
-    ("stall barrier",          "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio",        "{:.2f}"),
-    ("stall mio_throttle",     "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio",   "{:.2f}"),
-    ("stall lg_throttle",      "smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio",    "{:.2f}"),
-    ("issue activo %",         "smsp__issue_active.avg.pct_of_peak_sustained_active",    "{:.1f}"),
-    ("conflictos banco ld",    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum", "{:.0f}"),
-    ("conflictos banco st",    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum", "{:.0f}"),
-    ("limite ocupancia shared","launch__occupancy_limit_shared_mem",                     "{:.0f}"),
-    ("limite ocupancia regs",  "launch__occupancy_limit_registers",                      "{:.0f}"),
-    ("limite ocupancia warps", "launch__occupancy_limit_warps",                          "{:.0f}"),
-]
-ORDEN = ["FP32_ref", "WMMA_FP16_off", "WMMA_BF16_off", "WMMA_FP16_local", "WMMA_FP16_spatial"]
-cols = [c for c in ORDEN if c in datos] + [c for c in sorted(datos) if c not in ORDEN]
-
-anchoi = max(len(f[0]) for f in FILAS) + 2
-print(" " * anchoi + "".join(f"{c:>20}" for c in cols))
-print("-" * (anchoi + 20 * len(cols)))
-for etiqueta, metrica, fmt in FILAS:
-    celdas = []
-    for c in cols:
-        v = datos[c].get(metrica)
-        if v is None:
-            celdas.append(f"{'-':>20}")
-        elif isinstance(v, float):
-            if "MB" in etiqueta:
-                v = v / 1e6
-            celdas.append(f"{fmt.format(v):>20}")
-        else:
-            celdas.append(f"{str(v):>20}")
-    print(f"{etiqueta:<{anchoi}}" + "".join(celdas))
-
-print()
-print("Como leerla:")
-print("  La columna FP32_ref es la ruta que llega al ~75 %. Cada fila donde")
-print("  WMMA se separa mucho de ella es una hipotesis sobre el 41 %.")
-print("  - DRAM % bajo + stall long_scoreboard alto -> latency-bound, no")
-print("    bandwidth-bound: el kernel espera, no satura. La solucion seria mas")
-print("    paralelismo en vuelo (ocupancia o accesos independientes), no menos")
-print("    bytes.")
-print("  - sectores/request > 4 en ld/st -> accesos aun descoalescidos.")
-print("  - stall barrier alto -> los __syncwarp()/__syncthreads() del tile")
-print("    dominan; el reparto 1 warp = 1 tile seria el sospechoso.")
-print("  - conflictos de banco altos -> el precio de los accesos de 128 bits")
-print("    a shared que introdujo la vectorizacion.")
-print("  - 'limite ocupancia' mas bajo = el recurso que la esta capando.")
-PY
+echo
+echo "Como leerla:"
+echo "  La columna FP32_ref es la ruta que llega al ~75 %. Cada fila donde WMMA"
+echo "  se separa mucho de ella es una hipotesis sobre el 41 %."
+echo "  - DRAM % bajo + long_scoreboard alto -> latency-bound, no"
+echo "    bandwidth-bound: el kernel espera, no satura. La solucion seria mas"
+echo "    paralelismo en vuelo, no menos bytes."
+echo "  - sectores/request > 4 en ld/st -> accesos aun descoalescidos."
+echo "  - barrier alto -> los __syncwarp() del tile dominan; el reparto"
+echo "    1 warp = 1 tile seria el sospechoso."
+echo "  - conflictos de banco altos -> el precio de los accesos de 128 bits a"
+echo "    shared que introdujo la vectorizacion."
+echo "  - 'limite ocup.' mas bajo = el recurso que la esta capando."
 
 echo
 echo "CSV crudos: ${PWD}/${WORK}/csv/"
