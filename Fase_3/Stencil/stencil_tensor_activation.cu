@@ -3058,7 +3058,38 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
         // conversion dentro del bucle); out_fp32 solo cuando write_fp32 (ultima
         // iteracion medida o checkpoint), con la MISMA funcion de conversion
         // que convert_float_to_half_kernel/convert_float_to_bfloat16_kernel.
-        if (vec_ok) {
+        // El epilogo vectorizado SOLO se toma en CompMode::Off. Medido en el
+        // job 6725 (4096^2, 5 replicas, control GPU_FP32 plano con CV 0.06 %):
+        //
+        //   off       0.17828 -> 0.17138 ms   (+4.0 %)   <- gana
+        //   local     0.37335 -> 0.66152 ms   (-77 %)    <- se hunde
+        //   spatial   0.33918 -> 0.58088 ms   (-71 %)    <- se hunde
+        //
+        // La causa es un conflicto entre dos formas opuestas de repartir las
+        // celdas entre lanes:
+        //
+        //   - un acceso VECTORIAL quiere que cada lane posea celdas contiguas
+        //     entre si (8 celdas seguidas = 16 B = un acceso de 128 bits);
+        //   - un acceso ESCALAR quiere lo contrario: que las 32 lanes cubran
+        //     direcciones consecutivas, para que el warp coalesca en pocos
+        //     sectores.
+        //
+        // compensated_store sigue escribiendo comp[] celda a celda (es la
+        // referencia numerica y no se toca). Con el mapeo por-lane-contiguo,
+        // para un j fijo las 32 lanes quedan separadas 8 floats = 32 B, o sea
+        // una en cada sector: el buffer comp pasa de 32 a 256 sectores por
+        // tile, 8x. A 4096^2 son ~470 MB extra por iteracion, es decir
+        // +0.30 ms a 1.55 TB/s -- del orden de los +0.25/+0.28 ms medidos.
+        //
+        // En CompMode::Off no hay buffer comp, no queda ningun acceso escalar
+        // que descoalescar, y el mapeo vectorial es puro beneficio.
+        //
+        // Constante de compilacion: en Local/Spatial la condicion es
+        // falsa en tiempo de compilacion y la rama vectorizada desaparece
+        // entera (no cuesta ni un registro).
+        const bool vec_epilogue = vec_ok && (kMode == CompMode::Off);
+
+        if (vec_epilogue) {
             // Mapeo lane -> 8 celdas CONTIGUAS en x (fila = lane/2, columnas
             // 8*(lane%2)..+7). Es el cambio que hace representables los accesos
             // de 128 bits en la escritura: el bucle anterior (linear = lane,
