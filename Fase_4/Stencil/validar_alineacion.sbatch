@@ -101,19 +101,55 @@ echo
 # vivos a la vez. Si eso provoca spills, la vectorizacion se paga en trafico a
 # memoria local y el cambio deja de tener sentido: es un criterio de rechazo,
 # no un aviso.
-echo "-- Recursos por kernel WMMA (ptxas) --"
-echo "   BASE:"
-grep -A3 -i "stencil2d_wmma_kernel" "${PTX_BASE}" | sed 's/^/     /' || echo "     (sin lineas)"
-echo "   NUEVO:"
-grep -A3 -i "stencil2d_wmma_kernel" "${PTX_NEW}" | sed 's/^/     /' || echo "     (sin lineas)"
+# Registros por instanciacion, desmangleando lo justo (tipo y CompMode) para
+# poder comparar BASE y NUEVO linea a linea.
+resumen_registros() {   # $1 = log de ptxas, $2 = etiqueta
+    awk -v etq="$2" '
+        /Compiling entry function/ && /stencil2d_wmma_kernel/ {
+            tipo = (index($0, "__half") > 0) ? "FP16" : "BF16"
+            i = index($0, "CompModeE")
+            m = substr($0, i + 9, 1)
+            modo = (m == "0") ? "Off" : ((m == "1") ? "Local" : "Spatial")
+            pend = 1; next
+        }
+        pend && /Used [0-9]+ registers/ {
+            for (j = 1; j <= NF; j++) if ($j == "Used") regs = $(j + 1)
+            printf "     %-5s %-4s %-8s %3s registros\n", etq, tipo, modo, regs
+            pend = 0
+        }' "$1" | sort -k2,3
+}
+
+echo "-- Registros por instanciacion del kernel WMMA --"
+resumen_registros "${PTX_BASE}" "BASE"
+resumen_registros "${PTX_NEW}"  "NUEVO"
 echo
+
+# Deteccion de spills.
+#
+# NO basta con buscar la palabra "spill": el fuente declara una clase
+# ReferenceSpill (volcado a disco del campo de referencia) cuyo nombre aparece
+# en los avisos del compilador, y las propias lineas de ptxas dicen "0 bytes
+# spill stores" -- con la palabra presente y el contador a cero. La primera
+# version de esta comprobacion daba positivo por las dos razones a la vez.
+#
+# Lo correcto es extraer el NUMERO de cada contador y exigir que todos sean 0.
+#
+# Y NO se usa 'grep -q' dentro de una tuberia: con 'set -o pipefail' activo,
+# grep -q cierra la tuberia en cuanto encuentra la primera coincidencia, el
+# grep de aguas arriba muere por SIGPIPE y el pipeline devuelve estado distinto
+# de cero. Es decir: justo cuando SI hay spills, la condicion daria falso. Un
+# falso negativo silencioso, peor que el falso positivo que esto reemplaza.
+# Se captura la salida en una variable y se prueba si esta vacia.
 spills_nuevo=0
-if grep -qi "spill" "${PTX_NEW}"; then
-    echo "  ATENCION: la revision NUEVA reporta spills:"
-    grep -i "spill" "${PTX_NEW}" | sed 's/^/     /'
+spill_no_cero="$(grep -oE '[0-9]+ bytes spill (stores|loads)' "${PTX_NEW}" \
+                 | grep -vE '^0 bytes' || true)"
+if [[ -n "${spill_no_cero}" ]]; then
+    echo "  ATENCION: la revision NUEVA reporta spills distintos de cero:"
+    printf '%s\n' "${spill_no_cero}" | sort | uniq -c | sed 's/^/     /'
     spills_nuevo=1
 else
-    echo "  OK: cero spill stores y cero spill loads en la revision NUEVA."
+    n_cero=$(grep -cE '[0-9]+ bytes spill stores' "${PTX_NEW}" || true)
+    echo "  OK: cero spill stores y cero spill loads (${n_cero} funciones comprobadas)."
 fi
 echo
 
