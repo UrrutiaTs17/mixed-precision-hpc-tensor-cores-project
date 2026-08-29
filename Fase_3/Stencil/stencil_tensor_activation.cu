@@ -77,10 +77,10 @@ constexpr int kWarpThreads = 32;
 constexpr int kWarmupIters = 3;
 constexpr int kConversionThreads = 256;
 // occupancy: con 1 warp/bloque el techo de 32 CTAs/SM del A100 fija 32
-// warps/SM (50%) pese a que registros (64 warps/SM) y shared (36 bloques) lo
-// permitirian; con 4 warps/bloque, shared por bloque = 4*3584 B = 14 KiB
-// (10 bloques/SM x 4 warps = 40 warps/SM, 62.5%) y los CTAs bajan de 1.05M a
-// 262144 (gridDim.x = ceil(total_tiles / kWarpsPerBlock)).
+// warps/SM (50%) pese a que registros (64 warps/SM) y shared lo permitirian.
+// Con 4 warps/bloque los CTAs bajan de 1.05M a 262144. Los cuatro warps ya no
+// toman un tile 16x16 cada uno: cooperan sobre UN tile 16x(4*16) -- ver kTileW
+// y el camino ancho del kernel.
 constexpr int kWarpsPerBlock = 4;
 
 // Desplazamiento de alineacion de los buffers del dominio 2D completo.
@@ -2796,6 +2796,101 @@ __host__ __device__ constexpr size_t wmma_warp_shared_bytes(CompMode mode) {
                 : 0);
 }
 
+// ---------------------------------------------------------------------------
+// Tile ANCHO de bloque: 16x64 compartido por los kWarpsPerBlock warps
+// ---------------------------------------------------------------------------
+//
+// Motivo, medido con ncu (job 6730): las bandas IZQUIERDA y DERECHA recorren y
+// con paso nx, asi que cada elemento de 2 B cae en su propio sector de 32 B.
+// Por cada tile 16x16 son 32 sectores para 64 B utiles -- el 64 % de los
+// sectores de carga para el 10 % de los bytes. Ese coste es FIJO por tile, no
+// por celda, de modo que cuadruplicar el ancho lo reparte entre 4x celdas:
+//
+//   por cada 256 celdas utiles     tile 16x16      tile 16x64
+//     X                            16 sectores     16 sectores
+//     bandas superior/inferior      2               2
+//     bandas izquierda/derecha     32               8
+//     TOTAL                        50              26          (1.9x menos)
+//
+// El segundo motivo es que un tile de 16 elementos son 32 B por fila, y con
+// solo dos trozos de 16 B por fila NO hay grados de libertad para swizzlear
+// (ver el barrido de padding del job 6735, donde ninguna variante gano). Con 64
+// elementos la fila mide 128 B = los 32 bancos exactos, y el XOR clasico
+// funciona.
+constexpr int kTileW = kWarpsPerBlock * kTile;      // 64 columnas por bloque
+
+#ifndef STENCIL_SWIZZLE
+#define STENCIL_SWIZZLE 1
+#endif
+#ifndef STENCIL_LDMATRIX
+#define STENCIL_LDMATRIX 0
+#endif
+constexpr bool kSwizzle = (STENCIL_SWIZZLE != 0);
+
+// Permutacion XOR del tile ancho de X, en trozos de 8 elementos (16 B).
+//
+// La fila r coloca su trozo c en la posicion (c ^ (r & 7)). Como es una
+// PERMUTACION dentro de la fila, no consume un solo byte extra -- a diferencia
+// del padding, que fue justo lo que lo hundio.
+//
+// Grados de conflicto de banco calculados sobre el reparto real de las lanes:
+//
+//   acceso                     ancho 16 (antes)   ancho 64 plano   ancho 64 swz
+//   fragmento A (X en matrix_a)       2                 8               1
+//   fragmento B (X en matrix_b)       2                 4               1
+//
+// Sin swizzle, ensanchar EMPEORA el fragmento A de 2 a 8 vias: las dos cosas no
+// son independientes, tienen que ir juntas.
+//
+// Los pares de columnas contiguas que piden los fragmentos (2*tid, 2*tid+1 y
+// 2*tid+8, +9) caen siempre DENTRO del mismo trozo de 8, asi que siguen siendo
+// contiguos despues de permutar y se leen con un solo acceso de 32 bits.
+__host__ __device__ __forceinline__ int swz_x(int r, int c) {
+    return kSwizzle ? (r * kTileW + ((((c >> 3) ^ (r & 7)) << 3) | (c & 7)))
+                    : (r * kTileW + c);
+}
+
+// ldm del tile ancho de residuos. 64 floats por fila son 256 B = dos vueltas
+// completas a los 32 bancos, de modo que TODAS las filas empezarian en el mismo
+// banco y el epilogo (que cubre dos filas por paso de warp) chocaria a 2 vias.
+// Con 80 el desplazamiento por fila es de 16 bancos y las dos filas de un warp
+// quedan disjuntas. Aqui si se paga con bytes porque comp_tile no lo leen los
+// fragmentos: no hay un patron rival al que el XOR tenga que servir a la vez.
+constexpr int kLdC = kTileW + kTile;                // 80 floats por fila
+static_assert(kLdC % 4 == 0, "kLdC*sizeof(float) debe ser multiplo de 16 B");
+
+template <typename T>
+__host__ __device__ constexpr size_t wide_x_bytes() { return kTile * kTileW * sizeof(T); }
+__host__ __device__ constexpr size_t wide_out_bytes() {
+    return static_cast<size_t>(kWarpsPerBlock) * kTile * kLdF * sizeof(float);
+}
+template <typename T>
+__host__ __device__ constexpr size_t wide_bands_bytes() {
+    return 2 * static_cast<size_t>(kTile + kTileW) * sizeof(T);
+}
+__host__ __device__ constexpr size_t wide_comp_bytes() { return kTile * kLdC * sizeof(float); }
+__host__ __device__ constexpr size_t wide_comp_bands_bytes() {
+    return 2 * static_cast<size_t>(kTile + kTileW) * sizeof(float);
+}
+template <typename T>
+__host__ __device__ constexpr size_t wide_block_shared_bytes(CompMode mode) {
+    return wide_x_bytes<T>() + wide_out_bytes() + wide_bands_bytes<T>()
+         + ((mode == CompMode::Spatial)
+                ? (wide_comp_bytes() + wide_comp_bands_bytes())
+                : 0);
+}
+
+// El bloque reserva el MAXIMO de los dos layouts porque solo uno de los dos se
+// usa en cada bloque: el ancho cuando el tile 16x64 cabe entero, y el de cuatro
+// regiones por warp cuando no (ver la rama de respaldo del kernel).
+template <typename T>
+__host__ __device__ constexpr size_t block_shared_bytes(CompMode mode) {
+    return (wide_block_shared_bytes<T>(mode)
+                > kWarpsPerBlock * wmma_warp_shared_bytes<T>(mode))
+         ? wide_block_shared_bytes<T>(mode)
+         : kWarpsPerBlock * wmma_warp_shared_bytes<T>(mode);
+}
+
 // Ocho elementos de 16 bits = 16 B: la unidad de acceso de 128 bits de la ruta
 // vectorizada. El alignas(16) es lo que autoriza al compilador a emitir un
 // LDG.128/STG.128 en vez de ocho accesos escalares; sin el, el cast seria
@@ -2952,6 +3047,59 @@ __device__ __forceinline__ float wmma_epilogue_value(
     return val;
 }
 
+// Gemelo del anterior para el tile ANCHO. Misma secuencia de operaciones en el
+// mismo orden -- se duplica en vez de parametrizarse justamente para que se
+// pueda leer una al lado de la otra y comprobar que lo es.
+//
+// Lo unico que cambia es DE DONDE sale cada vecina, no como se combina:
+//
+//   - las costuras internas del tile (columnas 16, 32 y 48) ya no necesitan una
+//     banda traida de global: la vecina esta en el propio x_tile, que los cuatro
+//     warps cargaron juntos. Solo los dos bordes EXTERNOS usan band_l/band_r.
+//   - el bloque de 16 columnas de cada warp empieza en las mismas posiciones
+//     globales que los tiles de 16 de antes (x0 + 16w con x0 = 1 + 64*tile_x),
+//     asi que cada celda recibe exactamente las mismas correcciones que recibia.
+//     Esa coincidencia es la que hace que el resultado sea identico bit a bit.
+template <typename T, CompMode kMode>
+__device__ __forceinline__ float wide_epilogue_value(
+        float val, int local_x, int local_y, int warp_id,
+        const T* x_tile,
+        const T* band_l, const T* band_r, const T* band_u, const T* band_d,
+        const float* comp_tile,
+        const float* comp_band_l, const float* comp_band_r,
+        const float* comp_band_u, const float* comp_band_d,
+        float c_neigh, float c_center) {
+    const int gx = warp_id * kTile + local_x;      // columna dentro del 16x64
+    if (local_x == 0)
+        val += c_neigh * tc_to_float((warp_id == 0)
+                                         ? band_l[local_y]
+                                         : x_tile[swz_x(local_y, gx - 1)]);
+    if (local_x == kTile - 1)
+        val += c_neigh * tc_to_float((warp_id == kWarpsPerBlock - 1)
+                                         ? band_r[local_y]
+                                         : x_tile[swz_x(local_y, gx + 1)]);
+    if (local_y == 0)         val += c_neigh * tc_to_float(band_u[gx]);
+    if (local_y == kTile - 1) val += c_neigh * tc_to_float(band_d[gx]);
+    if constexpr (kMode == CompMode::Spatial) {
+        const int ci = local_y * kLdC + gx;
+        const float cc = comp_tile[ci];
+        // La compensacion espacial es un stencil de 5 puntos COMPLETO sobre
+        // comp_prev, evaluado fuera del mma: sus vecinas se toman por posicion
+        // GLOBAL en el tile (gx), no por posicion dentro del bloque del warp.
+        const float cl = (gx > 0)           ? comp_tile[ci - 1]    : comp_band_l[local_y];
+        const float cr = (gx < kTileW - 1)  ? comp_tile[ci + 1]    : comp_band_r[local_y];
+        const float cu = (local_y > 0)      ? comp_tile[ci - kLdC] : comp_band_u[gx];
+        const float cd = (local_y < kTile - 1) ? comp_tile[ci + kLdC] : comp_band_d[gx];
+        val += fmaf(c_neigh, cu + cd + cl + cr, c_center * cc);
+    }
+    return val;
+}
+
+// Direccion de shared en el espacio de 32 bits que exige ldmatrix.
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
 // kMode (parametro de plantilla, no runtime): elige la politica de
 // compensacion del redondeo de almacenamiento (ver CompMode /
 // compensated_store). comp/comp_prev son nullptr y no se tocan cuando
@@ -3005,26 +3153,283 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
     // MISMA formula que el host usa para dimensionar el grid (ver
     // benchmark_gpu_tensor_core_stencil), preservando el mapeo tile->dominio
     // (x0/y0) sin agregar un parametro nuevo a la firma.
-    const int tiles_x = (nx - 2 + kTile - 1) / kTile;
-    const int tile_id = blockIdx.x * kWarpsPerBlock + warp_id;
-    const int tile_x = tile_id % tiles_x;
-    const int tile_y = tile_id / tiles_x;
+    const int tiles_x = (nx - 2 + kTileW - 1) / kTileW;
+    const int tile_x = static_cast<int>(blockIdx.x) % tiles_x;
+    const int tile_y = static_cast<int>(blockIdx.x) / tiles_x;
 
-    const int x0 = 1 + tile_x * kTile;
-    const int y0 = 1 + tile_y * kTile;
-    const bool full_tile = (x0 + kTile - 1 < nx - 1) && (y0 + kTile - 1 < ny - 1);
+    // Un bloque = UN tile de 16x64. Ya no hay warps fantasma: cada bloque mapea
+    // a un tile real, y gridDim.x es exactamente tiles_x*tiles_y.
+    const int bx0 = 1 + tile_x * kTileW;
+    const int by0 = 1 + tile_y * kTile;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const bool block_full = (bx0 + kTileW - 1 < nx - 1) && (by0 + kTile - 1 < ny - 1);
+#else
+    // sm_70 / sm_75 no tienen mma.sync.m16n8k16, y wmma::load_matrix_sync no
+    // puede leer un tile permutado porque solo acepta un ldm plano. En esos
+    // objetivos TODOS los bloques toman el respaldo por warp de 16 columnas.
+    const bool block_full = false;
+#endif
 
-    // full_tile es uniforme POR WARP (mismo tile_id para las 32 lanes de un
-    // warp), asi que __syncwarp() dentro de cada rama es valido aunque
-    // distintos warps del bloque tomen ramas distintas. Ningun hilo hace
-    // return antes del __syncthreads() final: los warps "fantasma" que
-    // gridDim.x = ceil(total_tiles/kWarpsPerBlock) agrega al ultimo bloque
-    // (tile_id >= total_tiles) caen en tile_y >= tiles_y, lo que fuerza
-    // full_tile = false y active = false para sus 256 puntos (ver rama
-    // else): no leen ni escriben nada, pero igual llegan al final.
+    // block_full es uniforme en todo el BLOQUE (solo depende de blockIdx), que
+    // es lo que autoriza el __syncthreads() de dentro del camino ancho. Ningun
+    // hilo hace return antes del __syncthreads() final.
     __shared__ int blk_bad;
     if (threadIdx.x == 0) blk_bad = 0;
     __syncthreads();
+
+    if (block_full) {
+        // ===================================================================
+        // CAMINO ANCHO: los kWarpsPerBlock warps cooperan sobre un tile 16x64.
+        // ===================================================================
+        // El bloque de 16 columnas de cada warp empieza en bx0 + 16*warp_id, es
+        // decir en las MISMAS posiciones globales que los tiles de 16 del
+        // diseno anterior (1 + 16*k). Por eso cada celda recibe exactamente las
+        // mismas correcciones de borde y el resultado es identico bit a bit: lo
+        // unico que cambia es de donde salen las vecinas de las costuras
+        // internas (de shared en vez de global) y cuantas veces se paga el
+        // coste fijo de las bandas laterales.
+        extern __shared__ __align__(32) char smem_raw[];
+        T* const x_tile = reinterpret_cast<T*>(smem_raw);
+        float* const out_tile = reinterpret_cast<float*>(smem_raw + wide_x_bytes<T>())
+                              + warp_id * kTile * kLdF;
+        T* const bands = reinterpret_cast<T*>(smem_raw + wide_x_bytes<T>()
+                                                       + wide_out_bytes());
+        T* const band_l = bands;
+        T* const band_r = bands + kTile;
+        T* const band_u = bands + 2 * kTile;
+        T* const band_d = bands + 2 * kTile + kTileW;
+
+        const int t128 = static_cast<int>(threadIdx.x);
+        constexpr int kBlockThreads = kWarpsPerBlock * kWarpThreads;
+        const bool vec_ok = ((nx & 7) == 0);
+
+        // --- X: 1024 elementos, 8 por hilo. Ocho hilos cubren una fila entera
+        // de 128 B, cuatro sectores contiguos y llenos.
+        if (vec_ok) {
+            const int r = t128 >> 3;
+            const int c0 = (t128 & 7) << 3;
+            *reinterpret_cast<TVec8<T>*>(&x_tile[swz_x(r, c0)]) =
+                *reinterpret_cast<const TVec8<T>*>(&in[idx2d(bx0 + c0, by0 + r, nx)]);
+        } else {
+            for (int lin = t128; lin < kTile * kTileW; lin += kBlockThreads) {
+                const int r = lin / kTileW;
+                const int c = lin - r * kTileW;
+                x_tile[swz_x(r, c)] = in[idx2d(bx0 + c, by0 + r, nx)];
+            }
+        }
+        // --- bandas superior e inferior: 64 elementos contiguos cada una ---
+        if (vec_ok) {
+            if (t128 < 16) {
+                const int which = t128 >> 3;              // 0 = superior
+                const int c0 = (t128 & 7) << 3;
+                const int y_src = (which == 0) ? (by0 - 1) : (by0 + kTile);
+                T* const dst = (which == 0) ? band_u : band_d;
+                *reinterpret_cast<TVec8<T>*>(&dst[c0]) =
+                    *reinterpret_cast<const TVec8<T>*>(&in[idx2d(bx0 + c0, y_src, nx)]);
+            }
+        } else {
+            for (int b = t128; b < kTileW; b += kBlockThreads) {
+                band_u[b] = in[idx2d(bx0 + b, by0 - 1,     nx)];
+                band_d[b] = in[idx2d(bx0 + b, by0 + kTile, nx)];
+            }
+        }
+        // --- bandas izquierda y derecha: 16 cada una. Siguen siendo escalares
+        // (stride nx), pero ahora son 32 lecturas por cada 1024 celdas en vez de
+        // por cada 256: es exactamente el coste que este diseno viene a diluir.
+        for (int b = t128; b < kTile; b += kBlockThreads) {
+            band_l[b] = in[idx2d(bx0 - 1,      by0 + b, nx)];
+            band_r[b] = in[idx2d(bx0 + kTileW, by0 + b, nx)];
+        }
+
+        float* comp_tile = nullptr;
+        float* comp_band_l = nullptr;
+        float* comp_band_r = nullptr;
+        float* comp_band_u = nullptr;
+        float* comp_band_d = nullptr;
+        if constexpr (kMode == CompMode::Spatial) {
+            comp_tile = reinterpret_cast<float*>(smem_raw + wide_x_bytes<T>()
+                                                          + wide_out_bytes()
+                                                          + wide_bands_bytes<T>());
+            float* const cb = comp_tile + kTile * kLdC;
+            comp_band_l = cb;
+            comp_band_r = cb + kTile;
+            comp_band_u = cb + 2 * kTile;
+            comp_band_d = cb + 2 * kTile + kTileW;
+            if (vec_ok) {
+                // 1024 floats / 4 por float4 = 256 chunks, DOS por hilo, con el
+                // reparto por chunks CONTIGUOS ENTRE HILOS: hilos consecutivos
+                // piden chunks consecutivos y 16 hilos cubren una fila entera.
+                // Es el mismo criterio que corrigio el -2 % del job 6727; el
+                // reparto "8 floats por hilo" volveria a entrelazar las mitades
+                // de cada fila y a duplicar las peticiones.
+                #pragma unroll
+                for (int t = 0; t < 2; ++t) {
+                    const int c = t128 + t * kBlockThreads;    // chunk 0..255
+                    const int r = c >> 4;
+                    const int col = (c & 15) << 2;
+                    *reinterpret_cast<float4*>(&comp_tile[r * kLdC + col]) =
+                        *reinterpret_cast<const float4*>(
+                            &comp_prev[idx2d(bx0 + col, by0 + r, nx)]);
+                }
+            } else {
+                for (int lin = t128; lin < kTile * kTileW; lin += kBlockThreads) {
+                    const int r = lin / kTileW;
+                    const int c = lin - r * kTileW;
+                    comp_tile[r * kLdC + c] = comp_prev[idx2d(bx0 + c, by0 + r, nx)];
+                }
+            }
+            for (int b = t128; b < kTileW; b += kBlockThreads) {
+                comp_band_u[b] = comp_prev[idx2d(bx0 + b, by0 - 1,     nx)];
+                comp_band_d[b] = comp_prev[idx2d(bx0 + b, by0 + kTile, nx)];
+            }
+            for (int b = t128; b < kTile; b += kBlockThreads) {
+                comp_band_l[b] = comp_prev[idx2d(bx0 - 1,      by0 + b, nx)];
+                comp_band_r[b] = comp_prev[idx2d(bx0 + kTileW, by0 + b, nx)];
+            }
+        }
+        // x_tile y las bandas las comparten los cuatro warps: aqui __syncwarp()
+        // NO basta.
+        __syncthreads();
+
+        const int wcol = warp_id * kTile;   // columna base del bloque del warp
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        {
+            const int gid = lane >> 2;
+            const int tid = lane & 3;
+
+            uint32_t ra_x[4];
+#if STENCIL_LDMATRIX
+            {
+                // Un ldmatrix.x4 en lugar de cuatro accesos de 32 bits. Los
+                // ocho primeros lanes dan las direcciones de fila del cuadrante
+                // 0, los ocho siguientes las del 1, y asi.
+                const int q = lane >> 3;
+                const int r = lane & 7;
+                const uint32_t dir = smem_u32(
+                    &x_tile[swz_x(r + 8 * (q & 1), wcol + 8 * (q >> 1))]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                             "{%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(ra_x[0]), "=r"(ra_x[1]), "=r"(ra_x[2]), "=r"(ra_x[3])
+                             : "r"(dir));
+            }
+#else
+            ra_x[0] = tc_ld32(&x_tile[swz_x(gid,     wcol + 2 * tid)]);
+            ra_x[1] = tc_ld32(&x_tile[swz_x(gid + 8, wcol + 2 * tid)]);
+            ra_x[2] = tc_ld32(&x_tile[swz_x(gid,     wcol + 2 * tid + 8)]);
+            ra_x[3] = tc_ld32(&x_tile[swz_x(gid + 8, wcol + 2 * tid + 8)]);
+#endif
+            uint32_t ra_v[4];
+            {
+                const T* const pv = vertical_op + gid * kTile + 2 * tid;
+                ra_v[0] = tc_ld32(pv);
+                ra_v[1] = tc_ld32(pv + 8 * kTile);
+                ra_v[2] = tc_ld32(pv + 8);
+                ra_v[3] = tc_ld32(pv + 8 * kTile + 8);
+            }
+
+            const float zero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            #pragma unroll
+            for (int nh = 0; nh < 2; ++nh) {
+                const int hcol = nh * 8 + gid;          // columna dentro de H
+                const int xcol = wcol + hcol;           // columna dentro del 16x64
+
+                uint32_t rb_h[2];
+                rb_h[0] = tc_pack2(horizontal_op[(2 * tid + 0) * kTile + hcol],
+                                   horizontal_op[(2 * tid + 1) * kTile + hcol]);
+                rb_h[1] = tc_pack2(horizontal_op[(2 * tid + 8) * kTile + hcol],
+                                   horizontal_op[(2 * tid + 9) * kTile + hcol]);
+
+                uint32_t rb_x[2];
+#if STENCIL_LDMATRIX
+                {
+                    // .trans entrega el bloque 8x8 transpuesto, que es
+                    // exactamente el reparto que pide el operando B.
+                    const uint32_t dir = smem_u32(&x_tile[swz_x(lane & 15, wcol + nh * 8)]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+                                 "{%0,%1}, [%2];\n"
+                                 : "=r"(rb_x[0]), "=r"(rb_x[1]) : "r"(dir));
+                }
+#else
+                rb_x[0] = tc_pack2(x_tile[swz_x(2 * tid + 0, xcol)],
+                                   x_tile[swz_x(2 * tid + 1, xcol)]);
+                rb_x[1] = tc_pack2(x_tile[swz_x(2 * tid + 8, xcol)],
+                                   x_tile[swz_x(2 * tid + 9, xcol)]);
+#endif
+                float acc_h[4], acc[4];
+                mma_m16n8k16(acc_h, ra_x, rb_h, zero4, static_cast<const T*>(nullptr));
+                mma_m16n8k16(acc,   ra_v, rb_x, acc_h, static_cast<const T*>(nullptr));
+
+                *reinterpret_cast<float2*>(&out_tile[gid * kLdF + nh * 8 + 2 * tid]) =
+                    make_float2(acc[0], acc[1]);
+                *reinterpret_cast<float2*>(&out_tile[(gid + 8) * kLdF + nh * 8 + 2 * tid]) =
+                    make_float2(acc[2], acc[3]);
+            }
+        }
+#endif
+        // out_tile SI es privado del warp: aqui __syncwarp() es suficiente.
+        __syncwarp();
+
+        const bool vec_epilogue = vec_ok && (kMode == CompMode::Off);
+        if (vec_epilogue) {
+            const int row = lane >> 1;
+            const int col0 = 8 * (lane & 1);
+            const int lin0 = row * kLdF + col0;
+            const int idx0 = idx2d(bx0 + wcol + col0, by0 + row, nx);
+
+            const float4 acc_lo = *reinterpret_cast<const float4*>(&out_tile[lin0]);
+            const float4 acc_hi = *reinterpret_cast<const float4*>(&out_tile[lin0 + 4]);
+            float vals[8] = {acc_lo.x, acc_lo.y, acc_lo.z, acc_lo.w,
+                             acc_hi.x, acc_hi.y, acc_hi.z, acc_hi.w};
+            TVec8<T> quantized;
+
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                vals[j] = wide_epilogue_value<T, kMode>(
+                    vals[j], col0 + j, row, warp_id, x_tile,
+                    band_l, band_r, band_u, band_d,
+                    comp_tile, comp_band_l, comp_band_r, comp_band_u, comp_band_d,
+                    c_neigh, c_center);
+                quantized.v[j] = compensated_store<T, kMode>(vals[j], comp, idx0 + j);
+                if (!isfinite(vals[j])) blk_bad = 1;    // carrera benigna
+            }
+
+            *reinterpret_cast<TVec8<T>*>(&out_tc[idx0]) = quantized;
+            if (write_fp32) {
+                *reinterpret_cast<float4*>(&out_fp32[idx0]) =
+                    make_float4(vals[0], vals[1], vals[2], vals[3]);
+                *reinterpret_cast<float4*>(&out_fp32[idx0 + 4]) =
+                    make_float4(vals[4], vals[5], vals[6], vals[7]);
+            }
+        } else {
+            for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
+                const int local_x = linear % kTile;
+                const int local_y = linear / kTile;
+                const int idx = idx2d(bx0 + wcol + local_x, by0 + local_y, nx);
+                const float val = wide_epilogue_value<T, kMode>(
+                    out_tile[local_y * kLdF + local_x], local_x, local_y, warp_id, x_tile,
+                    band_l, band_r, band_u, band_d,
+                    comp_tile, comp_band_l, comp_band_r, comp_band_u, comp_band_d,
+                    c_neigh, c_center);
+                out_tc[idx] = compensated_store<T, kMode>(val, comp, idx);
+                if (write_fp32) out_fp32[idx] = val;
+                if (!isfinite(val)) blk_bad = 1;        // carrera benigna
+            }
+        }
+    } else {
+    // =======================================================================
+    // RESPALDO: el tile 16x64 no cabe entero, asi que cada warp toma su bloque
+    // de 16 columnas con el codigo ANTERIOR, sin tocar.
+    // =======================================================================
+    // No es solo comodidad: es lo que impide que el ensanchamiento cambie el
+    // EXPERIMENTO. Si los bloques parciales cayeran enteros a la ruta escalar,
+    // a 4096^2 las columnas 4033..4080 dejarian de pasar por el tensor core y
+    // sus valores cambiarian en los ultimos bits. Con este respaldo cada celda
+    // toma exactamente la misma ruta que antes, y el A/B bit a bit sigue siendo
+    // exigible en cualquier dominio.
+    const int x0 = bx0 + warp_id * kTile;
+    const int y0 = by0;
+    const bool full_tile = (x0 + kTile - 1 < nx - 1) && (y0 + kTile - 1 < ny - 1);
 
     if (full_tile) {
         // Particion de la shared dinamica del BLOQUE. Cada warp toma su propia
@@ -3418,6 +3823,7 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             }
         }
     }
+    }   // fin del respaldo por warp
 
     __syncthreads();
     // El guardia blk_bad != 0 se adelanta aqui (reduce_and_mark_first_nonfinite
@@ -3772,25 +4178,31 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaMemcpy(d_vertical, vertical.data(),
                           vertical.size() * sizeof(T), cudaMemcpyHostToDevice));
 
-    // gridDim.x ya no es tiles_x/tiles_y (2D, 1 tile = 1 bloque): es 1D,
-    // ceil(total_tiles / kWarpsPerBlock), con kWarpsPerBlock tiles por
-    // bloque (ver derivacion de tile_id/tiles_x dentro del kernel, misma
-    // formula de tiles_x/tiles_y que aqui). shared_bytes es dinamica y depende
-    // del modo de compensacion: 4*1664 = 6656 B por bloque en Off/Local y
-    // 4*2944 = 11776 B en Spatial, contra los 4*3584 = 14336 B que pedia la
-    // formulacion de cinco tiles en TODOS los modos. Muy por debajo de 48 KiB,
-    // asi que no requiere cudaFuncAttributeMaxDynamicSharedMemorySize.
-    const int tiles_x = (nx - 2 + kTile - 1) / kTile;
+    // gridDim.x es 1D y vale exactamente tiles_x*tiles_y, con UN tile de
+    // kTile x kTileW (16x64) por bloque; los kWarpsPerBlock warps se reparten
+    // sus cuatro bloques de 16 columnas (misma formula de tiles_x/tiles_y que
+    // dentro del kernel). Es el mismo numero de bloques que la version de
+    // tiles 16x16 -- alli era ceil(4*tiles64/4) -- pero ya no sobran warps
+    // fantasma en el ultimo bloque.
+    //
+    // shared_bytes reserva el maximo de los dos layouts (ancho y respaldo por
+    // warp) porque cada bloque usa uno solo: 6656 B en Off/Local y 12224 B en
+    // Spatial. Muy por debajo de 48 KiB, asi que no requiere
+    // cudaFuncAttributeMaxDynamicSharedMemorySize.
+    const int tiles_x = (nx - 2 + kTileW - 1) / kTileW;
     const int tiles_y = (ny - 2 + kTile - 1) / kTile;
     const int total_tiles = tiles_x * tiles_y;
     // El caso mayor (Spatial) es el que tiene que caber; los otros dos son
     // estrictamente menores.
-    static_assert(kWarpsPerBlock * wmma_warp_shared_bytes<T>(CompMode::Spatial) <= 49152,
+    static_assert(block_shared_bytes<T>(CompMode::Spatial) <= 49152,
                  "shared por bloque excede 48 KiB estaticos/dinamicos");
     dim3 block(kWarpsPerBlock * kWarpThreads);
-    dim3 grid((total_tiles + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    // Un bloque = un tile de 16x64 = kWarpsPerBlock bloques de 16 columnas. El
+    // numero de bloques es el mismo que antes (antes: ceil(tiles16/4) con
+    // tiles16 = 4*tiles64), pero ya no sobran warps fantasma.
+    dim3 grid(total_tiles);
     const size_t shared_bytes =
-        static_cast<size_t>(kWarpsPerBlock) * wmma_warp_shared_bytes<T>(comp_mode);
+        block_shared_bytes<T>(comp_mode);
 
     // Siembra los DOS buffers de residuo con el error de la conversion inicial
     // FP32 -> T (ver seed_comp_from_conversion_kernel). Los dos, y no solo uno,
