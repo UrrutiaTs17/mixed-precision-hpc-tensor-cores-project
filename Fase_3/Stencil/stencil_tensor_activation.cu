@@ -113,6 +113,43 @@ constexpr int kWarpsPerBlock = 4;
 // nx NO se toca: la alineacion se consigue moviendo el origen del buffer, no
 // el stride logico, de modo que idx2d(x, y, nx) y toda la topologia del
 // dominio quedan intactas (el kernel no se entera).
+// Padding de los TILES DE SHARED (no confundir con kAlignPadElems, que es el de
+// los buffers GLOBALES).
+//
+// Diagnostico del job 6730 (ncu, 4096^2): el mayor stall del kernel WMMA no es
+// esperar datos de memoria global (long_scoreboard 9.00, MENOS que el 15.61 de
+// GPU_FP32) sino esperar sitio en la cola de la unidad de memoria interna
+// (mio_throttle 14.93 contra 0.10 de GPU_FP32, 150x). La causa son los
+// conflictos de banco en shared: 1.1 M en lectura y 566 k en escritura, contra
+// 9.5 k y 1.9 k de GPU_FP32.
+//
+// Origen: shared tiene 32 bancos de 4 B. Con ldm = kTile las filas del tile
+// quedan a 32 B (T de 16 bits) o 64 B (float), es decir 8 o 16 bancos, y las
+// filas 0/4/8/12 -- u 0/2/4/... en float -- arrancan en el MISMO banco. La
+// lectura de fragmentos de wmma toca todas las filas a la vez y se serializa.
+//
+// Separar las filas mas de lo que ocupan desplaza ese arranque y alarga el
+// periodo de repeticion. Restriccion dura de wmma: load_matrix_sync y
+// store_matrix_sync exigen que ldm * sizeof(elemento) sea multiplo de 16 B,
+// luego kLdX debe ser multiplo de 8 (T de 16 bits) y kLdF multiplo de 4
+// (float). Valores utiles: kPadTC en {0, 8, 16, 24}, kPadF32 en {0, 4, 8, 12}.
+//
+// 0/0 reproduce el comportamiento actual BYTE A BYTE: el padding solo cambia
+// donde vive cada dato en shared, no que dato es ni en que orden se opera.
+// Se dejan como macros para poder barrer valores con -D sin editar el fuente.
+#ifndef STENCIL_PAD_TC
+#define STENCIL_PAD_TC 0
+#endif
+#ifndef STENCIL_PAD_F32
+#define STENCIL_PAD_F32 0
+#endif
+constexpr int kPadTC = STENCIL_PAD_TC;
+constexpr int kPadF32 = STENCIL_PAD_F32;
+constexpr int kLdX = kTile + kPadTC;    // ldm de x_tile, en elementos de T
+constexpr int kLdF = kTile + kPadF32;   // ldm de out_tile y comp_tile, en floats
+static_assert(kLdX % 8 == 0, "kLdX*sizeof(T) debe ser multiplo de 16 B (wmma)");
+static_assert(kLdF % 4 == 0, "kLdF*sizeof(float) debe ser multiplo de 16 B (wmma)");
+
 constexpr size_t kAlignOffsetElems = 15;
 // Capacidad fisica extra por buffer. PAD >= OFFSET para que el ultimo elemento
 // logico (indice count-1 visto desde el puntero desplazado) siga dentro de la
@@ -2736,17 +2773,17 @@ static void initialize_vertical_operator(std::vector<T>& mat, const StencilOpera
 // Off y Local no lo pagan.
 template <typename T>
 __host__ __device__ constexpr size_t wmma_x_tile_bytes() {
-    return kTile * kTile * sizeof(T);
+    return kTile * kLdX * sizeof(T);
 }
 __host__ __device__ constexpr size_t wmma_out_tile_bytes() {
-    return kTile * kTile * sizeof(float);
+    return kTile * kLdF * sizeof(float);
 }
 template <typename T>
 __host__ __device__ constexpr size_t wmma_bands_bytes() {
     return 4 * kTile * sizeof(T);
 }
 __host__ __device__ constexpr size_t wmma_comp_center_bytes() {
-    return kTile * kTile * sizeof(float);
+    return kTile * kLdF * sizeof(float);
 }
 __host__ __device__ constexpr size_t wmma_comp_bands_bytes() {
     return 4 * kTile * sizeof(float);
@@ -2781,7 +2818,7 @@ struct alignas(16) TVec8 {
 // compensated_store, que es la referencia numerica.
 template <typename T, CompMode kMode>
 __device__ __forceinline__ float wmma_epilogue_value(
-        float val, int local_x, int local_y, int linear,
+        float val, int local_x, int local_y, int sidx,
         const T* band_l, const T* band_r, const T* band_u, const T* band_d,
         const float* comp_tile,
         const float* comp_band_l, const float* comp_band_r,
@@ -2808,14 +2845,17 @@ __device__ __forceinline__ float wmma_epilogue_value(
         // trabajo pesado de los Tensor Cores ni tocar la formula del stencil.
         // Los cinco residuos salen de shared: los interiores del tile central y
         // los del borde de las bandas ya cargadas.
-        const float cc = comp_tile[linear];
-        const float cl = (local_x > 0)         ? comp_tile[linear - 1]
+        // sidx es el indice en SHARED (fila * kLdF + columna), no el indice
+        // logico de celda: con padding las dos cosas dejan de coincidir. El
+        // vecino horizontal sigue a distancia 1; el vertical, a kLdF.
+        const float cc = comp_tile[sidx];
+        const float cl = (local_x > 0)         ? comp_tile[sidx - 1]
                                                : comp_band_l[local_y];
-        const float cr = (local_x < kTile - 1) ? comp_tile[linear + 1]
+        const float cr = (local_x < kTile - 1) ? comp_tile[sidx + 1]
                                                : comp_band_r[local_y];
-        const float cu = (local_y > 0)         ? comp_tile[linear - kTile]
+        const float cu = (local_y > 0)         ? comp_tile[sidx - kLdF]
                                                : comp_band_u[local_x];
-        const float cd = (local_y < kTile - 1) ? comp_tile[linear + kTile]
+        const float cd = (local_y < kTile - 1) ? comp_tile[sidx + kLdF]
                                                : comp_band_d[local_x];
         val += fmaf(c_neigh, cu + cd + cl + cr, c_center * cc);
     }
@@ -2939,13 +2979,14 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             // que cubre los 32 bancos de shared sin un solo conflicto.
             const int row = lane >> 1;
             const int col0 = 8 * (lane & 1);
-            *reinterpret_cast<TVec8<T>*>(&x_tile[row * kTile + col0]) =
+            *reinterpret_cast<TVec8<T>*>(&x_tile[row * kLdX + col0]) =
                 *reinterpret_cast<const TVec8<T>*>(&in[idx2d(x0 + col0, y0 + row, nx)]);
         } else {
             for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
                 const int local_x = linear % kTile;
                 const int local_y = linear / kTile;
-                x_tile[linear] = in[idx2d(x0 + local_x, y0 + local_y, nx)];
+                x_tile[local_y * kLdX + local_x] =
+                    in[idx2d(x0 + local_x, y0 + local_y, nx)];
             }
         }
         // full_tile garantiza x0 >= 1 y x0+kTile-1 <= nx-2 (idem en y), luego
@@ -2993,7 +3034,7 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             comp_tile = reinterpret_cast<float*>(warp_base + wmma_x_tile_bytes<T>()
                                                            + wmma_out_tile_bytes()
                                                            + wmma_bands_bytes<T>());
-            float* cb = comp_tile + kTile * kTile;
+            float* cb = comp_tile + kTile * kLdF;
             comp_band_l = cb + 0 * kTile;
             comp_band_r = cb + 1 * kTile;
             comp_band_u = cb + 2 * kTile;
@@ -3024,7 +3065,7 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                     const int el = c * 4;                    // elemento local
                     const int lrow = el / kTile;
                     const int lcol = el % kTile;             // 0, 4, 8 o 12
-                    *reinterpret_cast<float4*>(&comp_tile[el]) =
+                    *reinterpret_cast<float4*>(&comp_tile[lrow * kLdF + lcol]) =
                         *reinterpret_cast<const float4*>(
                             &comp_prev[idx2d(x0 + lcol, y0 + lrow, nx)]);
                 }
@@ -3032,7 +3073,8 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                 for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
                     const int local_x = linear % kTile;
                     const int local_y = linear / kTile;
-                    comp_tile[linear] = comp_prev[idx2d(x0 + local_x, y0 + local_y, nx)];
+                    comp_tile[local_y * kLdF + local_x] =
+                        comp_prev[idx2d(x0 + local_x, y0 + local_y, nx)];
                 }
             }
             // Las cuatro bandas de residuo se quedan escalares: izquierda y
@@ -3058,17 +3100,17 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
 
         wmma::fill_fragment(acc_frag, 0.0f);
 
-        wmma::load_matrix_sync(a_frag, x_tile, kTile);           // A = X
+        wmma::load_matrix_sync(a_frag, x_tile, kLdX);            // A = X
         wmma::load_matrix_sync(b_frag, horizontal_op, kTile);    // B = H
         wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);      // acc  = X H
 
         wmma::load_matrix_sync(a_frag, vertical_op, kTile);      // A = V
-        wmma::load_matrix_sync(b_frag, x_tile, kTile);           // B = X
+        wmma::load_matrix_sync(b_frag, x_tile, kLdX);            // B = X
         wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);      // acc += V X
 
         // out_tile no solapa a x_tile, asi que este volcado no destruye el
         // tile que los dos mma acaban de consumir.
-        wmma::store_matrix_sync(out_tile, acc_frag, kTile, wmma::mem_row_major);
+        wmma::store_matrix_sync(out_tile, acc_frag, kLdF, wmma::mem_row_major);
         __syncwarp();
 
         // Finitud evaluada sobre el acumulador FP32 (out_tile), antes de
@@ -3120,7 +3162,7 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
             // el resultado es identico bit a bit -- no "dentro de tolerancia".
             const int row = lane >> 1;
             const int col0 = 8 * (lane & 1);
-            const int lin0 = row * kTile + col0;
+            const int lin0 = row * kLdF + col0;   // indice en SHARED, con padding
             const int idx0 = idx2d(x0 + col0, y0 + row, nx);
 
             // El acumulador sale de shared en dos accesos de 128 bits en vez de
@@ -3163,8 +3205,9 @@ __global__ static void stencil2d_wmma_kernel(const T* __restrict__ in,
                 const int local_x = linear % kTile;
                 const int local_y = linear / kTile;
                 const int idx = idx2d(x0 + local_x, y0 + local_y, nx);
+                const int sidx = local_y * kLdF + local_x;   // indice en SHARED
                 const float val = wmma_epilogue_value<T, kMode>(
-                    out_tile[linear], local_x, local_y, linear,
+                    out_tile[sidx], local_x, local_y, sidx,
                     band_l, band_r, band_u, band_d,
                     comp_tile, comp_band_l, comp_band_r, comp_band_u, comp_band_d,
                     c_neigh, c_center);
