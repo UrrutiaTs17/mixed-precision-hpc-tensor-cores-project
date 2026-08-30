@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --exclusive
-#SBATCH --time=01:00:00
+#SBATCH --time=04:00:00
 # ===========================================================================
 # ANCLAJE de la extrapolacion de ref_linf al tamano REAL de la campana.
 # ===========================================================================
@@ -27,9 +27,23 @@
 # Con eso siguen corriendo CPU_FP32, GPU_FP32 y WMMA_FP16. Es el minimo
 # alcanzable sin tocar el .cu, y el .cu esta congelado para este anclaje.
 #
-# Costo esperado, extrapolado del punto de 8192^2 medido en local
-# (174 s de pared, 3.4 GB de RSS): ~4x en celdas -> ~12 min y ~14 GB de RSS.
-# El --time=01:00:00 y los 128G son holgura, no estimacion.
+# COSTO, recalibrado con la medida REAL del job 6746 (no con la estimacion
+# local, que fallaba ~6x y mato al job 6745 por timeout a los 60 min):
+#   6746 midio 75 min por invocacion de 320 iters a 16384^2 con la config
+#   completa. Este job apaga FP64_GPU y la 2a pasada CPU_FP64, ~35% menos.
+#     pasada 1 (640 iters, diffusive) : ~98 min
+#     pasada 2 (160 iters, stress)    : ~30 min
+#     compilacion                     : ~4 min      TOTAL ~2.2 h
+# De ahi --time=04:00:00.
+#
+# SOLO_HORIZONTE=1 salta la pasada 1 y deja unicamente el horizonte (~34 min).
+# Tiene sentido porque el job 6746 YA midio a 16384^2 el decaimiento del modo
+# dominante: lambda = 9.984438e-01 con R^2 = 1.000000 sobre 96 puntos, que
+# coincide con la formula idealizada en 2.5e-08 e implica ref_linf(640) =
+# 0.3691, dentro del rango de aceptacion. Con SOLO_HORIZONTE=1 ese valor queda
+# INFERIDO de una tasa medida a escala real, no medido directamente a 640
+# iteraciones -- es una extrapolacion segura sobre un operador lineal de
+# espectro fijo, pero es una extrapolacion y hay que declararla como tal.
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs results
@@ -55,13 +69,20 @@ done
 echo "nvcc       : ${NVCC}   arch: sm_${CUDA_ARCH}"
 echo "==========================================="
 
+SOLO_HORIZONTE="${SOLO_HORIZONTE:-0}"
 CSV="${PWD}/results/anclaje_reflinf_${JOB_ID}.csv"
+if [[ "${SOLO_HORIZONTE}" == "1" ]]; then
+    echo "### PASADA 1 OMITIDA (SOLO_HORIZONTE=1) ###"
+    echo "ref_linf(640) se toma del lambda medido por el job 6746:"
+    echo "   lambda = 9.984438e-01  ->  lambda^640 = 3.691e-01  (INFERIDO)"
+else
 /usr/bin/time -v "${BIN}" \
     --nx 16384 --ny 16384 --iters 640 --tc fp16 \
     --op-mode diffusive --alpha 0.1875 \
     --ci-mode monomode --ci-p 168 --ci-amplitude 1.0 \
     --fp64-gpu off --cpu-fp64 off \
     --csv "${CSV}"
+fi
 
 
 # ===========================================================================
@@ -88,10 +109,14 @@ echo "### PASADA 2: horizonte bajo stress (CI legacy, 160 iters) ###"
 echo
 echo "############ CRITERIO DE ACEPTACION ############"
 echo "g^640 predicho para 16384^2 / ci_p=168 : 3.691e-01"
+if [[ "${SOLO_HORIZONTE}" == "1" ]]; then
+  echo "ref_linf: NO MEDIDO en este job (pasada 1 omitida); inferido = 3.691e-01"
+else
 echo "ref_linf medido:"
 awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="ref_linf") c=i; next} {print "   "$c}' "${CSV}"
 echo "Se acepta si cae en [3.6e-01, 3.8e-01]. Un colapso de ordenes de"
 echo "magnitud (p.ej. 1e-08) refutaria la extrapolacion y hay que parar."
+fi
 echo
 echo "Horizonte medido en local a 1024/2048/4096/8192 (identico en los cuatro):"
 echo "   wmma_fp16 = 28   wmma_bf16 = 138   gpu_fp32 = 142"
