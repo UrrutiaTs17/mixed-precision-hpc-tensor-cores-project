@@ -63,6 +63,28 @@ CSV="${PWD}/results/anclaje_reflinf_${JOB_ID}.csv"
     --fp64-gpu off --cpu-fp64 off \
     --csv "${CSV}"
 
+
+# ===========================================================================
+# PASADA 2: horizonte de desbordamiento a 16384^2
+# ===========================================================================
+# NO se puede sacar de la pasada 1: el horizonte es un fenomeno del operador
+# STRESS (g(pi,pi) = -2 amplifica el modo Nyquist hasta desbordar). Bajo
+# diffusive |g| < 1 en todo el espectro y NADA diverge -- la pasada 1
+# reportara "ninguna (finito hasta iters=640)" para todas las rutas.
+#
+# Se resuelve dentro de ESTE MISMO job (no hay un segundo sbatch): una
+# invocacion extra con --op-mode stress y CI legacy. 160 iters basta para
+# cruzar los tres horizontes esperados (28 / 138 / 142) sin pagar 640.
+# Costo estimado ~3 min sobre el mismo nodo ya reservado.
+CSV_H="${PWD}/results/anclaje_horizonte_${JOB_ID}.csv"
+echo
+echo "### PASADA 2: horizonte bajo stress (CI legacy, 160 iters) ###"
+"${BIN}" \
+    --nx 16384 --ny 16384 --iters 160 --tc both \
+    --op-mode stress \
+    --fp64-gpu off --cpu-fp64 off \
+    --csv "${CSV_H}"
+
 echo
 echo "############ CRITERIO DE ACEPTACION ############"
 echo "g^640 predicho para 16384^2 / ci_p=168 : 3.691e-01"
@@ -70,3 +92,11 @@ echo "ref_linf medido:"
 awk -F, 'NR==1{for(i=1;i<=NF;i++) if($i=="ref_linf") c=i; next} {print "   "$c}' "${CSV}"
 echo "Se acepta si cae en [3.6e-01, 3.8e-01]. Un colapso de ordenes de"
 echo "magnitud (p.ej. 1e-08) refutaria la extrapolacion y hay que parar."
+echo
+echo "Horizonte medido en local a 1024/2048/4096/8192 (identico en los cuatro):"
+echo "   wmma_fp16 = 28   wmma_bf16 = 138   gpu_fp32 = 142"
+echo "Horizonte medido AQUI a 16384^2 (columna n_star):"
+awk -F, 'NR==1{for(i=1;i<=NF;i++){if($i=="formato")f=i; if($i=="n_star")n=i} next}
+         $f=="wmma_fp16"||$f=="wmma_bf16"||$f=="gpu_fp32"{printf "   %-10s = %s\n",$f,$n}' "${CSV_H}"
+echo "Se acepta si coinciden. Cualquier desviacion se reporta con el numero"
+echo "exacto, sin redondear a \"consistente\"."
