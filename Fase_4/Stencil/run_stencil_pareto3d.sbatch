@@ -53,7 +53,7 @@ mkdir -p logs results
 JOB_ID="${SLURM_JOB_ID:-manual}"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-SRC_DIR="${REPO_ROOT}/Fase_3/Stencil"
+SRC_DIR="${REPO_ROOT}/Fase_4/Stencil"
 
 # --- Perfilado: apagado y no negociable ------------------------------------
 # Se sobreescribe DESPUES de leer el entorno, a proposito. Un --export=ALL
@@ -153,10 +153,15 @@ else
 fi
 
 # --- Compilacion ------------------------------------------------------------
-# Se compila con cwd = Fase_3/Stencil porque el fuente incluye
+# Se compila con cwd = Fase_4/Stencil porque el fuente incluye
 # "../../Fase_2/common.cuh" y "tools/power_sampling.h" por rutas relativas a si
-# mismo; el binario sale a este job, no al arbol de Fase 3, para que dos jobs
+# mismo; el binario sale a este job, no al arbol de fuentes, para que dos jobs
 # concurrentes no se pisen el ejecutable.
+#
+# Fase_4/Stencil esta a la misma profundidad que Fase_3/Stencil, asi que
+# "../../Fase_2/common.cuh" resuelve igual. "tools/power_sampling.h" resuelve
+# por el SYMLINK Fase_4/Stencil/tools/power_sampling.h -> el header de Fase 3:
+# hay un solo header en el repo, no una copia que pueda derivar.
 BIN="${PWD}/${OUT_DIR}/stencil_tc_${JOB_ID}"
 echo "Compilando stencil_tc desde ${SRC_DIR}..."
 ( cd "${SRC_DIR}" && "${NVCC}" -std=c++17 stencil_tensor_activation.cu -o "${BIN}" \
