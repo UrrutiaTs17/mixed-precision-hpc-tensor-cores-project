@@ -4526,10 +4526,17 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     double checkpoint_ms_total = 0.0;
     // Igual que en la ruta GPU_FP32: energia acumulada por tramos, con cortes
     // en los mismos bloques que pausan el cronometro (ver comentario alli
-    // sobre por que no basta con parar/reanudar el muestreo). La exclusion
-    // solo se activa con checkpointing encendido; con checkpoint_every<=0 el
-    // bucle recorre un unico tramo y el resultado es identico al anterior.
-    const bool exclude_checkpoint_energy = checkpoints_enabled(ckpt);
+    // sobre por que no basta con parar/reanudar el muestreo).
+    //
+    // El corte es INCONDICIONAL, no depende de checkpoints_enabled(ckpt). Esta
+    // ruta entra al bloque por write_fp32, que es cierto TAMBIEN en la ultima
+    // iteracion medida aunque no haya checkpointing: sin corte, ese D2H final
+    // (~1 s a 16384^2) quedaba dentro de la ventana de energia mientras el
+    // cronometro si lo excluia, y energy_j medía un trabajo distinto del que
+    // medía t_ms_iter. Las rutas GPU_FP32/GPU_FP64 no tenian el fallo porque
+    // entran por checkpoint_due() y cierran el tramo sin condicion.
+    // Coste: una frontera de tramo extra (un salto de cuantizacion NVML, ~5 J)
+    // a cambio de los ~44 J de contaminacion que elimina.
     double gpu_energy_j = 0.0;
     double gpu_window_s = 0.0;
     // Numero de tramos acumulados: fija energy_window_reliable junto con la
@@ -4628,16 +4635,12 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             // checkpoint_every): el D2H y el escaneo del host son identicos en
             // ambos casos, y dejar el ultimo fuera haria que energy_gpu_j
             // dependiera de si iters es multiplo de la cadencia.
-            std::chrono::steady_clock::time_point pause_t0;
-            RAEnergySnapshot rapl_ckpt_before{};
-            if (exclude_checkpoint_energy) {
-                // pause_t0 antes de close_energy_segment(), por el pthread_join
-                // que esa llamada hace sobre el hilo de muestreo (ver la misma
-                // nota en benchmark_gpu_fp32_stencil).
-                pause_t0 = std::chrono::steady_clock::now();
-                close_energy_segment();
-                rapl_ckpt_before = rapl_snapshot_now();
-            }
+            // pause_t0 antes de close_energy_segment(), por el pthread_join
+            // que esa llamada hace sobre el hilo de muestreo (ver la misma
+            // nota en benchmark_gpu_fp32_stencil).
+            const auto pause_t0 = std::chrono::steady_clock::now();
+            close_energy_segment();
+            const RAEnergySnapshot rapl_ckpt_before = rapl_snapshot_now();
 
             const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
             // Una sola copia D2H de d_out_fp32, reutilizada tanto para
@@ -4705,13 +4708,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             checkpoint_ms_total +=
                 std::chrono::duration<double, std::milli>(ckpt_t1 - ckpt_t0).count();
 
-            if (exclude_checkpoint_energy) {
-                const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
-                checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
-                power_buffer_start_sampling(power_buffer);
-                checkpoint_pause_s += std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - pause_t0).count();
-            }
+            const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
+            checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
+            power_buffer_start_sampling(power_buffer);
+            checkpoint_pause_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pause_t0).count();
 
             timer.start();
         }
