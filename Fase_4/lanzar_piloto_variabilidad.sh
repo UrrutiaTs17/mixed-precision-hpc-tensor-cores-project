@@ -57,7 +57,7 @@ fi
 command -v sbatch >/dev/null || die "sbatch no disponible: ejecute este script en PACCA"
 
 # --- 2. Directorio de campana NUEVO ----------------------------------------
-# Profundidad 2 desde la raiz (igual que Fase_3/Stencil): el .cu incluye
+# Profundidad 2 desde la raiz (igual que Fase_4/Stencil): el .cu incluye
 # "tools/power_sampling.h" y "../../Fase_2/common.cuh", y el .sbatch busca
 # "../../tools/common_ncu.sh". Ambas rutas resuelven desde Fase_4/<ID>/.
 CAMPANA="${CAMPANA:-f4_piloto_variabilidad_$(date +%Y%m%d_%H%M%S)}"
@@ -65,7 +65,7 @@ CDIR="${ROOT}/Fase_4/${CAMPANA}"
 [[ -e "${CDIR}" ]] && die "el directorio de campana ya existe: ${CDIR}"
 mkdir -p "${CDIR}/logs" "${CDIR}/results" "${CDIR}/tools"
 
-SRC="${ROOT}/Fase_3/Stencil"
+SRC="${ROOT}/Fase_4/Stencil"
 cp "${SRC}/stencil_tensor_activation.cu" "${CDIR}/"
 cp "${SRC}/run_stencil_tc.sbatch"        "${CDIR}/"
 cp "${SRC}/tools/extract_csv.py"         "${CDIR}/tools/"
@@ -179,7 +179,10 @@ enviar() {
         export NX="${NX_C}" NY="${NY_C}" ITERS_LIST="${ITERS_C}" \
                CHECKPOINT_EVERY="${CKPT_C}" RUN_NCU="${NCU_C}" \
                SPATIAL_COMP="${spatial}" KAHAN_LIST="${kahan_list}" \
-               FP64_GPU=on CPU_FP64=on
+               FP64_GPU=on CPU_FP64=on \
+               OP_MODE="${OP_MODE:-stress}" ALPHA="${ALPHA:-0.1875}" \
+               CI_MODE="${CI_MODE:-legacy}" CI_P="${CI_P:-168}" \
+               CI_AMPLITUDE="${CI_AMPLITUDE:-1.0}"
         sbatch --parsable --export=ALL --job-name="${nombre}" --time="${wall}" \
                run_stencil_tc.sbatch
     )

@@ -101,16 +101,23 @@ fi
 
 # Los fuentes que la campana congela deben estar limpios ademas de versionados:
 # un fichero sin seguimiento ahi dentro podria cambiar lo que se compila.
-FUENTES=(Fase_3/Stencil Fase_2/common.cuh tools/common_ncu.sh)
+FUENTES=(Fase_4/Stencil Fase_2/common.cuh tools/common_ncu.sh
+         Fase_3/Stencil/tools/power_sampling.h)
 
-# ...salvo los ARTEFACTOS que toda corrida previa deja en Fase_3/Stencil (el
+# power_sampling.h entra en FUENTES por su ruta REAL de Fase 3 aunque el .cu
+# lo incluya a traves del symlink de Fase_4/Stencil/tools/: git status sigue al
+# fichero, no al enlace, y dejarlo fuera abriria un hueco por el que un cambio
+# sin versionar en ese header cambiaria el binario sin que la campana lo note.
+#
+# ...salvo los ARTEFACTOS que toda corrida previa deja en Fase_4/Stencil (el
 # binario compilado, logs/, results/, reportes de ncu). En PACCA estan siempre
 # presentes y no alteran lo que se compila: se listan, pero no abortan.
 es_artefacto() {
     case "$1" in
-        Fase_3/Stencil/stencil_tc|\
-        Fase_3/Stencil/logs|Fase_3/Stencil/logs/|Fase_3/Stencil/logs/*|\
-        Fase_3/Stencil/results|Fase_3/Stencil/results/|Fase_3/Stencil/results/*|\
+        Fase_4/Stencil/stencil_tc|\
+        Fase_4/Stencil/logs|Fase_4/Stencil/logs/|Fase_4/Stencil/logs/*|\
+        Fase_4/Stencil/results|Fase_4/Stencil/results/|Fase_4/Stencil/results/*|\
+        Fase_4/Stencil/estado|Fase_4/Stencil/estado/|Fase_4/Stencil/estado/*|\
         *.out|*.err|*.log|*.ncu-rep|*.nsys-rep|*.qdrep|*__pycache__*) return 0 ;;
     esac
     return 1
@@ -225,7 +232,7 @@ CDIR="${ROOT}/Fase_4/${CAMPANA}"
 [[ -e "${CDIR}" ]] && die "el directorio de campana ya existe: ${CDIR}"
 mkdir -p "${CDIR}/logs" "${CDIR}/replicas/Fase_2" "${CDIR}/replicas/tools"
 
-SRC="${ROOT}/Fase_3/Stencil"
+SRC="${ROOT}/Fase_4/Stencil"
 PLANT="${ROOT}/Fase_4/plantillas"
 
 # Fuentes congelados en el nivel "replicas/": el .cu incluye
