@@ -89,7 +89,14 @@ fi
 echo "  OK  compila, rc=0"
 echo "  sha256 binario: $(sha256sum "${BIN}" | awk '{print $1}')"
 
-n_warn=$(grep -c "warning" "${CLOG}")
+# OJO: se cuenta 'warning #', no 'warning' a secas. nvcc cierra el bloque de
+# diagnosticos con la linea informativa
+#   Remark: The warnings can be suppressed with "-diag-suppress <numero>"
+# que contiene la palabra "warnings" y NO es un warning. Contarla dio un falso
+# positivo en el job 6744 (3 en vez de 2) que marco FAILED una compilacion
+# perfectamente limpia. La misma linea aparece en los logs locales de nvcc 13.1,
+# asi que el fallo era del contador, nunca del codigo ni de la toolchain.
+n_warn=$(grep -c "warning #" "${CLOG}")
 echo "  warnings emitidos: ${n_warn}  (esperados 2)"
 grep -q 'variable "xcol" was declared but never referenced' "${CLOG}" \
   && echo "  OK  warning conocido 1/2: xcol #177-D" \
@@ -99,7 +106,7 @@ grep -q 'ReferenceSpill::is_open' "${CLOG}" \
   || { echo "  X   falta el warning conocido de ReferenceSpill::is_open"; fallos=$((fallos+1)); }
 if [[ ${n_warn} -gt 2 ]]; then
     echo "  X   HAY WARNINGS NUEVOS respecto a la linea base local:"
-    grep "warning" "${CLOG}" | grep -vE 'xcol|ReferenceSpill' | sed 's/^/      /'
+    grep "warning #" "${CLOG}" | grep -vE 'xcol|ReferenceSpill' | sed 's/^/      /'
     fallos=$((fallos+1))
 fi
 echo
