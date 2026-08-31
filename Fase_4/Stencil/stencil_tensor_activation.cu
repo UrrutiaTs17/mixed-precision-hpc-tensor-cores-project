@@ -472,6 +472,20 @@ static const char* bf16_route_label(CompMode mode) {
     return wmma_route_label(mode, "WMMA_BF16", "WMMA_BF16_SP");
 }
 
+// Misma convencion para la columna `formato` del CSV de resumen, que va en
+// minusculas. Sin esto la fila de spatial salia como (wmma_fp16, kahan=off),
+// IDENTICA a la de la politica sin compensar, y al concatenar los CSV del
+// bloque A y del bloque B las dos politicas se confundian en silencio: el
+// contrato de arriba -- (route, kahan) identifica las tres -- solo se cumplia
+// en los marcadores de stdout, no en el fichero.
+static const char* fp16_csv_label(CompMode mode) {
+    return wmma_route_label(mode, "wmma_fp16", "wmma_fp16_sp");
+}
+
+static const char* bf16_csv_label(CompMode mode) {
+    return wmma_route_label(mode, "wmma_bf16", "wmma_bf16_sp");
+}
+
 static std::string csv_first_nonfinite_field(int first_nf) {
     return std::to_string((first_nf == INT_MAX) ? -1 : first_nf);
 }
@@ -6318,7 +6332,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                             stencil_flops(opt.nx, opt.ny, op.flops_per_cell) * static_cast<double>(opt.iters),
                             /*gpu_route=*/true);
         if (csv_enabled) {
-            write_csv_row(csv, opt, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.kahan, opt.nx, opt.ny,
+            write_csv_row(csv, opt,
+                         std::string(under_ncu ? "NCU_" : "") + fp16_csv_label(comp_mode),
+                         opt.kahan, opt.nx, opt.ny,
                          opt.iters, tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
                          storage_num_field(fp16_storage_result, fp16_storage_evaluable,
                                            fp16_storage_result.rel_max_guarded),
@@ -6413,7 +6429,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                             stencil_flops(opt.nx, opt.ny, op.flops_per_cell) * static_cast<double>(opt.iters),
                             /*gpu_route=*/true);
         if (csv_enabled) {
-            write_csv_row(csv, opt, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.kahan, opt.nx, opt.ny,
+            write_csv_row(csv, opt,
+                         std::string(under_ncu ? "NCU_" : "") + bf16_csv_label(comp_mode),
+                         opt.kahan, opt.nx, opt.ny,
                          opt.iters, tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,
                          storage_num_field(bf16_storage_result, bf16_storage_evaluable,
                                            bf16_storage_result.rel_max_guarded),
