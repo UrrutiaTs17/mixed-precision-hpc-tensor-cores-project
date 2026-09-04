@@ -1,7 +1,34 @@
+// Fase_2/GEMM/gemm_tensor_activation.cu
+//
+// Migrado desde old/Fase_2/GEMM/gemm_tensor_activation.cu (codigo ya
+// auditado). Compara cinco rutas de GEMM en precision mixta: CPU OpenBLAS,
+// cuBLAS clasico (sin Tensor Cores), cuBLAS con Tensor Cores (cublasGemmEx,
+// FP16/BF16), un kernel WMMA propio (FP16/BF16) y CUTLASS
+// (cutlass::gemm::device::Gemm, FP16/BF16), todas contra una referencia
+// FP64. Ver Fase_2/GEMM/README.md para como interpretar los resultados sin
+// combinar comparaciones que no son equivalentes.
+//
+// Unico cambio de fondo respecto al original: CHECK_CUDA/CHECK_CUBLAS,
+// CudaEventTimer, Metrics, ErrorMetrics y las funciones compare_* ya no se
+// definen en este archivo (venian de old/Fase_2/common.cuh, incluido como
+// "../common.cuh") -- ahora se toman de common/cuda_checks.cuh y
+// common/metrics.cuh, que exponen los mismos nombres y firmas. El resto del
+// codigo, incluyendo la logica numerica de cada kernel, es identico.
+//
 // nvcc -std=c++17 gemm_tensor_activation.cu -o gemm_tc -I/usr/include/openblas -lcublas -lopenblas -gencode arch=compute_80,code=sm_80 --allow-unsupported-compiler
 // ./gemm_tc --m 2048 --n 2048 --k 2048 --iters 20
 // En PACCA (A100, sm_80) la compilacion y el perfilado con Nsight Compute se
 // lanzan via SLURM: sbatch run_gemm_tc.sbatch  (no ejecutar ncu con sudo).
+//
+// Ruta 5 (CUTLASS, --cutlass): requiere ademas -I$CUTLASS_DIR/include
+// apuntando a un checkout de github.com/NVIDIA/cutlass (serie 2.x, ver
+// REQUIREMENTS.md) y --expt-relaxed-constexpr, que CUTLASS 2.x exige para
+// su metaprogramacion constexpr host/device. Si CUTLASS no esta disponible
+// en el include path, el binario compila igual (ver el guard __has_include
+// mas abajo) pero --cutlass termina el proceso con un mensaje explicando
+// como habilitarlo, en vez de fallar la compilacion para todos.
+// nvcc -std=c++17 gemm_tensor_activation.cu -o gemm_tc -I/usr/include/openblas -I$CUTLASS_DIR/include -lcublas -lopenblas -gencode arch=compute_80,code=sm_80 --expt-relaxed-constexpr --allow-unsupported-compiler
+// ./gemm_tc --m 2048 --n 2048 --k 2048 --iters 20 --cutlass
 
 
 #include <algorithm>
@@ -23,84 +50,51 @@
 #include <cuda_pipeline_primitives.h>
 #include <mma.h>
 
+// CUTLASS (ruta 5) es header-only y opcional: si el include path no tiene un
+// checkout de github.com/NVIDIA/cutlass (variable CUTLASS_DIR en
+// run_gemm_tc.sbatch, ver REQUIREMENTS.md), el binario debe seguir
+// compilando para las cuatro rutas restantes -- __has_include evita que la
+// ausencia de CUTLASS rompa la compilacion de todo el archivo. Se incluye a
+// nivel de archivo (NO dentro del namespace anonimo de mas abajo) porque,
+// a diferencia de common/cuda_checks.cuh y common/metrics.cuh, CUTLASS es
+// una libreria externa con su propio namespace (cutlass::), no un header
+// interno del proyecto cuyos simbolos haya que aislar con enlace interno.
+#if __has_include(<cutlass/gemm/device/gemm.h>)
+#define HAVE_CUTLASS 1
+#include <cutlass/cutlass.h>
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/mma.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#else
+#define HAVE_CUTLASS 0
+#endif
+
 namespace {
 
-#include "../common.cuh"
+// Ver la nota de uso al inicio de cada header: se incluyen DENTRO de este
+// bloque de namespace anonimo para que sus simbolos conserven enlace
+// interno, igual que cuando estaban duplicados dentro de old/Fase_2/common.cuh.
+// metrics.cuh incluye cuda_checks.cuh internamente (CudaEventTimer usa
+// CHECK_CUDA), pero se listan ambos explicitamente porque este archivo usa
+// CHECK_CUDA/CHECK_CUBLAS directamente y no solo a traves de metrics.cuh.
+#include "../../common/cuda_checks.cuh"
+#include "../../common/metrics.cuh"
+// wmma_gemm.cuh define kWmmaM/N/K, kKStep, kBlockWarps*, kBlockTile*,
+// kNumStages, kSmemStride*, kVecElems/A/B, float_to_tc_scalar<T>,
+// tc_scalar_to_float<T>, float_colmaj_to_tc_rowmaj_kernel<T>,
+// issue_stage_copy<T> y wmma_gemm_kernel<T> -- todo lo que antes estaba
+// definido localmente en este archivo, ahora compartido con Fase 3/4 (ver
+// common/wmma_gemm.cuh). Mismos nombres, misma logica: el resto de este
+// archivo no necesita mas cambios que este include.
+#include "../../common/wmma_gemm.cuh"
 
 constexpr int kWarmupIters = 3;
 constexpr int kCpuWarmupIters = 3;
 constexpr int kConversionThreads = 256;
-
-// Dimensiones del fragmento WMMA para FP16: unicas dimensiones soportadas en sm_70+.
-constexpr int kWmmaM = 16;
-constexpr int kWmmaN = 16;
-constexpr int kWmmaK = 16;
-
-// Numero de elementos K cargados a shared memory por iteracion del bucle externo.
-// Debe ser multiplo de kWmmaK. A mayor kKStep, menos sincronizaciones y mayor
-// reuso de datos en shared memory, a costa de mas shared memory usada.
-constexpr int kKStep = 32;
-
-// Numero de warps por dimension dentro de un bloque (4×4 = 16 warps = 512 hilos).
-constexpr int kBlockWarpsM = 4;
-constexpr int kBlockWarpsN = 4;
-
-// Bloques residentes por SM que se le piden al compilador (segundo argumento de
-// __launch_bounds__). El valor se fijo originalmente pensando en CC 8.6
-// (48 warps/SM), no en el A100 de PACCA. En sm_80 el techo es 2048 hilos/SM y
-// 64 warps/SM:
-//   3 bloques x 512 hilos = 1536 hilos = 48/64 warps = 75 % de ocupancia,
-//   con presupuesto de 65536/(3*512) = 42 registros por hilo.
-// Subir a 4 daria 100 % pero recorta el presupuesto a 32 registros por hilo y
-// el kernel (3 fragmentos WMMA + indices) desbordaria a memoria local, que
-// cuesta mas que los warps ganados. La memoria compartida no es el limite:
-// 3 x 28.5 KiB = 85.5 KiB de los 164 KiB por SM del A100.
-// Sobrescribible al compilar para barrer el parametro en PACCA:
-//   nvcc -DWMMA_MIN_BLOCKS_PER_SM=2 ...
-#ifndef WMMA_MIN_BLOCKS_PER_SM
-#define WMMA_MIN_BLOCKS_PER_SM 3
-#endif
-
-// Tile de salida que maneja un bloque completo: 64×64 elementos FP32.
-constexpr int kBlockTileM = kBlockWarpsM * kWmmaM;  // 64
-constexpr int kBlockTileN = kBlockWarpsN * kWmmaN;  // 64
-
-// Etapas del pipeline de triple buffer para cp.async.
-// Mientras el warp computa el tile[i], la DMA ya esta cargando tile[i+2],
-// eliminando la espera sincrona de global memory en cada iteracion K.
-constexpr int kNumStages = 3;
-
-// Padding en shared memory para evitar bank conflicts entre warps.
-// Con FP16 (2 bytes) y 32 bancos de 4 bytes, añadir 8 elementos desplaza
-// cada fila 16 bytes extra, eliminando el patron de conflicto ciclico.
-constexpr int kWmmaShmemPad = 8;
-
-// Filas de shared memory, en elementos de 2 bytes (FP16 o BF16).
-constexpr int kSmemStrideA = kKStep      + kWmmaShmemPad;  // 40 elem = 80 B
-constexpr int kSmemStrideB = kBlockTileN + kWmmaShmemPad;  // 72 elem = 144 B
-
-// Ancho de cada cp.async. Ampere admite 4, 8 o 16 bytes por LDGSTS; la version
-// original usaba 4 (un uint32_t = 2 elementos), lo que emite 4x mas
-// instrucciones de las necesarias para mover el mismo tile. Con 16 bytes
-// (8 elementos de 2 bytes) el bloque copia un tile K completo en una sola
-// pasada de sus 512 hilos.
-constexpr int kVecElems = 16 / 2;                              // 8
-constexpr int kVecsA    = kBlockTileM * kKStep      / kVecElems;  // 256
-constexpr int kVecsB    = kKStep      * kBlockTileN / kVecElems;  // 256
-
-// cp.async exige que origen y destino esten alineados al tamaño copiado (16 B).
-// Destino: la base de sA/sB lleva __align__(16) y cada fila/etapa debe medir un
-// multiplo de 16 B para que el alineamiento se propague.
-static_assert(kKStep      % kVecElems == 0, "kKStep debe ser multiplo de kVecElems");
-static_assert(kBlockTileN % kVecElems == 0, "kBlockTileN debe ser multiplo de kVecElems");
-static_assert(kSmemStrideA * 2 % 16 == 0, "fila de sA no alineada a 16 B");
-static_assert(kSmemStrideB * 2 % 16 == 0, "fila de sB no alineada a 16 B");
-static_assert(kBlockTileM * kSmemStrideA * 2 % 16 == 0, "etapa de sA no alineada a 16 B");
-static_assert(kKStep      * kSmemStrideB * 2 % 16 == 0, "etapa de sB no alineada a 16 B");
-// Origen: los desplazamientos en global son (fila)*ld + k_off + col. Con
-// col multiplo de kVecElems y k_off multiplo de kKStep, basta que los leading
-// dimensions (K y N) sean multiplos de kVecElems; se garantiza en tiempo de
-// ejecucion en benchmark_gpu_wmma exigiendo K % kKStep == 0 y N % kBlockTileN == 0.
 
 // Formatos de datos soportados en las rutas Tensor Core (cuBLAS TC y WMMA custom).
 enum class TensorCoreFormat {
@@ -117,6 +111,9 @@ struct Options {
     int iters = 20;
     bool use_double = false;
     TensorCoreFormat tc_format = TensorCoreFormat::FP16;
+    // Ruta 5. Reutiliza tc_format para elegir fp16/bf16/both, igual que las
+    // rutas 3 y 4 -- ver print_usage y run_experiment_float.
+    bool use_cutlass = false;
 };
 
 // Traduce codigos de cuBLAS a texto legible para diagnosticar fallos.
@@ -201,22 +198,27 @@ private:
 static void print_usage(const char* prog) {
     std::cout << "Uso:\n"
               << "  " << prog << " [--m M] [--n N] [--k K] [--iters I] [--double]"
-              << " [--tc-format fp16|bf16|both]\n\n"
+              << " [--tc-format fp16|bf16|both] [--cutlass]\n\n"
               << "Descripcion:\n"
-              << "  Compara cuatro rutas de GEMM en precision mixta:\n"
+              << "  Compara hasta cinco rutas de GEMM en precision mixta:\n"
               << "    1. CPU BLAS (OpenBLAS, FP32/FP64)\n"
               << "    2. GPU cuBLAS clasico (FP32/FP64, sin Tensor Cores)\n"
               << "    3. GPU cuBLAS con Tensor Cores (FP16/BF16->FP32, cublasGemmEx)\n"
               << "    4. GPU WMMA custom (FP16/BF16->FP32, kernel propio con shared memory)\n"
+              << "    5. GPU CUTLASS (FP16/BF16->FP32, cutlass::gemm::device::Gemm), con --cutlass\n"
               << "  La ruta WMMA (4) requiere m y n multiplos de 64 y k multiplo de 32.\n"
-              << "  Con --double solo se ejecutan las rutas 1 y 2 (WMMA y TC son FP16/BF16).\n"
-              << "  --tc-format selecciona el formato de las rutas 3 y 4 (por defecto fp16).\n"
-              << "  BF16 requiere GPU Ampere o superior (compute capability >= 8.0).\n\n"
+              << "  Con --double solo se ejecutan las rutas 1 y 2 (3, 4 y 5 son FP16/BF16).\n"
+              << "  --tc-format selecciona el formato de las rutas 3, 4 y 5 (por defecto fp16).\n"
+              << "  BF16 requiere GPU Ampere o superior (compute capability >= 8.0).\n"
+              << "  --cutlass activa la ruta 5. Requiere compute capability >= 8.0 (el\n"
+              << "  template usa ArchTag Sm80) y que el binario se haya compilado con\n"
+              << "  -I$CUTLASS_DIR/include (ver REQUIREMENTS.md); si no, termina con error.\n\n"
               << "Ejemplos:\n"
               << "  " << prog << "\n"
               << "  " << prog << " --m 4096 --n 4096 --k 4096 --iters 10\n"
               << "  " << prog << " --double --m 2048 --n 2048 --k 2048 --iters 5\n"
-              << "  " << prog << " --m 1024 --n 1024 --k 1024 --iters 5 --tc-format bf16\n";
+              << "  " << prog << " --m 1024 --n 1024 --k 1024 --iters 5 --tc-format bf16\n"
+              << "  " << prog << " --m 2048 --n 2048 --k 2048 --iters 10 --tc-format both --cutlass\n";
 }
 
 static const char* require_arg_value(int& index, int argc, char** argv, const char* flag) {
@@ -271,6 +273,8 @@ static Options parse_args(int argc, char** argv) {
             opt.use_double = true;
         } else if (std::strcmp(argv[i], "--tc-format") == 0) {
             opt.tc_format = parse_tc_format(require_arg_value(i, argc, argv, "--tc-format"));
+        } else if (std::strcmp(argv[i], "--cutlass") == 0) {
+            opt.use_cutlass = true;
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             std::exit(EXIT_SUCCESS);
@@ -904,192 +908,6 @@ static Metrics benchmark_gpu_tensor_cores_bf16(const std::vector<float>& A,
 // Tensor Core; la logica de tiling/pipeline es identica para ambos.
 // =========================================================================
 
-// Conversion escalar float -> T. Cada tipo Tensor Core soportado provee su
-// propia especializacion mediante el intrinseco de CUDA correspondiente.
-template <typename T>
-__device__ inline T float_to_tc_scalar(float x);
-
-template <>
-__device__ inline __half float_to_tc_scalar<__half>(float x) {
-    return __float2half(x);
-}
-
-template <>
-__device__ inline __nv_bfloat16 float_to_tc_scalar<__nv_bfloat16>(float x) {
-    return __float2bfloat16(x);
-}
-
-// Convierte una matriz FP32 col-major (rows x cols) a T row-major.
-// Thread i escribe dst[i] = src[r + c*rows] donde r=i/cols, c=i%cols.
-// Hilos consecutivos leen src con paso 1 (misma columna, filas contiguas),
-// lo que produce accesos coalescentes en la lectura global.
-template <typename T>
-__global__ static void float_colmaj_to_tc_rowmaj_kernel(
-        const float* __restrict__ src,
-        T*           __restrict__ dst,
-        int rows, int cols) {
-    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int total = rows * cols;
-    if (idx < total) {
-        const int r = idx / cols;
-        const int c = idx % cols;
-        dst[idx] = float_to_tc_scalar<T>(src[r + c * rows]);
-    }
-}
-
-// Emite las cp.async de un tile K completo (sA + sB) hacia una etapa del
-// triple buffer. Los kVecsA + kVecsB vectores de 16 bytes se reparten entre
-// TODOS los hilos del bloque en un unico bucle: con la configuracion por
-// defecto son 256 + 256 = 512 vectores para 512 hilos, es decir un LDGSTS.128
-// por hilo. El bucle mantiene la forma grid-stride para seguir siendo correcto
-// si se cambian kBlockTile*/kKStep.
-//
-// Los indices globales se calculan en size_t: con M=N=K=32768 el producto
-// fila*ld ronda 1.07e9 y queda al borde del rango de int.
-template <typename T>
-__device__ __forceinline__ void issue_stage_copy(
-        const T* __restrict__ A,
-        const T* __restrict__ B,
-        T* __restrict__ sA_stage,
-        T* __restrict__ sB_stage,
-        int block_row, int block_col, int k_off, int N, int K) {
-    for (int i = threadIdx.x; i < kVecsA + kVecsB; i += blockDim.x) {
-        if (i < kVecsA) {
-            const int elem = i * kVecElems;
-            const int row  = elem / kKStep;
-            const int col  = elem % kKStep;
-            __pipeline_memcpy_async(
-                &sA_stage[row * kSmemStrideA + col],
-                &A[static_cast<size_t>(block_row + row) * K + k_off + col],
-                sizeof(uint4));
-        } else {
-            const int elem = (i - kVecsA) * kVecElems;
-            const int row  = elem / kBlockTileN;
-            const int col  = elem % kBlockTileN;
-            __pipeline_memcpy_async(
-                &sB_stage[row * kSmemStrideB + col],
-                &B[static_cast<size_t>(k_off + row) * N + block_col + col],
-                sizeof(uint4));
-        }
-    }
-}
-
-// Kernel GEMM con API WMMA + pipeline cp.async de 3 etapas (Ampere sm_80+).
-// C(M,N) = A(M,K) * B(K,N), todos row-major T->FP32 (T = __half o __nv_bfloat16).
-//
-// Organizacion de hilos:
-//   Bloque: 512 hilos = 16 warps en cuadricula 4x4 de fragmentos WMMA.
-//   Cada warp calcula un fragmento de salida 16x16 en FP32.
-//   Un bloque cubre un tile de salida 64x64.
-//   Grid: (ceildiv(M,64), ceildiv(N,64)).
-//
-// Triple buffer con cp.async:
-//   El SM tiene 3 copias de sA/sB (etapas 0,1,2). Mientras el warp ejecuta
-//   instrucciones HMMA sobre la etapa[i], la DMA ya transfiere la etapa[i+2]
-//   desde global memory sin pasar por registros (cp.async). La barrera de cada
-//   iteracion se reemplaza por consumer_wait_prior<kNumStages-1>(), que solo
-//   bloquea si el tile necesario aun no llego, en vez de vaciar todo el pipeline.
-//
-// Requisito: M multiplo de kBlockTileM(64), N de kBlockTileN(64), K de kKStep(32).
-// Ocupancia esperada en sm_80 (A100): WMMA_MIN_BLOCKS_PER_SM bloques/SM x 16
-// warps; con el valor por defecto 3 son 48 de los 64 warps del SM (75 %).
-template <typename T>
-__launch_bounds__(kBlockWarpsM * kBlockWarpsN * 32, WMMA_MIN_BLOCKS_PER_SM)
-__global__ static void wmma_gemm_kernel(
-        const T* __restrict__ A,
-        const T* __restrict__ B,
-        float*   __restrict__ C,
-        int M, int N, int K) {
-    using namespace nvcuda;
-
-    // Triple buffer: sA[etapa][fila][col], sB[etapa][fila][col].
-    // El padding por fila evita bank conflicts cuando warps distintos
-    // acceden a columnas separadas por kKStep o kBlockTileN elementos.
-    // __align__(16) es obligatorio para el destino de las cp.async de 16 bytes:
-    // nvcc solo garantizaria el alineamiento natural del tipo (2 bytes).
-    __shared__ __align__(16) T sA[kNumStages][kBlockTileM][kSmemStrideA];
-    __shared__ __align__(16) T sB[kNumStages][kKStep]     [kSmemStrideB];
-
-    const int warp_id       = threadIdx.x / 32;
-    const int warp_row      = warp_id / kBlockWarpsN;
-    const int warp_col      = warp_id % kBlockWarpsN;
-    const int block_row     = blockIdx.x * kBlockTileM;
-    const int block_col     = blockIdx.y * kBlockTileN;
-    const int warp_row_base = block_row + warp_row * kWmmaM;
-    const int warp_col_base = block_col + warp_col * kWmmaN;
-
-    wmma::fragment<wmma::matrix_a,    kWmmaM, kWmmaN, kWmmaK, T, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b,    kWmmaM, kWmmaN, kWmmaK, T, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float>              c_frag;
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    // API primitiva de pipeline (cuda_pipeline_primitives.h):
-    //   __pipeline_memcpy_async(dst, src, size) -> emite cp.async (min 4 bytes en Ampere)
-    //   __pipeline_commit()                     -> cierra el grupo de copias actual
-    //   __pipeline_wait_prior(N)                -> espera hasta que queden <= N grupos pendientes
-    // No requiere acquire/release: el estado del pipeline es implicito por hilo.
-
-    // Numero de tiles K. K es multiplo de kKStep (validado en benchmark_gpu_wmma).
-    const int num_tiles = K / kKStep;
-
-    // -- Precarga de las primeras kNumStages etapas antes del bucle principal --
-    // Emite kNumStages grupos de cp.async sin esperar ninguno todavia.
-    for (int s = 0; s < kNumStages && s < num_tiles; ++s) {
-        issue_stage_copy<T>(A, B, &sA[s][0][0], &sB[s][0][0],
-                            block_row, block_col, s * kKStep, N, K);
-        __pipeline_commit();  // cierra el grupo s
-    }
-
-    // -- Bucle principal sobre tiles K --
-    for (int tile = 0; tile < num_tiles; ++tile) {
-        // prior decrece en los ultimos kNumStages-1 tiles porque ya no se emiten
-        // commits nuevos: sin el ajuste, wait_prior(2) dejaria el tile actual pendiente.
-        // Formula: min(kNumStages-1, tiles restantes despues del actual).
-        const int prior = min(kNumStages - 1, num_tiles - tile - 1);
-        __pipeline_wait_prior(prior);
-
-        // Barrera de bloque: sincroniza los cp.async de todos los hilos antes de
-        // que cualquier warp lea sA/sB con wmma::load_matrix_sync.
-        __syncthreads();
-
-        // -- Computo WMMA sobre la etapa actual --
-        const int stage_c = tile % kNumStages;
-        for (int k_inner = 0; k_inner < kKStep; k_inner += kWmmaK) {
-            wmma::load_matrix_sync(a_frag,
-                reinterpret_cast<const T*>(&sA[stage_c][warp_row * kWmmaM][k_inner]),
-                kSmemStrideA);
-            wmma::load_matrix_sync(b_frag,
-                reinterpret_cast<const T*>(&sB[stage_c][k_inner][warp_col * kWmmaN]),
-                kSmemStrideB);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-
-        // Barrera entre computo y carga futura: garantiza que TODOS los warps
-        // terminaron wmma::load_matrix_sync sobre stage_c antes de que cualquier
-        // warp empiece a sobreescribirlo con cp.async.
-        // Sin esta barrera, un warp adelantado podria escribir stage_c mientras
-        // otro warp aun lo esta leyendo -> race condition en shared memory.
-        __syncthreads();
-
-        // Emitir la carga futura DESPUES del computo: stage_c quedo libre ahora
-        // y puede recibir el tile[tile+kNumStages] sin race condition.
-        // El overlap con el computo de las proximas iteraciones se mantiene.
-        const int future = tile + kNumStages;
-        if (future < num_tiles) {
-            issue_stage_copy<T>(A, B, &sA[stage_c][0][0], &sB[stage_c][0][0],
-                                block_row, block_col, future * kKStep, N, K);
-            __pipeline_commit();
-        }
-    }
-
-    // -- Escritura del fragmento acumulado a C (row-major) --
-    if (warp_row_base < M && warp_col_base < N) {
-        wmma::store_matrix_sync(
-            C + warp_row_base * N + warp_col_base,
-            c_frag, N,
-            wmma::mem_row_major);
-    }
-}
 
 // Benchmark de la ruta WMMA personalizada.
 // Convierte A y B de FP32 col-major a T row-major en la GPU (T = __half o
@@ -1165,6 +983,233 @@ static Metrics benchmark_gpu_wmma(const std::vector<float>& A,
     return build_metrics(m, n, k, static_cast<double>(total_ms) / iters);
 }
 
+// =========================================================================
+// Ruta 5 - CUTLASS (cutlass::gemm::device::Gemm, API 2.x)
+//
+// CUTLASS es la libreria de templates de NVIDIA para GEMM con Tensor Cores.
+// A diferencia de cuBLAS TC (ruta 3, binario cerrado y afinado por NVIDIA) y
+// del kernel WMMA propio (ruta 4, tiling/pipeline escritos a mano en este
+// proyecto), CUTLASS da una implementacion de referencia OFICIAL pero
+// instanciada por templates de C++ en tiempo de compilacion -- un punto
+// intermedio en calidad de implementacion entre (3) y (4). Ver
+// Fase_2/GEMM/README.md, seccion "Como interpretar los resultados", punto (c).
+//
+// Toda la combinacion de tipos/formas de abajo (ThreadblockShape, WarpShape,
+// InstructionShape, EpilogueOp, numero de etapas, y el patron de
+// Gemm::Arguments con listas {puntero, ld}) sigue, casi literal, el patron
+// de examples/08_turing_tensorop_gemm.cu del repositorio NVIDIA/cutlass (API
+// 2.x, cutlass::gemm::device::Gemm) mas el snippet canonico del README
+// principal de NVIDIA/cutlass para construir Gemm::Arguments. El unico
+// cambio deliberado es ArchTag: Sm75 (Turing, el ejemplo original) ->
+// Sm80 (Ampere, A100 de PACCA); el resto de la forma (128x128x32 de
+// threadblock, 64x64x32 de warp, 16x8x16 de instruccion HMMA, 3 etapas) es
+// la combinacion que usan la mayoria de los ejemplos oficiales de CUTLASS
+// para FP16/BF16 en Ampere, no un valor inventado para este proyecto.
+//
+// Verificado contra CUTLASS v2.11.0 (compila y corre en Ampere/Ada real):
+//   1. GemmIdentityThreadblockSwizzle y su header resolvieron sin cambios.
+//   2. La lista de campos de Gemm::Arguments (problem_size, ref_A, ref_B,
+//      ref_C, ref_D, {alpha,beta}, split_k_slices), con split_k_slices=1
+//      como ultimo campo posicional, coincide con el patron de los ejemplos
+//      oficiales.
+//   3. cutlass::Status no se decodifica con un switch propio (como
+//      cublas_status_to_string); CHECK_CUTLASS solo imprime el valor
+//      numerico. cutlass::cutlassGetStatusString() da un mensaje legible en
+//      la mayoria de versiones 2.x si se prefiere ese detalle.
+// Una version de CUTLASS distinta a 2.11.0 podria diferir en nombres de
+// header o firma de estos simbolos -- revisar aqui primero si aparece un
+// error de compilacion con otro checkout.
+// =========================================================================
+#if HAVE_CUTLASS
+
+// Traduce (parcialmente) un cutlass::Status a texto. Solo distingue
+// kSuccess de "cualquier otra cosa": un nombre de enumerador equivocado
+// rompe la compilacion de este archivo entero, mientras que imprimir el
+// codigo numerico crudo como fallback es seguro en cualquier version de
+// CUTLASS 2.x.
+static const char* cutlass_status_to_string(cutlass::Status status) {
+    if (status == cutlass::Status::kSuccess) {
+        return "kSuccess";
+    }
+    return "CUTLASS_STATUS_ERROR (ver codigo numerico impreso junto a este mensaje)";
+}
+
+#define CHECK_CUTLASS(call)                                                  \
+    do {                                                                     \
+        cutlass::Status cutlass_status = (call);                             \
+        if (cutlass_status != cutlass::Status::kSuccess) {                   \
+            std::cerr << "CUTLASS error at " << __FILE__ << ":" << __LINE__  \
+                      << " -> " << cutlass_status_to_string(cutlass_status)  \
+                      << " (status code "                                    \
+                      << static_cast<int>(cutlass_status) << ")" << std::endl; \
+            std::exit(EXIT_FAILURE);                                         \
+        }                                                                    \
+    } while (0)
+
+// Configuracion de tipos/formas de CUTLASS para un ElementInput dado
+// (cutlass::half_t o cutlass::bfloat16_t). Ver la nota grande de arriba
+// sobre el origen de cada parametro de forma.
+template <typename ElementInput>
+struct CutlassGemmConfig {
+    using ElementOutput = float;
+    using ElementAccumulator = float;
+    using LayoutInput = cutlass::layout::ColumnMajor;
+    using LayoutOutput = cutlass::layout::ColumnMajor;
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        ElementInput, LayoutInput,
+        ElementInput, LayoutInput,
+        ElementOutput, LayoutOutput,
+        ElementAccumulator,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,   // ThreadblockShape
+        cutlass::gemm::GemmShape<64, 64, 32>,     // WarpShape
+        cutlass::gemm::GemmShape<16, 8, 16>,      // InstructionShape (HMMA FP16 en Ampere)
+        cutlass::epilogue::thread::LinearCombination<
+            ElementOutput,
+            128 / cutlass::sizeof_bits<ElementOutput>::value,
+            ElementAccumulator,
+            ElementAccumulator>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        3>;  // NumStages
+};
+
+// Conversion escalar float -> ElementInput usando el constructor explicito
+// que cutlass::half_t/cutlass::bfloat16_t proveen desde float (cutlass/half.h,
+// cutlass/bfloat16.h). Kernel separado de convert_float_to_half_kernel /
+// convert_float_to_bfloat16_kernel (ruta 3) porque cutlass::half_t y
+// __half (idem bfloat16_t / __nv_bfloat16) son tipos de C++ distintos,
+// aunque bit-compatibles en memoria.
+template <typename ElementInput>
+__global__ static void convert_float_to_cutlass_kernel(
+        const float* __restrict__ src, ElementInput* __restrict__ dst, size_t size) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        dst[idx] = static_cast<ElementInput>(src[idx]);
+    }
+}
+
+// Convierte dos buffers FP32 a ElementInput dentro de la GPU. Analoga a
+// convert_fp32_buffers_to_fp16/convert_fp32_buffers_to_bf16 (ruta 3).
+template <typename ElementInput>
+static void convert_fp32_buffers_to_cutlass(const float* src_a,
+                                             const float* src_b,
+                                             ElementInput* dst_a,
+                                             ElementInput* dst_b,
+                                             size_t size_a,
+                                             size_t size_b) {
+    const unsigned int blocks_a = blocks_for_elements(size_a);
+    const unsigned int blocks_b = blocks_for_elements(size_b);
+
+    convert_float_to_cutlass_kernel<ElementInput><<<blocks_a, kConversionThreads>>>(
+        src_a, dst_a, size_a);
+    CHECK_CUDA(cudaGetLastError());
+
+    convert_float_to_cutlass_kernel<ElementInput><<<blocks_b, kConversionThreads>>>(
+        src_b, dst_b, size_b);
+    CHECK_CUDA(cudaGetLastError());
+
+    CHECK_CUDA(cudaDeviceSynchronize());
+}
+
+// Lanza una GEMM de CUTLASS ya inicializada (gemm_op.initialize ya corrio).
+// Analoga a run_tensor_core_gemm: una llamada delgada con verificacion de
+// error, pensada para reutilizarse igual dentro del bucle de warmup y del
+// bucle cronometrado.
+template <typename Gemm>
+static void run_cutlass_gemm(Gemm& gemm_op) {
+    CHECK_CUTLASS(gemm_op());
+}
+
+// Ejecuta la ruta de precision mixta con CUTLASS. Misma estructura que
+// benchmark_gpu_tensor_cores/benchmark_gpu_wmma: conversion FP32->ElementInput,
+// warmup, medicion con CudaEventTimer, copia de vuelta a host.
+//
+// Diferencia deliberada con las otras rutas: la construccion de argumentos
+// y gemm_op.initialize() (que incluye can_implement y el workspace) se hacen
+// UNA sola vez antes del warmup, no en cada iteracion -- igual que el
+// handle de cuBLAS se crea una sola vez fuera del bucle en las rutas 2 y 3.
+// Repetir initialize() en cada iteracion mediria tambien el costo de
+// configurar la grilla, no solo el de ejecutar la GEMM, y la comparacion de
+// tiempos con las demas rutas dejaria de ser justa.
+template <typename ElementInput>
+static Metrics benchmark_gpu_cutlass(const std::vector<float>& A,
+                                     const std::vector<float>& B,
+                                     std::vector<float>& C,
+                                     int m, int n, int k,
+                                     int iters) {
+    using Config = CutlassGemmConfig<ElementInput>;
+    using Gemm = typename Config::Gemm;
+
+    DeviceBuffer<ElementInput> dA(A.size());
+    DeviceBuffer<ElementInput> dB(B.size());
+    DeviceBuffer<float> dC(C.size());
+
+    {
+        DeviceBuffer<float> dA_fp32(A.size());
+        DeviceBuffer<float> dB_fp32(B.size());
+        copy_float_vector_to_device(A, dA_fp32.get());
+        copy_float_vector_to_device(B, dB_fp32.get());
+        convert_fp32_buffers_to_cutlass<ElementInput>(
+            dA_fp32.get(), dB_fp32.get(), dA.get(), dB.get(), A.size(), B.size());
+    }
+
+    // Leading dimensions: A, B y C col-major, igual que en las rutas 1-3
+    // (m, k, m respectivamente) -- ver benchmark_gpu_cublas_float. A
+    // diferencia de WMMA (ruta 4), CUTLASS aqui no necesita una conversion a
+    // row-major: la salida se compara con compare_fp64_ref_vs_fp32 (misma
+    // funcion que usan cpu/gpu/tc), no con la variante _colmaj_vs_fp32_rowmaj.
+    const int lda = m;
+    const int ldb = k;
+    const int ldc = m;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // Aggregate-init con listas {puntero, ld}: patron canonico de la seccion
+    // "Instantiate CUTLASS GEMM..." del README de NVIDIA/cutlass, donde cada
+    // {ptr, ld} construye implicitamente un cutlass::TensorRef via el
+    // constructor no-explicito de cutlass::layout::ColumnMajor(ld).
+    typename Gemm::Arguments arguments{
+        {m, n, k},
+        {dA.get(), lda},
+        {dB.get(), ldb},
+        {dC.get(), ldc},
+        {dC.get(), ldc},
+        {alpha, beta},
+        1  // split_k_slices: sin split-K, un solo bloque de acumulacion en K.
+    };
+
+    Gemm gemm_op;
+    CHECK_CUTLASS(gemm_op.can_implement(arguments));
+
+    const size_t workspace_size = Gemm::get_workspace_size(arguments);
+    // DeviceBuffer<T> con count==0 no reserva memoria y get() devuelve
+    // nullptr (ver la clase mas arriba) -- exactamente lo que
+    // gemm_op.initialize espera cuando no hace falta workspace.
+    DeviceBuffer<uint8_t> workspace(workspace_size);
+    CHECK_CUTLASS(gemm_op.initialize(arguments, workspace.get()));
+
+    for (int i = 0; i < kWarmupIters; ++i) {
+        run_cutlass_gemm(gemm_op);
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CudaEventTimer timer;
+    timer.start();
+    for (int i = 0; i < iters; ++i) {
+        run_cutlass_gemm(gemm_op);
+    }
+    const float total_ms = timer.stop_and_elapsed_ms();
+
+    copy_float_vector_to_host(dC.get(), C);
+
+    return build_metrics(m, n, k, total_ms / iters);
+}
+
+#endif  // HAVE_CUTLASS
+
 // Presenta los resultados del experimento FP32.
 // Los bloques TC/WMMA FP16 se imprimen si opt.tc_format es FP16 o Both;
 // los bloques BF16 se imprimen si opt.tc_format es BF16 o Both.
@@ -1175,12 +1220,16 @@ static void print_float_report(const Options& opt,
                                const Metrics& wmma,
                                const Metrics& tc_bf16,
                                const Metrics& wmma_bf16,
+                               const Metrics& cutlass_fp16,
+                               const Metrics& cutlass_bf16,
                                const ErrorMetrics& cpu_error,
                                const ErrorMetrics& gpu_error,
                                const ErrorMetrics& tc_error,
                                const ErrorMetrics& wmma_error,
                                const ErrorMetrics& tc_bf16_error,
-                               const ErrorMetrics& wmma_bf16_error) {
+                               const ErrorMetrics& wmma_bf16_error,
+                               const ErrorMetrics& cutlass_fp16_error,
+                               const ErrorMetrics& cutlass_bf16_error) {
     const bool show_fp16 = (opt.tc_format == TensorCoreFormat::FP16 ||
                             opt.tc_format == TensorCoreFormat::Both);
     const bool show_bf16 = (opt.tc_format == TensorCoreFormat::BF16 ||
@@ -1213,6 +1262,18 @@ static void print_float_report(const Options& opt,
         std::cout << "Speedup WMMA vs cuBLAS TC  : " << tc.ms / wmma.ms << "x\n";
         std::cout << "Error max abs vs FP64      : " << wmma_error.max_abs << "\n";
         std::cout << "Error relativo L2 vs FP64  : " << wmma_error.rel_l2 << "\n\n";
+
+        if (opt.use_cutlass) {
+            std::cout << "GPU CUTLASS - tiempo       : " << cutlass_fp16.ms << " ms\n";
+            std::cout << "GPU CUTLASS - rend.        : " << cutlass_fp16.gflops << " GFLOP/s ("
+                      << cutlass_fp16.tflops << " TFLOP/s)\n";
+            std::cout << "Speedup CUTLASS vs CPU        : " << cpu.ms / cutlass_fp16.ms << "x\n";
+            std::cout << "Speedup CUTLASS vs GPU clasico: " << gpu.ms / cutlass_fp16.ms << "x\n";
+            std::cout << "Speedup CUTLASS vs cuBLAS TC  : " << tc.ms / cutlass_fp16.ms << "x\n";
+            std::cout << "Speedup CUTLASS vs WMMA custom: " << wmma.ms / cutlass_fp16.ms << "x\n";
+            std::cout << "Error max abs vs FP64      : " << cutlass_fp16_error.max_abs << "\n";
+            std::cout << "Error relativo L2 vs FP64  : " << cutlass_fp16_error.rel_l2 << "\n\n";
+        }
     }
 
     if (show_bf16) {
@@ -1232,6 +1293,19 @@ static void print_float_report(const Options& opt,
         std::cout << "Speedup WMMA BF16 vs cuBLAS TC  : " << tc_bf16.ms / wmma_bf16.ms << "x\n";
         std::cout << "Error max abs vs FP64           : " << wmma_bf16_error.max_abs << "\n";
         std::cout << "Error relativo L2 vs FP64       : " << wmma_bf16_error.rel_l2 << "\n";
+
+        if (opt.use_cutlass) {
+            std::cout << "\n";
+            std::cout << "GPU CUTLASS BF16 - tiempo       : " << cutlass_bf16.ms << " ms\n";
+            std::cout << "GPU CUTLASS BF16 - rend.        : " << cutlass_bf16.gflops << " GFLOP/s ("
+                      << cutlass_bf16.tflops << " TFLOP/s)\n";
+            std::cout << "Speedup CUTLASS BF16 vs CPU        : " << cpu.ms / cutlass_bf16.ms << "x\n";
+            std::cout << "Speedup CUTLASS BF16 vs GPU clasico: " << gpu.ms / cutlass_bf16.ms << "x\n";
+            std::cout << "Speedup CUTLASS BF16 vs cuBLAS TC  : " << tc_bf16.ms / cutlass_bf16.ms << "x\n";
+            std::cout << "Speedup CUTLASS BF16 vs WMMA custom: " << wmma_bf16.ms / cutlass_bf16.ms << "x\n";
+            std::cout << "Error max abs vs FP64           : " << cutlass_bf16_error.max_abs << "\n";
+            std::cout << "Error relativo L2 vs FP64       : " << cutlass_bf16_error.rel_l2 << "\n";
+        }
     }
     std::cout << "=======================================================\n";
 }
@@ -1271,6 +1345,17 @@ static void run_experiment_float(const Options& opt) {
         std::exit(EXIT_FAILURE);
     }
 
+    // La ruta 5 (CUTLASS) usa ArchTag Sm80 en su template (ver
+    // CutlassGemmConfig): igual que BF16, requiere Ampere o superior.
+    // Reutilizamos active_device_supports_bf16_tensor_cores() porque su
+    // condicion (compute capability >= 8.0) es exactamente la que Sm80
+    // exige, no porque tenga relacion logica con BF16 en si.
+    if (opt.use_cutlass && !active_device_supports_bf16_tensor_cores()) {
+        std::cerr << "La ruta CUTLASS (ArchTag Sm80) requiere arquitectura Ampere o superior"
+                     " (compute capability >= 8.0)." << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+
     const size_t size_a = checked_element_count(opt.m, opt.k, "A");
     const size_t size_b = checked_element_count(opt.k, opt.n, "B");
     const size_t size_c = checked_element_count(opt.m, opt.n, "C");
@@ -1283,6 +1368,8 @@ static void run_experiment_float(const Options& opt) {
     std::vector<float> C_wmma(size_c, 0.0f);
     std::vector<float> C_tc_bf16(size_c, 0.0f);
     std::vector<float> C_wmma_bf16(size_c, 0.0f);
+    std::vector<float> C_cutlass_fp16(size_c, 0.0f);
+    std::vector<float> C_cutlass_bf16(size_c, 0.0f);
 
     initialize_matrix_float(A);
     initialize_matrix_float(B);
@@ -1299,8 +1386,9 @@ static void run_experiment_float(const Options& opt) {
     const Metrics cpu = benchmark_cpu_float(A, B, C_cpu, opt.m, opt.n, opt.k, opt.iters);
     const Metrics gpu = benchmark_gpu_cublas_float(A, B, C_gpu, opt.m, opt.n, opt.k, opt.iters);
 
-    Metrics tc{}, wmma{}, tc_bf16{}, wmma_bf16{};
+    Metrics tc{}, wmma{}, tc_bf16{}, wmma_bf16{}, cutlass_fp16{}, cutlass_bf16{};
     ErrorMetrics tc_error{}, wmma_error{}, tc_bf16_error{}, wmma_bf16_error{};
+    ErrorMetrics cutlass_fp16_error{}, cutlass_bf16_error{};
 
     if (want_fp16) {
         tc   = benchmark_gpu_tensor_cores(A, B, C_tc, opt.m, opt.n, opt.k, opt.iters);
@@ -1315,12 +1403,36 @@ static void run_experiment_float(const Options& opt) {
         wmma_bf16_error = compare_fp64_ref_colmaj_vs_fp32_rowmaj(C_ref, C_wmma_bf16, opt.m, opt.n);
     }
 
+    if (opt.use_cutlass) {
+#if HAVE_CUTLASS
+        if (want_fp16) {
+            cutlass_fp16 = benchmark_gpu_cutlass<cutlass::half_t>(
+                A, B, C_cutlass_fp16, opt.m, opt.n, opt.k, opt.iters);
+            cutlass_fp16_error = compare_fp64_ref_vs_fp32(C_ref, C_cutlass_fp16);
+        }
+        if (want_bf16) {
+            cutlass_bf16 = benchmark_gpu_cutlass<cutlass::bfloat16_t>(
+                A, B, C_cutlass_bf16, opt.m, opt.n, opt.k, opt.iters);
+            cutlass_bf16_error = compare_fp64_ref_vs_fp32(C_ref, C_cutlass_bf16);
+        }
+#else
+        std::cerr << "Se pidio --cutlass pero el binario se compilo sin CUTLASS disponible"
+                     " en el include path.\n"
+                  << "Recompila agregando -I$CUTLASS_DIR/include, apuntando a un checkout de"
+                     " github.com/NVIDIA/cutlass (serie 2.x) -- ver REQUIREMENTS.md y"
+                     " Fase_2/GEMM/README.md." << std::endl;
+        std::exit(EXIT_FAILURE);
+#endif
+    }
+
     const ErrorMetrics cpu_error = compare_fp64_ref_vs_fp32(C_ref, C_cpu);
     const ErrorMetrics gpu_error = compare_fp64_ref_vs_fp32(C_ref, C_gpu);
 
     print_float_report(opt, cpu, gpu, tc, wmma, tc_bf16, wmma_bf16,
+                       cutlass_fp16, cutlass_bf16,
                        cpu_error, gpu_error, tc_error, wmma_error,
-                       tc_bf16_error, wmma_bf16_error);
+                       tc_bf16_error, wmma_bf16_error,
+                       cutlass_fp16_error, cutlass_bf16_error);
 }
 
 // Orquesta el experimento FP64 completo.

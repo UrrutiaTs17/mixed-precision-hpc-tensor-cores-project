@@ -1,0 +1,18 @@
+# requirements.txt
+#
+# Dependencias de PYTHON unicamente (post-proceso de CSV, estadistica,
+# Pareto 3D) -- para instalar TODO el proyecto (incluyendo el toolchain CUDA
+# para compilar los .cu) usa environment.yml (conda) en vez de este archivo.
+# Este requirements.txt existe para quien ya tiene el CUDA Toolkit instalado
+# por su cuenta (o esta en un cluster con `module load cuda`) y solo
+# necesita el lado de Python -- ver REQUIREMENTS.md.
+#
+# Instalar:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+
+numpy>=1.24
+pandas>=2.0
+scipy>=1.11
+statsmodels>=0.14   # ANOVA factorial + post-hoc Tukey HSD
+matplotlib>=3.7

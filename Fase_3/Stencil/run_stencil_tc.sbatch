@@ -15,27 +15,50 @@ cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 if [[ ! -f stencil_tensor_activation.cu && -f Stencil/stencil_tensor_activation.cu ]]; then
     cd Stencil
 fi
-mkdir -p logs results
-JOB_ID="${SLURM_JOB_ID:-manual}"
-RESULTS_LOG="results/run_${JOB_ID}.log"
 
-# stencil_tc usa mma.h / cuda_fp16.h / cuda_bf16.h y, si PACCA lo expone,
+# Directorios de salida, parametrizados: ningun script de post-proceso ni
+# ninguna ruta de log queda hardcodeada a "logs"/"results" salvo como default.
+LOGS_DIR="${LOGS_DIR:-logs}"
+RESULTS_DIR="${RESULTS_DIR:-results}"
+mkdir -p "${LOGS_DIR}" "${RESULTS_DIR}"
+JOB_ID="${SLURM_JOB_ID:-manual}"
+RESULTS_LOG="${RESULTS_DIR}/run_${JOB_ID}.log"
+
+# stencil_tc usa mma.h / cuda_fp16.h / cuda_bf16.h y, si el cluster lo expone,
 # NVML para telemetria; OpenBLAS/cuDNN no aplican aqui.
 
 # Arquitectura por defecto para A100.
 # Puedes sobrescribirla con:
 #   sbatch --export=ALL,CUDA_ARCH=86 run_stencil_tc.sbatch
-CUDA_ARCH="${CUDA_ARCH:-80}"  # A100=80, RTX 3050=86, V100=70
+# --- Deteccion portable del toolchain (tools/detect_toolchain.sh) --------
+# Corre igual bajo SLURM en PACCA o con `bash` directo en cualquier otra
+# maquina con el entorno conda de environment.yml activo -- ver el
+# comentario de cabecera de ese script.
+for _toolchain in "../../tools/detect_toolchain.sh" "./detect_toolchain.sh"; do
+    if [[ -f "${_toolchain}" ]]; then
+        # shellcheck source=/dev/null
+        source "${_toolchain}"
+        break
+    fi
+done
+CUDA_ARCH="$(detect_cuda_arch)"  # A100=80, RTX 3050=86, V100=70, Ada=89, Hopper=90
 
-NVCC="${NVCC:-/opt/ohpc/pub/devtools/nvidia/hpc_sdk/Linux_x86_64/23.1/compilers/bin/nvcc}"
-NCU="${NCU:-${HOME}/fcrojasv/nsight_compute/ncu}"
+# Rutas del toolchain: especificas del cluster historico (PACCA/HPC SDK).
+# Sobrescribir con --export si el cluster de destino tiene otro layout.
+NVCC="$(detect_nvcc)"
+NCU="$(detect_ncu || true)"
+if [[ -z "${NCU}" ]]; then
+    echo "AVISO: Nsight Compute (ncu) no encontrado -- se deshabilita el perfilado (RUN_NCU forzado a 0)." >&2
+    RUN_NCU=0
+fi
 
 # NVML es opcional: cuando nvml.h y la biblioteca del driver estan visibles,
-# se habilita la telemetria y se enlaza con libnvidia-ml. Si PACCA no expone
-# alguno de los dos, el mismo fuente compila con el stub sin telemetria.
+# se habilita la telemetria y se enlaza con libnvidia-ml. Si el cluster no
+# expone alguno de los dos, el mismo fuente compila con el stub sin
+# telemetria (ver common/power_sampling.h).
 NVML_FLAGS=()
-# El driver NVIDIA suele instalarse como -lnvidia-ml; PACCA puede sobreescribir
-# este valor con -lnvml si su modulo ofrece ese alias.
+# El driver NVIDIA suele instalarse como -lnvidia-ml; algunos modulos de
+# cluster ofrecen -lnvml como alias.
 NVML_LINK_FLAG="${NVML_LINK_FLAG:--lnvidia-ml}"
 if [[ "${DISABLE_NVML_TELEMETRY:-0}" != "1" ]] &&
    "${NVCC}" -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
@@ -71,24 +94,29 @@ NCU_KERNEL_REGEX_CONVERT="${NCU_KERNEL_REGEX_CONVERT:-.*convert_float_to_(half|b
 # tiempo de compilacion). Por eso el regex es el mismo por defecto: lo que
 # distingue una politica de otra no es el nombre del kernel sino los flags con
 # que se invoca el binario, y cada llamada a ncu lanza una sola instanciacion.
-# Se declara como variable propia para poder apuntarla a un regex sobre el
-# nombre demangled (que si lleva el argumento de plantilla) si alguna vez hace
-# falta: ncu usa --kernel-name-base=function por defecto, que recorta los
-# argumentos de plantilla, asi que ese caso exigiria ademas
-# --kernel-name-base demangled.
 NCU_KERNEL_REGEX_WMMA_SP="${NCU_KERNEL_REGEX_WMMA_SP:-${NCU_KERNEL_REGEX_WMMA}}"
-# Debe coincidir con kWarmupIters en stencil_tensor_activation.cu (Fase_3/Stencil);
-# se deriva del propio fuente en vez de repetir el literal para que ambos no
-# puedan desincronizarse si kWarmupIters cambia.
+# Debe coincidir con kWarmupIters en stencil_tensor_activation.cu (este mismo
+# directorio, Fase_3/Stencil); se deriva del propio fuente en vez de repetir
+# el literal para que ambos no puedan desincronizarse si kWarmupIters cambia.
 KWARMUP_ITERS_CU="$(grep -m1 'kWarmupIters *=' stencil_tensor_activation.cu | grep -oE '[0-9]+' | head -n1)"
 NCU_LAUNCH_SKIP="${NCU_LAUNCH_SKIP:-${KWARMUP_ITERS_CU}}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
-# Barrido de METRICAS (16384^2): 10..120 caen dentro del horizonte de
-# FP32/BF16/FP16 (produce L2/Linf finitas). Se elimino 200: a este tamano
-# divergen las tres rutas GPU (n* FP32~142, BF16~138, FP16~28) y toda la
-# corrida sale "REFERENCIA NO FINITA" sin ningun dato comparable -- era la
-# corrida mas cara del job sin aportar nada. El horizonte de divergencia en
-# si (donde SI importa iters grande) se mide aparte, a 4096^2, en
+
+# --- Tamano de malla y barrido de iteraciones -------------------------------
+# NX/NY: SIN limite superior impuesto por este script -- el default (16384) es
+# el tamano historicamente calibrado (presupuesto de memoria, walltime), pero
+# nada impide correr a 512/1024/2048. AUDITORIA (ver Fase_3/Stencil/README.md,
+# "Hallazgos de la auditoria"): el histerico del proyecto nunca ejercito una
+# campana real en el rango 512^2-2048^2 pese a que el flag siempre lo permitio;
+# antes de generar datos en ese rango conviene revalidar al menos el horizonte
+# de overflow medido alli.
+NX="${NX:-16384}"
+NY="${NY:-16384}"
+# Formato(s) Tensor Core de las corridas de MEDICION (--tc del binario).
+TC_FORMAT="${TC_FORMAT:-both}"
+# Barrido de ITERACIONES: 10..120 caen dentro del horizonte de FP32/BF16/FP16
+# a los NX/NY por defecto (produce L2/Linf finitas). El horizonte de
+# divergencia en si (donde SI importa iters grande) se mide aparte, en
 # run_stencil_horizon.sbatch.
 ITERS_LIST="${ITERS_LIST:-10 50 100 120}"
 # Necesario para que storage_rel (error relativo de guardar en FP16/BF16) sea
@@ -96,36 +124,34 @@ ITERS_LIST="${ITERS_LIST:-10 50 100 120}"
 # con n*~28 en corridas con ITERS>28): sin --checkpoint-every, stencil_tc solo
 # puede capturar un estado FP32 finito en la ULTIMA iteracion medida, y si esa
 # iteracion ya diverguio no hay forma de recuperar un estado finito posterior
-# al hecho (ver comentario storage_rel_eval_iter en
-# benchmark_gpu_tensor_core_stencil, stencil_tensor_activation.cu). 5 deja
-# checkpoints en 5,10,15,20,25,... -- el ultimo antes de n*~28 (FP16, el
-# formato que diverge mas temprano) cae en 25, bien dentro del rango finito.
+# al hecho (ver storage_rel_eval_iter en benchmark_gpu_tensor_core_stencil,
+# stencil_tensor_activation.cu). El default (5) fue calibrado para NX/NY=16384;
+# a mallas mucho mas chicas o con otro --op-mode/--ci-mode puede convenir otro
+# valor (donde diverja FP16 con esa condicion inicial).
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 
 # --- Tipo de corrida: energetica vs numerica --------------------------------
-# Portado de Fase 4 (RUN_KIND en Fase_4/Stencil/run_stencil_pareto3d.sbatch).
-# El gate de energy_window_reliable es IDENTICO en los dos .cu:
+# El gate de energy_window_reliable es el de common/power_sampling.h:
 #
 #     window_reliable  <=>  time_total_s >= 0.5 s * gpu_segment_count
 #
 # y cada checkpoint abre un tramo, porque el contador NVML se cuantiza POR
-# TRAMO y no sobre la suma (ver REGIMEN DE VALIDEZ en tools/power_sampling.h).
-# Con CHECKPOINT_EVERY=5 e ITERS=120 son 24 tramos: 12 s de ventana exigidos
-# contra los ~0.9 s que dura la ruta GPU mas lenta a 16384^2. Por eso las 156
-# filas de energia de los jobs 6325-6333 salieron con reliable=0 pese a que
-# NVML SI estaba midiendo (energy_gpu_j no fue NaN ni una sola vez): no fallo
-# el contador, fallo el protocolo. Sin checkpoints hay UN tramo y el umbral
-# baja a 0.5 s totales.
+# TRAMO y no sobre la suma (ver "REGIMEN DE VALIDEZ" en
+# common/power_sampling.h). Con CHECKPOINT_EVERY=5 e ITERS=120 son 24 tramos:
+# 12 s de ventana exigidos contra un tiempo de ruta GPU tipicamente muy por
+# debajo de eso a mallas grandes. Por eso una corrida con checkpoints activos
+# puede reportar reliable=0 en casi todas sus filas pese a que NVML SI este
+# midiendo: no falla el contador, falla el protocolo.
 #
 #   energy  -> sin checkpoints ni perfilado. Se REPLICA: es la unica via para
-#              reportar Cv, y cualquier instrumentacion contamina por igual
-#              t_iter_ms y la ventana de energia.
+#              reportar variabilidad, y cualquier instrumentacion contamina
+#              por igual t_iter_ms y la ventana de energia.
 #   numeric -> con checkpoints (comportamiento historico, default). Una sola
 #              corrida basta: el error es determinista.
 #
 # Las dos variables se fuerzan DESPUES de leer el entorno, a proposito: un
 # --export=ALL arrastra el CHECKPOINT_EVERY o el RUN_NCU que quedara exportado
-# de otra sesion, y una sola corrida instrumentada dentro de la campana
+# de otra sesion, y una sola corrida instrumentada dentro de una campana
 # energetica arruina la replica sin dejar rastro evidente en el CSV.
 RUN_KIND="${RUN_KIND:-numeric}"
 case "${RUN_KIND}" in
@@ -156,43 +182,39 @@ esac
 # ATENCION: ITERS_NCU e ITERS_LIST son independientes y hay que alinearlas a
 # mano. Si ningun valor de ITERS_LIST es igual a ITERS_NCU no se genera ningun
 # reporte; el script lo avisa (al arrancar y en cada corrida omitida) en vez de
-# saltarse el bloque en silencio como hacia antes.
+# saltarse el bloque en silencio.
 ITERS_NCU="${ITERS_NCU:-100}"
-# Diseno factorial {fp16,bf16} x {kahan off,on} x ITERS_LIST (bloque 5): cada
-# valor de ITERS_LIST corre completo con --kahan off y con --kahan on. Kahan
-# solo cambia las rutas WMMA (ver stencil_tensor_activation.cu); GPU FP32
-# clasico y las referencias CPU FP32/FP64 dan identico resultado en ambas
-# pasadas, pero se recalculan de todas formas (una invocacion == una corrida
-# completa) -- el costo extra es ese recalculo redundante, no trabajo nuevo.
+# Diseno factorial {fp16,bf16} x {kahan off,on} x ITERS_LIST: cada valor de
+# ITERS_LIST corre completo con --kahan off y con --kahan on. Kahan solo
+# cambia las rutas WMMA (ver stencil_tensor_activation.cu); GPU FP32 clasico y
+# las referencias CPU FP32/FP64 dan identico resultado en ambas pasadas, pero
+# se recalculan de todas formas (una invocacion == una corrida completa).
 # OJO: con el default actual (SPATIAL_COMP=on, ver abajo) esta lista se fuerza
 # a "off" y el barrido factorial de Kahan NO corre en las mediciones. Para
 # recuperarlo hay que pedir explicitamente SPATIAL_COMP=off.
 KAHAN_LIST="${KAHAN_LIST:-off on}"
 
-# Compensacion ESPACIAL (error feedback de vecinos): politica POR DEFECTO,
-# alternativa a --kahan off|on (ver CompMode en stencil_tensor_activation.cu).
-# El default se invirtio de "off" a "on" porque es la unica de las tres
-# politicas que efectivamente mitiga el error medido: Kahan LOCAL es
-# indistinguible de no compensar (rel_l2 igual hasta la 4a cifra con --kahan
-# off, horizonte sin mover: FP16=28, BF16=138) a un costo de ~1.97x en
-# t_iter_ms, mientras la espacial baja rel_l2 ~5-6 ordenes de magnitud
-# (BF16 a nx=16384: 6.01e-01 -> 3.16e-07) y lleva el horizonte de BF16 de 138
-# a 142, el mismo de FP32 clasico, por ~1.56x. Verificado a nx=4096/8192/16384
-# (jobs 4501/4502 y 4511-4514).
+# --- Politica de compensacion (none / kahan_local / spatial) ----------------
+# El binario expone esto como DOS flags booleanos independientes, no como un
+# unico selector: --kahan off|on (politica "kahan_local" en el README) y
+# --spatial-comp off|on (politica "spatial"), mutuamente excluyentes; "none"
+# es --kahan off --spatial-comp off, el default del binario. Este script
+# respeta esa misma forma en vez de inventar un tercer nombre de variable.
 #
-# El binario RECHAZA --kahan on junto con --spatial-comp on (son dos politicas
-# alternativas de la misma compensacion, no dos capas): con SPATIAL_COMP=on se
-# fuerza KAHAN_LIST=off aqui, porque con `set -e` una combinacion invalida
-# mataria el job a mitad del barrido. Por eso SPATIAL_COMP=off es la UNICA via
-# para obtener el barrido factorial de Kahan local (kahan off y on), que se
-# conserva intacto:
+# El default de ESTE SCRIPT se invirtio de "off" a "on" porque la espacial es
+# la unica de las tres politicas que efectivamente mitiga el error medido:
+# Kahan LOCAL puede ser indistinguible de no compensar o incluso empeorar el
+# error segun el operador activo (ver Fase_3/Stencil/README.md, "Compensacion
+# del redondeo de almacenamiento"), a un costo de ~1.97x en t_iter_ms; la
+# espacial baja rel_l2 varios ordenes de magnitud a ~1.56x.
+#
+# El binario RECHAZA --kahan on junto con --spatial-comp on: con SPATIAL_COMP=on
+# se fuerza KAHAN_LIST=off aqui, porque con `set -e` una combinacion invalida
+# mataria el job a mitad del barrido. SPATIAL_COMP=off es la via para obtener
+# el barrido factorial de Kahan local (kahan off y on):
 #   sbatch run_stencil_tc.sbatch                     -> WMMA_*_SP
 #   sbatch --export=ALL,SPATIAL_COMP=off run_stencil_tc.sbatch
 #                                     -> WMMA_FP16/BF16 con kahan off y on
-#
-# Las rutas WMMA de una corrida espacial se reportan como WMMA_FP16_SP /
-# WMMA_BF16_SP, asi que sus filas conviven sin ambiguedad con las de
-# KAHAN_LIST="off on" en un mismo CSV extraido.
 #
 # Nota: esto solo fija la politica de las corridas de MEDICION. El perfilado
 # NCU no depende de esta variable para el kernel WMMA: perfila las tres
@@ -202,38 +224,40 @@ if [[ "${SPATIAL_COMP}" == "on" ]]; then
     KAHAN_LIST="off"
 fi
 
-NX="${NX:-16384}"
-NY="${NY:-16384}"
+# --- Operador y condicion inicial -------------------------------------------
+# Los DEFAULTS de abajo reproducen el comportamiento historico (stress +
+# legacy, los defaults del binario): una corrida que no exporte nada da el
+# mismo resultado que antes de exponer estos flags. El operador difusivo se
+# pide explicitamente:
+#   sbatch --export=ALL,OP_MODE=diffusive,CI_MODE=monomode run_stencil_tc.sbatch
+#
+# ALPHA solo se pasa con --op-mode diffusive y CI_P/CI_AMPLITUDE solo con
+# --ci-mode monomode: el binario RECHAZA --alpha junto a stress (es un error,
+# no un no-op silencioso), asi que con `set -e` pasarlo siempre mataria el job.
+OP_MODE="${OP_MODE:-stress}"
+ALPHA="${ALPHA:-0.1875}"
+CI_MODE="${CI_MODE:-legacy}"
+CI_P="${CI_P:-168}"
+CI_AMPLITUDE="${CI_AMPLITUDE:-1.0}"
+
+OP_ARGS=(--op-mode "${OP_MODE}" --ci-mode "${CI_MODE}")
+[[ "${OP_MODE}" == "diffusive" ]] && OP_ARGS+=(--alpha "${ALPHA}")
+[[ "${CI_MODE}" == "monomode" ]] && OP_ARGS+=(--ci-p "${CI_P}" --ci-amplitude "${CI_AMPLITUDE}")
 
 # Ruta GPU_FP64 (referencia de maxima precision EN GPU): ON por defecto, de modo
 # que TODA corrida del barrido la produzca para los MISMOS NX/NY/ITERS que las
 # rutas WMMA. Esa coincidencia es el requisito para poder unir sus filas por
-# (nx, ny, iters) y calcular el speedup de WMMA_FP16_SP / WMMA_BF16_SP contra un
-# denominador GPU, sin cruzar dispositivos: la referencia FP64 de CPU sirve como
-# ground truth de ERROR, no como denominador de RENDIMIENTO.
-#
-# Presupuesto de memoria host a 16384^2 (el caso mas caro del barrido):
-#   - fp64_checkpoints con CHECKPOINT_EVERY=5 e ITERS=120: 24 snapshots x
-#     16384^2 x 8 B = 48 GiB (ya existente, no lo agrega esta ruta)
-#   - input_fp64 + y_ref: 2 x 2 GiB = 4 GiB (ya existente)
-#   - buffers FP32 de las otras rutas: ~5 GiB (ya existente)
-#   - GPU_FP64 agrega: estado final (2 GiB) + buffer D2H de checkpoint (2 GiB)
-#     + la copia en double del input dentro de la funcion (2 GiB) = ~6 GiB
-# Total ~63 GiB contra los 128G que pide el job: cabe con holgura.
-# En GPU agrega 2 buffers de 2 GiB (4 GiB), liberados al terminar la ruta.
-#
-# FP64_GPU=off la omite (por ejemplo, para repetir una corrida historica byte a
-# byte o si se reduce --mem):
+# (nx, ny, iters) y calcular el speedup de las rutas WMMA contra un
+# denominador GPU, sin cruzar dispositivos.
+# FP64_GPU=off la omite (por ejemplo, para reducir memoria a mallas grandes):
 #   sbatch --export=ALL,FP64_GPU=off run_stencil_tc.sbatch
 FP64_GPU="${FP64_GPU:-on}"
 
 # Ruta CPU_FP64: cronometra el patron de oro IEEE 754 (double serial en CPU),
 # referencia de COSTO del proyecto. El ERROR contra FP64 de CPU se mide siempre
 # (es el ground truth de todas las rutas); esta ruta agrega su TIEMPO y su
-# ENERGIA. Cuesta una segunda pasada FP64 sobre la malla, independiente del
-# ground truth para no heredar su instrumentacion, asi que a ITERS grandes es
-# la parte mas cara de la corrida: a 4096^2 escala igual que la referencia FP64
-# que ya se paga, es decir, aproximadamente la duplica.
+# ENERGIA. Cuesta una segunda pasada FP64 sobre la malla, asi que a ITERS
+# grandes es la parte mas cara de la corrida.
 # CPU_FP64=off la omite (barridos donde solo interesan las rutas GPU):
 #   sbatch --export=ALL,CPU_FP64=off run_stencil_tc.sbatch
 CPU_FP64="${CPU_FP64:-on}"
@@ -261,7 +285,7 @@ NCU_MODE="${NCU_MODE:-quick}"
 # sectores/request -> hipotesis de coalescencia. Ambos grupos se definen y
 # documentan en tools/common_ncu.sh. Vaciar la variable
 # (NCU_COMP_ANALYSIS_METRICS="") vuelve al conjunto quick historico, util si
-# la version de ncu de PACCA rechaza algun nombre de metrica.
+# la version de ncu del cluster rechaza algun nombre de metrica.
 NCU_COMP_ANALYSIS_METRICS="${NCU_COMP_ANALYSIS_METRICS:-${NCU_WARP_STALL_METRICS:-},${NCU_COALESCING_METRICS:-}}"
 
 # Politicas de compensacion a perfilar en el kernel WMMA, independientes de
@@ -281,6 +305,7 @@ echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
 echo "Arquitectura CUDA: sm_${CUDA_ARCH}"
+echo "Operador         : OP_MODE=${OP_MODE} CI_MODE=${CI_MODE} (args: ${OP_ARGS[*]})"
 echo "NVCC=${NVCC}"
 echo "NCU=${NCU}"
 echo "SMOKE_TEST=${SMOKE_TEST}"
@@ -292,7 +317,8 @@ echo "RUN_KIND=${RUN_KIND} (CHECKPOINT_EVERY=${CHECKPOINT_EVERY}, ITERS_LIST=\"$
 
 nvidia-smi || true
 
-echo "Compilando stencil_tc (Fase_3/Stencil, incluye Fase_2/common.cuh por ruta relativa)..."
+echo "Compilando stencil_tc (Fase_3/Stencil, incluye common/cuda_checks.cuh," \
+     "common/metrics.cuh y common/power_sampling.h por ruta relativa)..."
 "${NVCC}" -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
@@ -314,7 +340,7 @@ echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "NVCC_FLAGS=${NVCC_FLAGS}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=NX=${NX} NY=${NY} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP64_GPU=${FP64_GPU} CPU_FP64=${CPU_FP64}"
+echo "RUN_PARAMS=NX=${NX} NY=${NY} TC_FORMAT=${TC_FORMAT} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP64_GPU=${FP64_GPU} CPU_FP64=${CPU_FP64}"
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no
@@ -355,26 +381,22 @@ echo "Ejecutando benchmarks de stencil 2D con Tensor Cores (Fase 3: encadenamien
 
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     declare -a RUNS=(
-        "512 512 3 both"
+        "512 512 3 ${TC_FORMAT}"
     )
 else
-    # Dimensiones de referencia del proyecto (mismas del hint Nsight en el .cu),
-    # barridas sobre ITERS_LIST dentro de la ventana finita (10..120): todas
-    # las metricas (L2/Linf/gflops/etc.) quedan comparables entre corridas.
-    # NX/NY son configurables via variables de entorno (mismo mecanismo que
-    # ITERS_LIST); el valor por defecto (16384) se conserva por compatibilidad
-    # con las corridas de diagnostico ya hechas a ese tamano.
+    # NX/NY son configurables via variables de entorno; ver el bloque
+    # "Tamano de malla y barrido de iteraciones" mas arriba (incluye el
+    # hallazgo de auditoria sobre el rango 512^2-2048^2 nunca ejercitado).
     declare -a RUNS=()
     for ITERS_VAL in ${ITERS_LIST}; do
-        RUNS+=("${NX} ${NY} ${ITERS_VAL} both")
+        RUNS+=("${NX} ${NY} ${ITERS_VAL} ${TC_FORMAT}")
     done
 fi
 
 # Perfila UN solo kernel (regex + tc_type que lo activa) con --profile-only en
-# el binario: evita recalcular la referencia CPU FP32 (~742s) y la FP64
-# encadenada (~900s) antes de llegar al kernel bajo perfil (~1723s de pared
-# por llamada a ncu antes de este cambio). Usa NX/NY/ITERS/NCU_CAPTURE_ARGS
-# del ambito que la invoca (bucle principal, mas abajo). kahan (5to arg,
+# el binario: evita recalcular la referencia CPU FP32 y la FP64 encadenada
+# antes de llegar al kernel bajo perfil. Usa NX/NY/ITERS/NCU_CAPTURE_ARGS del
+# ambito que la invoca (bucle principal, mas abajo). kahan (5to arg,
 # "off"/"on") se pasa tal cual a --kahan; default "off" para los kernels que
 # Kahan no toca (FP32 clasico, conversion), que solo se perfilan una vez.
 # spatial (6to arg) default "${SPATIAL_COMP}": los kernels que la compensacion
@@ -384,7 +406,7 @@ fi
 ncu_profile_kernel() {
     local label="$1" regex="$2" tc_type="$3" report_tag="$4" kahan="${5:-off}"
     local spatial="${6:-${SPATIAL_COMP}}"
-    local report="logs/ncu_${report_tag}_nx${NX}_ny${NY}_job${SLURM_JOB_ID:-manual}"
+    local report="${LOGS_DIR}/ncu_${report_tag}_nx${NX}_ny${NY}_job${SLURM_JOB_ID:-manual}"
     echo
     echo "Perfilando ${label} con Nsight Compute (NCU_MODE=${NCU_MODE}," \
          "kahan=${kahan}, spatial-comp=${spatial})..."
@@ -399,7 +421,8 @@ ncu_profile_kernel() {
         --export "${report}" \
         --force-overwrite \
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${tc_type}" \
-            --kahan "${kahan}" --spatial-comp "${spatial}" --profile-only; } 2>&1
+            --kahan "${kahan}" --spatial-comp "${spatial}" \
+            "${OP_ARGS[@]}" --profile-only; } 2>&1
 }
 
 # Primer valor de KAHAN_LIST: la pasada en la que se concentra todo el
@@ -422,11 +445,7 @@ if [[ "${RUN_NCU}" == "1" ]]; then
 fi
 
 # Una sola invocacion de tee envuelve TODO el bucle (todas las combinaciones
-# de RUNS x KAHAN_LIST) en vez de reabrirse por cada pasada de KAHAN: mismo
-# patron ya usado para el .out de SLURM (una unica redireccion persistente
-# durante toda la corrida, que nunca perdio datos). Reabrir un proceso tee
-# por pasada dejaba a cada pasada dependiendo de que ESA invocacion puntual
-# sobreviviera intacta; con una sola invocacion para todo el bucle, ninguna
+# de RUNS x KAHAN_LIST) en vez de reabrirse por cada pasada de KAHAN: ninguna
 # pasada individual puede perderse sin que se pierdan todas.
 {
 for run in "${RUNS[@]}"; do
@@ -437,13 +456,11 @@ for run in "${RUNS[@]}"; do
         echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}, KAHAN=${KAHAN}"
         echo "============================================================"
         # --fp64-gpu se pasa SOLO aqui (corridas de medicion). Las invocaciones
-        # de ncu usan --profile-only, que no ejecuta la ruta GPU_FP64: perfilar
-        # el kernel FP64 no es el objetivo de este job y correrlo antes del
-        # kernel bajo perfil solo alargaria cada llamada a ncu.
+        # de ncu usan --profile-only, que no ejecuta la ruta GPU_FP64.
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
             --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
             --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}" \
-            --cpu-fp64 "${CPU_FP64}"
+            --cpu-fp64 "${CPU_FP64}" "${OP_ARGS[@]}"
 
         if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego
@@ -451,8 +468,6 @@ for run in "${RUNS[@]}"; do
             # de forma global, un solo pase de ncu con skip=3 solo capturaria la
             # instanciacion FP16. Se perfila cada tipo por separado (--tc fp16 /
             # --tc bf16): un reporte por precision con skip/count deterministas.
-            # --profile-only exige --tc fp16|bf16 (nunca both), asi que este split
-            # ya es obligatorio, no solo una optimizacion de --launch-skip.
             if [[ "${TC}" == "both" ]]; then
                 NCU_TC_TYPES=(fp16 bf16)
             else
@@ -468,28 +483,15 @@ for run in "${RUNS[@]}"; do
             # (la primera): ncu invoca el binario aparte, con --profile-only y
             # con la politica de compensacion que el mismo elige (ver
             # NCU_COMP_LIST), asi que no gana nada repitiendose por cada valor
-            # de KAHAN_LIST. Se ancla al primer elemento y no al literal "off"
-            # para que KAHAN_LIST="on" (o cualquier lista de un solo valor)
-            # tampoco se quede sin perfilar.
+            # de KAHAN_LIST.
             if [[ "${KAHAN}" == "${KAHAN_FIRST}" ]]; then
-                # El valor de --tc que se le pasa al FP32 clasico es
-                # irrelevante para ese kernel; se usa el primero de
-                # NCU_TC_TYPES.
                 ncu_profile_kernel "GPU FP32 clasico" "${NCU_KERNEL_REGEX_FP32}" \
                     "${NCU_TC_TYPES[0]}" "fp32_stencil"
 
                 for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
-                    # Las conversiones float<->16 bits no dependen de la
-                    # politica de compensacion (no las toca, ver
-                    # stencil_tensor_activation.cu): un reporte por precision.
                     ncu_profile_kernel "conversion ${TC_TYPE}" "${NCU_KERNEL_REGEX_CONVERT}" \
                         "${TC_TYPE}" "convert_${TC_TYPE}"
 
-                    # El kernel WMMA SI depende de la politica: se perfila una
-                    # vez por politica de NCU_COMP_LIST, con reportes
-                    # distinguibles por sufijo (kahan0 / kahan1 / sp). Los tres
-                    # salen de la MISMA corrida, nx e iters -- que es lo que
-                    # permite compararlos lado a lado.
                     for COMP_POLICY in ${NCU_COMP_LIST}; do
                         case "${COMP_POLICY}" in
                             off)
@@ -522,10 +524,6 @@ for run in "${RUNS[@]}"; do
                 done
             fi
         elif [[ "${RUN_NCU}" == "1" ]]; then
-            # Sin este aviso el bloque NCU se saltaba en silencio: ITERS_NCU e
-            # ITERS_LIST son variables independientes, y toda corrida cuyo
-            # ITERS no coincidiera con ITERS_NCU terminaba sin un solo
-            # .ncu-rep sin que nada lo dijera en el log.
             echo
             echo "AVISO: NCU omitido en esta corrida: ITERS=${ITERS} no coincide con" \
                  "ITERS_NCU=${ITERS_NCU}. El perfilado solo se dispara en el valor de" \
@@ -536,21 +534,46 @@ for run in "${RUNS[@]}"; do
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 
-echo
-echo "Extrayendo CSVs desde ${RESULTS_LOG}..."
-python3 tools/extract_csv.py \
-    --input  "${RESULTS_LOG}" \
-    --outdir "results" \
-    --job-id "${JOB_ID}" \
-    --kernel stencil
+# tools/extract_csv.py (post-proceso de CSV) migra por separado, en
+# Fase_3/tools/ (ver README.md de la raiz del repo -- no es parte de este
+# entregable). Se prueban varias rutas candidatas, como ya se hace arriba con
+# common_ncu.sh, y si no se encuentra ninguna se avisa y se omite la
+# extraccion en vez de fallar todo el job: el log crudo (${RESULTS_LOG}) queda
+# de todas formas disponible para post-procesar manualmente despues.
+EXTRACT_CSV_SCRIPT="${EXTRACT_CSV_SCRIPT:-}"
+if [[ -z "${EXTRACT_CSV_SCRIPT}" ]]; then
+    for _cand in "../tools/extract_csv.py" "tools/extract_csv.py" "../../tools/extract_csv.py"; do
+        if [[ -f "${_cand}" ]]; then
+            EXTRACT_CSV_SCRIPT="${_cand}"
+            break
+        fi
+    done
+fi
 
-echo "CSVs generados:"
-for csv_path in \
-    "results/drift_stencil_${JOB_ID}.csv" \
-    "results/summary_stencil_${JOB_ID}.csv" \
-    "results/horizon_stencil_${JOB_ID}.csv" \
-    "results/store_stencil_${JOB_ID}.csv" \
-    "results/energy_stencil_${JOB_ID}.csv"; do
-    rows=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "${csv_path}")
-    echo "  ${csv_path}: ${rows} filas"
-done
+if [[ -n "${EXTRACT_CSV_SCRIPT}" ]]; then
+    echo
+    echo "Extrayendo CSVs desde ${RESULTS_LOG} (via ${EXTRACT_CSV_SCRIPT})..."
+    python3 "${EXTRACT_CSV_SCRIPT}" \
+        --input  "${RESULTS_LOG}" \
+        --outdir "${RESULTS_DIR}" \
+        --job-id "${JOB_ID}" \
+        --kernel stencil
+
+    echo "CSVs generados:"
+    for csv_path in \
+        "${RESULTS_DIR}/drift_stencil_${JOB_ID}.csv" \
+        "${RESULTS_DIR}/summary_stencil_${JOB_ID}.csv" \
+        "${RESULTS_DIR}/horizon_stencil_${JOB_ID}.csv" \
+        "${RESULTS_DIR}/store_stencil_${JOB_ID}.csv" \
+        "${RESULTS_DIR}/energy_stencil_${JOB_ID}.csv"; do
+        rows=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "${csv_path}" 2>/dev/null || echo 0)
+        echo "  ${csv_path}: ${rows} filas"
+    done
+else
+    echo
+    echo "AVISO: extract_csv.py no encontrado (se probo ../tools/, tools/ y" \
+         "../../tools/ relativos a esta carpeta). Se omite la extraccion de" \
+         "CSVs; el log crudo con los tokens CSV_* queda en ${RESULTS_LOG}." \
+         "Defina EXTRACT_CSV_SCRIPT=/ruta/a/extract_csv.py para forzar una" \
+         "ubicacion." >&2
+fi

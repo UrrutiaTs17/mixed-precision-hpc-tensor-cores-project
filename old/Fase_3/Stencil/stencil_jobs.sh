@@ -32,33 +32,6 @@
 #   --validacion-final    --sub-c-energia + --sub-d-replicas
 #                         + --sub-e-kahan-horizonte (9 jobs)
 #
-# Energia con el protocolo de Fase 4 (RUN_KIND). Sustituye a --sub-c-energia:
-# aquella lanzaba UNA corrida por configuracion, y sin replicas la energia no
-# es reportable (entre los jobs 6325 y 6326, misma configuracion, t_iter_ms de
-# WMMA_BF16 difiere 7.24%). Autocontenida: no depende de ninguna campana previa.
-#
-#   --sub-f-energia       2*REPLICAS+1 jobs (default REPLICAS=5 => 11):
-#                         replicas de Bloque A y B con RUN_KIND=energy a
-#                         ITERS=400, mas 1 control a ITERS=1000.
-#
-#   --sub-g-horizonte-fino 2 jobs por malla (default 4): curva de error con paso
-#                         de checkpoint fino (1 en vez de 20), para que FP16
-#                         tenga mas de un punto antes de desbordar en n*=28.
-#
-# Campana COMPLETA: regenera Fase 3 entera desde cero, en UN solo directorio y
-# con UN solo manifiesto, sin depender de ninguna corrida anterior.
-#
-#   --campana-completa    --todo + --sub-d-replicas + --sub-e-kahan-horizonte
-#                         + --sub-f-energia (8+5+1+11 = 25 jobs con REPLICAS=5)
-#
-# Deliberadamente NO incluye:
-#   --sub-a-exploratorio  solo media walltime; ya se conoce (job 6325: 00:31:52).
-#   --sub-c-energia       superada por --sub-f-energia. Repetirla solo produciria
-#                         mas filas con energy_window_reliable=0.
-#   perfilado NCU         RUN_NCU=1 invalida tiempo y energia en la MISMA corrida
-#                         (ver under_ncu en el .cu y RUN_KIND=energy). Tiene que
-#                         ser una campana aparte, nunca mezclada con esta.
-#
 # Se ejecuta EN PACCA, desde cualquier punto del repositorio.
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -110,53 +83,6 @@ Uso: stencil_jobs.sh <flag>
   --validacion-final     --sub-c-energia + --sub-d-replicas
                          + --sub-e-kahan-horizonte (9 jobs).
 
---- Energia con el protocolo RUN_KIND de Fase 4 ---
-
-  --sub-f-energia        2*REPLICAS+1 jobs (REPLICAS env, default 5 => 11) de
-                         run_stencil_tc.sbatch con RUN_KIND=energy, que fuerza
-                         CHECKPOINT_EVERY=0 y RUN_NCU=0 dentro del propio
-                         .sbatch (un solo tramo => el umbral de
-                         window_reliable baja de 0.5 s x tramos a 0.5 s
-                         totales):
-                           energiaA_rN  ITERS_LIST=400  SPATIAL_COMP=off
-                                        KAHAN_LIST="off on"   (sin comp. + Kahan)
-                           energiaB_rN  ITERS_LIST=400  SPATIAL_COMP=on
-                                        (fuerza KAHAN_LIST=off) (espacial)
-                           control_1000 ITERS_LIST=1000 SPATIAL_COMP=off
-                                        KAHAN_LIST=off
-                         --time=WALL_ENERGIA (default 02:00:00) para las
-                         replicas y WALL_CONTROL (default 04:00:00) para el
-                         control.
-
---- Horizonte de alta resolucion ---
-
-  --sub-g-horizonte-fino 2 jobs por malla (default 4 jobs) de
-                         run_stencil_horizon.sbatch con paso de checkpoint fino,
-                         para resolver la curva de FP16 (n*=28), que con el paso
-                         20 estandar deja UN solo punto finito.
-                         Ajustable por entorno:
-                           ITERS_FINO   default 160  (cubre FP16/BF16/FP32)
-                           PASO_FINO    default 1
-                           MALLAS_FINO  default "4096 8192"
-                           MEM_FINO     default: sin override de --mem
-                         NO recalcula n*: FP64 no diverge en 160 iters y sale
-                         con fit_status=insufficient_points. n* viene de
-                         --sub-b-horizonte.
-
---- Campana completa ---
-
-  --campana-completa     --todo + --sub-d-replicas + --sub-e-kahan-horizonte
-                         + --sub-f-energia. Con REPLICAS=5 son 25 jobs:
-                           8  error (bloques A/B) + horizonte (3 mallas x 2)
-                           5  replicas con checkpoints (Cv de t_iter_ms)
-                           1  Kahan sobre el horizonte a 16384^2
-                          11  energia con RUN_KIND=energy + control
-                         Regenera Fase 3 entera en UN directorio y UN
-                         manifiesto. No incluye --sub-a-exploratorio,
-                         --sub-c-energia (superada por F) ni perfilado NCU
-                         (invalida tiempo y energia; va en campana aparte).
-                         Con REPLICAS=3 son 21 jobs.
-
 Sin flag: imprime este uso y sale sin lanzar nada.
 USO_EOF
 }
@@ -165,7 +91,6 @@ MODO="${1:-}"
 case "${MODO}" in
     --sub-a-exploratorio|--sub-a-completa|--sub-b-horizonte|--todo) ;;
     --sub-c-energia|--sub-d-replicas|--sub-e-kahan-horizonte|--validacion-final) ;;
-    --sub-f-energia|--campana-completa|--sub-g-horizonte-fino) ;;
     ""|-h|--help)
         uso
         exit 0
@@ -183,20 +108,6 @@ WALL_TC="${WALL_TC:-04:00:00}"
 # margen >2x sobre ambas estimaciones.
 WALL_ENERGIA="${WALL_ENERGIA:-02:00:00}"
 WALL_CONTROL="${WALL_CONTROL:-04:00:00}"
-
-# Replicas por bloque en --sub-f-energia. 5 es el minimo con el que un Cv sobre
-# t_iter_ms y energia tiene grados de libertad utiles: con las 2 corridas
-# equivalentes que existian (6325/6326) la dispersion de WMMA_BF16 ya era del
-# 7.24%, y con n=2 no se puede distinguir esa cifra del ruido.
-REPLICAS="${REPLICAS:-5}"
-
-# Parametros de --sub-g-horizonte-fino (ver la funcion para el razonamiento).
-ITERS_FINO="${ITERS_FINO:-160}"
-PASO_FINO="${PASO_FINO:-1}"
-MALLAS_FINO="${MALLAS_FINO:-4096 8192}"
-MEM_FINO="${MEM_FINO:-}"
-[[ "${REPLICAS}" =~ ^[0-9]+$ && "${REPLICAS}" -ge 1 ]] \
-    || die "REPLICAS debe ser un entero >= 1 (recibido: ${REPLICAS})"
 
 # --- 1. Procedencia: rama, commit, arbol ------------------------------------
 ROOT="$(git rev-parse --show-toplevel)" || die "no estas dentro del repositorio git"
@@ -387,52 +298,6 @@ mueve el **error**; falta saber si mueve el **horizonte** n\*. Aqui NO se pasa
 ITERS=1200, CHECKPOINT_EVERY=20 y --time=02:00:00 quedan en el default del
 script (ese limite ya esta calibrado para las dos pasadas de KAHAN).
 
-## Sub-campana F - energia con el protocolo RUN_KIND de Fase 4
-| Job | ITERS_LIST | SPATIAL_COMP | KAHAN_LIST | Walltime | Proposito |
-| --- | --- | --- | --- | --- | --- |
-| f_energia/energiaA_r1..r${REPLICAS} | 400 | off | off on | ${WALL_ENERGIA} | Energia sin compensar + Kahan local |
-| f_energia/energiaB_r1..r${REPLICAS} | 400 | on (fuerza off) | off | ${WALL_ENERGIA} | Energia con compensacion espacial |
-| f_energia/control_1000 | 1000 | off | off | ${WALL_CONTROL} | Independencia energia / rutas finitas |
-
-Portado de \`RUN_KIND\` en \`Fase_4/Stencil/run_stencil_pareto3d.sbatch\`. El
-\`.cu\` NO se modifica: el gate es identico en el fuente congelado de Fase 3 y
-en el de Fase 4,
-
-    window_reliable  <=>  time_total_s >= 0.5 s * gpu_segment_count
-
-y cada checkpoint abre un tramo. Lo que Fase 4 cambio fue el PROTOCOLO, no el
-codigo: separar la corrida de energia (sin instrumentacion) de la numerica (con
-checkpoints). \`RUN_KIND=energy\` fuerza \`CHECKPOINT_EVERY=0\` y \`RUN_NCU=0\`
-dentro del propio \`.sbatch\`, despues de leer el entorno, para que un
-\`--export=ALL\` no pueda colar instrumentacion en una replica.
-
-**Diagnostico que lo motiva:** en los jobs 6325-6333 las 156 filas de energia
-salieron con \`energy_window_reliable=0\`, pero \`energy_gpu_j\` **nunca** fue
-NaN (103 J, 210 J, 246 J, 689 J). NVML si media; lo que fallaba era el umbral:
-24 tramos (CHECKPOINT_EVERY=5, ITERS=120) exigen 12 s de ventana contra los
-~0.9 s reales de la ruta GPU mas lenta a 16384^2. Con un solo tramo el umbral
-es 0.5 s y la ventana medida a 400 iters es ~1.2 s (margen ~2.5x, derivado del
-job 6332: 1200 iters en 3.68 s => 3.07 ms/iter).
-
-**Por que replicas:** entre 6325 y 6326, misma configuracion y mismo binario,
-\`t_iter_ms\` de WMMA_BF16 difiere **7.24%**. Con n=2 esa cifra no se distingue
-del ruido, asi que la energia no era reportable ni aunque la ventana hubiera
-sido valida. ${REPLICAS} replicas por bloque dan grados de libertad para un Cv.
-
-**El control a ITERS=1000** mide (en vez de asumir) que el consumo del kernel
-es memory-bound e independiente del contenido numerico: la fraccion de
-iteraciones aun finitas de WMMA_FP16 (n\*=28) cae de 7% a 400 iters a 2.8% a
-1000. Si \`energy_gpu_j_per_iter\` no se mueve, la independencia queda medida.
-Se lanza con \`KAHAN_LIST=off\` para comparar contra las filas kahan=off de las
-replicas sin pagar la segunda pasada.
-
-**Esperado, no es un bug:** sin checkpoints no hay snapshots de error, asi que
-esta sub-campana NO produce \`drift_stencil\` ni \`store_stencil\` utiles.
-
-La columna \`energy_per_cell_update_j\` de Fase 4 no se porta al \`.cu\`: es
-derivable en post-proceso desde columnas que el CSV ya trae
-(\`energy_total_j / ((nx-2)*(ny-2)*iters)\`). Ver \`tools/energia_por_celda.py\`.
-
 ## Job IDs (anadidos tras el envio)
 
 MAN_EOF
@@ -479,14 +344,8 @@ lanzar_tc() {
     msg "  [${sub}] ${nombre}: JobID ${jid}  (--time ${wall}, export ${export_vars})"
 }
 
-# extra (7mo arg, opcional) se anade tal cual al final de --export.
-# mem  (8vo arg, opcional) sobreescribe el "#SBATCH --mem=32G" del script: los
-# checkpoints se retienen en memoria de host y su consumo escala como
-# ITERS/CHECKPOINT_EVERY, asi que una ventana fina no cabe en el presupuesto
-# por defecto (calculado en el .sbatch para 4096^2 y paso 20).
 lanzar_horizon() {
     local sub="$1" grupo="$2" nombre="$3" nx="$4" spatial="$5" kahan_off_explicito="$6"
-    local extra="${7:-}" mem="${8:-}"
     local jobdir="${CDIR}/jobs/${grupo}/${nombre}"
     preparar_dir_job "${jobdir}" "run_stencil_horizon.sbatch"
 
@@ -494,31 +353,21 @@ lanzar_horizon() {
     if [[ "${kahan_off_explicito}" == "1" ]]; then
         export_vars="${export_vars},KAHAN_LIST=off"
     fi
-    [[ -n "${extra}" ]] && export_vars="${export_vars},${extra}"
-
-    # El campo walltime del CSV no puede llevar comas (no va entrecomillado):
-    # el override de memoria se anexa con '+' para que el mapa siga teniendo 8
-    # columnas y aun asi registre el recurso real con el que se envio el job.
-    local sbatch_args=(--parsable --export="${export_vars}")
-    local wall_label="02:00:00(default)"
-    if [[ -n "${mem}" ]]; then
-        sbatch_args+=(--mem="${mem}")
-        wall_label="${wall_label}+mem${mem}"
-    fi
-
     local jid
-    jid=$(cd "${jobdir}" && sbatch "${sbatch_args[@]}" run_stencil_horizon.sbatch)
+    jid=$(cd "${jobdir}" && sbatch --parsable \
+            --export="${export_vars}" \
+            run_stencil_horizon.sbatch)
     JIDS+=("${jid}")
 
     printf '%s,%s,%s,%s,"%s",%s,%s,%s\n' \
         "${sub}" "${grupo}" "${nombre}" "run_stencil_horizon.sbatch" \
-        "${export_vars}" "${wall_label}" "${jid}" "jobs/${grupo}/${nombre}" >> "${MAPA}"
+        "${export_vars}" "02:00:00(default)" "${jid}" "jobs/${grupo}/${nombre}" >> "${MAPA}"
 
     {
-        echo "| ${sub} | ${nombre} | \`${jid}\` | ${wall_label} |"
+        echo "| ${sub} | ${nombre} | \`${jid}\` | 02:00:00 (default del script) |"
     } >> "${CDIR}/MANIFIESTO.md"
 
-    msg "  [${sub}] ${nombre}: JobID ${jid}  (${wall_label}, export ${export_vars})"
+    msg "  [${sub}] ${nombre}: JobID ${jid}  (export ${export_vars})"
 
     sleep 2
 }
@@ -573,55 +422,6 @@ sub_d_replicas() {
     done
 }
 
-# Energia con el protocolo RUN_KIND de Fase 4. RUN_KIND=energy hace el trabajo
-# dentro del .sbatch (fuerza CHECKPOINT_EVERY=0 y RUN_NCU=0); aqui solo se fija
-# ITERS y se repiten las corridas, que es lo que ninguna sub-campana anterior
-# hizo y sin lo cual no hay Cv que reportar.
-sub_f_energia() {
-    msg "Enviando sub-f-energia (${REPLICAS} replicas x 2 bloques + 1 control = $((2 * REPLICAS + 1)) jobs)..."
-    for R in $(seq 1 "${REPLICAS}"); do
-        lanzar_tc "F-energia" "f_energia" "energiaA_r${R}" "off" "off on" "${WALL_ENERGIA}" \
-            "RUN_KIND=energy,ITERS_LIST=400"
-    done
-    for R in $(seq 1 "${REPLICAS}"); do
-        lanzar_tc "F-energia" "f_energia" "energiaB_r${R}" "on"  ""       "${WALL_ENERGIA}" \
-            "RUN_KIND=energy,ITERS_LIST=400"
-    done
-    lanzar_tc "F-energia" "f_energia" "control_1000" "off" "off" "${WALL_CONTROL}" \
-        "RUN_KIND=energy,ITERS_LIST=1000"
-}
-
-# Horizonte de ALTA RESOLUCION. Con CHECKPOINT_EVERY=20 sobre ITERS=1200, FP16
-# (n*=28) deja UN solo punto finito: el de n=20, porque el siguiente checkpoint
-# ya desbordo. Aqui se invierte el reparto -- pocas iteraciones, paso fino --
-# que es donde vive la informacion.
-#
-# ITERS=160 cubre la divergencia de FP16 (28), BF16 (138) y FP32 (142). FP64 no
-# diverge ahi (n*~1044) y su fila de horizon_stencil sale con
-# fit_status=insufficient_points, que es el degradado limpio de
-# emit_csv_horizon_row. Estos jobs NO recalculan n*: eso lo dan los jobs largos
-# de --sub-b-horizonte.
-#
-# Mallas por defecto 4096 y 8192, no 16384: el error es invariante con la malla
-# (medido sobre los jobs 6328/6330/6332, las diferencias van del 0.23% al 2.1%,
-# inapreciables en un eje log de 10 decadas), y un snapshot a 16384^2 pesa 2.1
-# GB contra 134 MB a 4096^2. Anadir 16384 solo cuesta memoria sin aportar curva.
-#
-# Todo ajustable sin tocar el script:
-#   ITERS_FINO   (default 160)   PASO_FINO  (default 1)
-#   MALLAS_FINO  (default "4096 8192")      MEM_FINO (default: sin override)
-sub_g_horizonte_fino() {
-    local n=0
-    for NX_G in ${MALLAS_FINO}; do n=$((n + 2)); done
-    msg "Enviando sub-g-horizonte-fino (${n} jobs: mallas '${MALLAS_FINO}', ITERS=${ITERS_FINO}, paso ${PASO_FINO})..."
-    for NX_G in ${MALLAS_FINO}; do
-        lanzar_horizon "G-horizonte-fino" "g_horizonte_fino" "nx${NX_G}_off" "${NX_G}" "off" "1" \
-            "ITERS=${ITERS_FINO},CHECKPOINT_EVERY=${PASO_FINO}" "${MEM_FINO}"
-        lanzar_horizon "G-horizonte-fino" "g_horizonte_fino" "nx${NX_G}_on"  "${NX_G}" "on"  "0" \
-            "ITERS=${ITERS_FINO},CHECKPOINT_EVERY=${PASO_FINO}" "${MEM_FINO}"
-    done
-}
-
 # SPATIAL_COMP=off SIN KAHAN_LIST explicito: es la unica via para que el script
 # use su default "off on" y corra por fin la rama kahan=on del horizonte.
 sub_e_kahan_horizonte() {
@@ -652,23 +452,6 @@ case "${MODO}" in
         ;;
     --sub-e-kahan-horizonte)
         sub_e_kahan_horizonte
-        ;;
-    --sub-f-energia)
-        sub_f_energia
-        ;;
-    --sub-g-horizonte-fino)
-        sub_g_horizonte_fino
-        ;;
-    --campana-completa)
-        # Orden: primero lo que responde preguntas que hoy NO estan contestadas
-        # (energia y la rama Kahan del horizonte), despues lo que reproduce
-        # resultados que ya existen. Si hay que cancelar la campana a medias,
-        # lo perdido es lo reproducible.
-        sub_f_energia
-        sub_e_kahan_horizonte
-        sub_a_completa
-        sub_b_horizonte
-        sub_d_replicas
         ;;
     --validacion-final)
         sub_c_energia

@@ -40,6 +40,8 @@ dist/
 *.md
 !README.md
 !**/README.md
+!REQUIREMENTS.md
+!docs/MANUAL.md
 
 # IDEs
 .vscode/
@@ -61,6 +63,8 @@ dist/
 metricas_*.txt
 output/
 results/
+stats_out/
+pareto_out/
 
 # Archivos del sistema
 .DS_Store
@@ -72,7 +76,3 @@ out/
 
 # CLion
 cmake-build-*/
-
-# Cache de bytecode de los scripts de analisis (tools/*.py)
-__pycache__/
-*.pyc

@@ -36,8 +36,26 @@
 // la misma operacion sobre el MISMO buffer de entrada, valido solo para medir
 // throughput-, aqui las tres rutas encadenan genuinamente salida(i) -> entrada(i+1)
 // para poder cuantificar drift numerico acumulado a traves de iteraciones reales.
-// Reutiliza Fase_2/common.cuh por ruta relativa (no lo duplica). La suma
-// compensada Kahan queda para una entrega posterior de Fase 3.
+// Reutiliza common/cuda_checks.cuh y common/metrics.cuh por ruta relativa (no
+// los duplica). Incluye ademas la suma compensada de Kahan (CompMode::Local,
+// --kahan on) y la compensacion espacial (CompMode::Spatial, --spatial-comp
+// on) -- ver la seccion "Politica de compensacion del redondeo de
+// almacenamiento" junto a compensated_store, mas abajo.
+//
+// NOTA MIGRACION (ver Fase_3/Stencil/README.md): este archivo es una
+// relocalizacion, sin cambios numericos, de old/Fase_4/Stencil/
+// stencil_tensor_activation.cu (rama fase4-estadistica-variabilidad del
+// historico del proyecto, nunca fusionada a main) hacia Fase_3/Stencil/ en la
+// rama principal. Se prefirio esa version -mas avanzada que la que main tenia
+// en old/Fase_3/Stencil/- porque ya incluye la reformulacion Y = X H + V X,
+// el tiling ensanchado (kTileW), ldmatrix/mma.sync explicito y CUDA Graphs,
+// con sus gates de regresion ya validados en el historico. El unico cambio
+// respecto al original es de INCLUDES (ver mas abajo): pasa a usar los
+// headers compartidos ya migrados en common/ en vez de tools/power_sampling.h
+// y ../../Fase_2/common.cuh (que no existen todavia en esta rama). El
+// mecanismo de "ancla FP64" NO esta migrado aqui a proposito: es una
+// extension que se construye por separado en Fase_4/Stencil/, apoyada en este
+// mismo kernel.
 
 #include <mma.h>
 
@@ -64,11 +82,25 @@
 // El header de telemetria queda a nivel global porque incluye <nvml.h> cuando
 // el sbatch habilita NVML; las declaraciones C de NVML no deben caer dentro
 // del namespace anonimo de este archivo.
-#include "tools/power_sampling.h"
+//
+// MIGRACION: el original (old/Fase_4/Stencil/stencil_tensor_activation.cu)
+// incluia "tools/power_sampling.h", una copia local identica -salvo reflow y
+// traduccion de comentarios, sin diferencias de firma ni de logica, ver
+// Fase_3/Stencil/README.md- a la que ahora vive en common/. Se usa esa unica
+// copia compartida en vez de duplicarla de nuevo bajo Stencil/tools/.
+#include "../../common/power_sampling.h"
 
 namespace {
 
-#include "../../Fase_2/common.cuh"
+// MIGRACION: el original incluia "../../Fase_2/common.cuh" (un solo header
+// con las macros CHECK_CUDA/CHECK_CUBLAS/CHECK_CUDNN, CudaEventTimer y las
+// funciones compare_*/ErrorMetrics). Ese archivo se separo, sin cambio de
+// comportamiento, en common/cuda_checks.cuh (macros de validacion) y
+// common/metrics.cuh (cronometro y metricas de error) -- ver
+// old/Fase_2/common.cuh para la version previa a la separacion y
+// Fase_3/Stencil/README.md para la comparacion linea a linea.
+#include "../../common/cuda_checks.cuh"
+#include "../../common/metrics.cuh"
 
 using namespace nvcuda;
 
@@ -470,6 +502,20 @@ static const char* fp16_route_label(CompMode mode) {
 
 static const char* bf16_route_label(CompMode mode) {
     return wmma_route_label(mode, "WMMA_BF16", "WMMA_BF16_SP");
+}
+
+// Misma convencion para la columna `formato` del CSV de resumen, que va en
+// minusculas. Sin esto la fila de spatial salia como (wmma_fp16, kahan=off),
+// IDENTICA a la de la politica sin compensar, y al concatenar los CSV del
+// bloque A y del bloque B las dos politicas se confundian en silencio: el
+// contrato de arriba -- (route, kahan) identifica las tres -- solo se cumplia
+// en los marcadores de stdout, no en el fichero.
+static const char* fp16_csv_label(CompMode mode) {
+    return wmma_route_label(mode, "wmma_fp16", "wmma_fp16_sp");
+}
+
+static const char* bf16_csv_label(CompMode mode) {
+    return wmma_route_label(mode, "wmma_bf16", "wmma_bf16_sp");
 }
 
 static std::string csv_first_nonfinite_field(int first_nf) {
@@ -2038,13 +2084,13 @@ static void record_checkpoint(const CheckpointContext& ckpt,
     }
 }
 
-// Version FP64/FP64 de compare_fp64_ref_vs_fp32 (Fase_2/common.cuh), byte a
+// Version FP64/FP64 de compare_fp64_ref_vs_fp32 (common/metrics.cuh), byte a
 // byte igual salvo que `test` ya es double y no hay cast que aplicar. No se
-// usa compare_double_vectors -que si existe en common.cuh y compara el mismo
+// usa compare_double_vectors -que si existe en metrics.cuh y compara el mismo
 // par de tipos- porque ESA deja l2_abs y ref_l2_norm en 0.0 por diseno (ver su
 // comentario): son justamente las dos primeras columnas numericas que
 // emit_csv_drift_row imprime, asi que CSV_DRIFT saldria con ref_l2=0 y abs_l2=0
-// para toda la ruta GPU_FP64. Se define aqui, y no ampliando common.cuh, para
+// para toda la ruta GPU_FP64. Se define aqui, y no ampliando metrics.cuh, para
 // no alterar un header compartido con Fase 1 y Fase 2.
 static ErrorMetrics compare_fp64_ref_vs_fp64(const std::vector<double>& ref_fp64,
                                              const std::vector<double>& test_fp64) {
@@ -2125,7 +2171,7 @@ static void record_checkpoint_fp64(const CheckpointContext& ckpt,
 
 // Construye la medicion de energia a partir de escalares YA depurados del
 // consumo de los bloques de checkpoint. make_energy_measurement (en
-// tools/power_sampling.h) integra el buffer de muestras COMPLETO, incluido el
+// common/power_sampling.h) integra el buffer de muestras COMPLETO, incluido el
 // hueco entre parada y reanudacion del muestreo, asi que no puede descontar
 // esos tramos; las formulas de aqui son exactamente las suyas, solo cambian
 // las entradas. Ver acumulacion por tramos en las rutas GPU de abajo.
@@ -2143,7 +2189,7 @@ static EnergyMeasurement make_energy_measurement_from_segments(bool gpu_valid,
     // El contador NVML se cuantiza POR TRAMO, no sobre la suma: cada tramo
     // aporta hasta un salto de error, asi que el minimo exigido de ventana se
     // multiplica por el numero de tramos (ver REGIMEN DE VALIDEZ en
-    // tools/power_sampling.h). Sin checkpointing hay un solo tramo y esto se
+    // common/power_sampling.h). Sin checkpointing hay un solo tramo y esto se
     // reduce a time_total_s >= kEnergyWindowReliableSeconds.
     result.gpu_segment_count = gpu_segment_count;
     result.window_reliable =
@@ -2606,9 +2652,38 @@ __device__ inline __nv_bfloat16 float_to_tc<__nv_bfloat16>(float v) {
 // iteraciones el residuo indexado por celda; que se guarda ahi y con que signo
 // depende de kMode:
 //
-//   Local (--kahan on): convencion Kahan clasica. Se PRE-RESTA el residuo
-//     anterior antes de redondear y se guarda el nuevo residuo con signo
-//     Q(y)-y. Formulacion historica, intacta byte a byte.
+//   Local (--kahan on): cuantizador con RETROALIMENTACION DE ERROR (error
+//     feedback / noise shaping de primer orden). Se PRE-RESTA el residuo de la
+//     escritura anterior antes de redondear y se guarda el nuevo residuo con
+//     signo Q(y)-y. Intacta byte a byte. El nombre historico de la opcion
+//     (--kahan) es enganoso y se conserva solo por compatibilidad de la CLI y
+//     de los CSV ya emitidos: NO es suma compensada de Kahan, que exige un
+//     acumulador vivo al que sumarle incrementos. Aqui val se recalcula entero
+//     desde los 5 vecinos en cada iteracion, asi que no hay tal acumulador --
+//     lo que hace la pre-resta es dar forma al espectro del ruido de
+//     cuantizacion, empujandolo fuera de la banda donde vive la senal.
+//
+//     Consecuencia, y es la propiedad que gobierna cuando sirve: su eficacia
+//     depende de la CORRELACION TEMPORAL del campo cuantizado. Medido en este
+//     mismo codigo (1024^2, 20 iters, --ci-p 168, rel_l2_prop contra el ground
+//     truth FP64, frente a --kahan off):
+//
+//       diffusive (campo suave, residuos correlacionados entre iteraciones):
+//         FP16 -26.1 %, BF16 -24.5 % de error. El ruido dado forma cae fuera
+//         de la banda de la senal y la retroalimentacion cancela.
+//       stress (g(pi,pi) = -2, el modo Nyquist se duplica cada iteracion y
+//         decorrelaciona el residuo): FP16 +8.7 %, BF16 +6.0 %. Sin
+//         correlacion que explotar, la pre-resta solo inyecta ruido extra.
+//
+//     Es decir: no es un error algebraico y no debe "corregirse" a la
+//     convencion de Spatial. Un intento de hacerlo (sustituirla por
+//     comp = val - Q(val), sin reincorporar residuos durante la recurrencia)
+//     se midio y quedo indistinguible de --kahan off: entre 0.00004 % y
+//     0.003 % de diferencia a 20 iters, porque reconstruir en el readout solo
+//     deshace el redondeo de la ULTIMA escritura y ese termino se diluye
+//     segun se acumula error (a iters=1 valia -47.8 %, a iters=5 ya -6.3 %).
+//     Lo que hay que declarar al interpretar --kahan on es su dependencia del
+//     operador, no un supuesto defecto de la formula.
 //
 //   Spatial (--spatial-comp on): convencion de error feedback. Se guarda lo
 //     que el redondeo PERDIO, comp = val - Q(val), de modo que el lector
@@ -2627,6 +2702,11 @@ __device__ inline __nv_bfloat16 float_to_tc<__nv_bfloat16>(float v) {
 template <typename T, CompMode kMode>
 __device__ inline T compensated_store(float val, float* comp, int idx) {
     if constexpr (kMode == CompMode::Local) {
+        // Lazo de retroalimentacion de error (ver el bloque de doc de arriba
+        // para por que NO es Kahan y de que depende su eficacia). El residuo
+        // de la escritura ANTERIOR de esta misma celda se resta antes de
+        // cuantizar, y el nuevo residuo se guarda con signo Q(y)-y para que la
+        // proxima iteracion lo reste, no lo sume.
         const float y = val - comp[idx];
         const T s = float_to_tc<T>(y);
         comp[idx] = tc_to_float(s) - y;
@@ -3927,6 +4007,30 @@ static std::vector<float> build_spatial_reconstructed_field(const std::vector<T>
     return out;
 }
 
+// Campo de LECTURA (readout) del estado propagado, para rel_l2_prop/rel_linf_prop.
+//
+// Antes de la correccion del 29-ago esto era reduced_to_float(state_tc) a secas
+// en los dos sitios de llamada, sin rama por CompMode: rel_l2_prop media el
+// buffer T CRUDO incluso bajo compensacion ESPACIAL, que es la unica politica
+// cuyo estado efectivo no es el buffer T. Eso ya era inconsistente con lo que
+// el archivado hace desde siempre (Q(u)+comp), y subestimaba la precision de
+// Spatial en un factor grande: medido a 1024^2, 20 iters, diffusive, la ruta
+// FP16_SP pasaba de un 3.03e-04 aparente a 2.02e-05 real, y BF16_SP de
+// 1.55e-03 a 2.02e-05. Que ambos formatos converjan al MISMO valor es la
+// comprobacion de que la reconstruccion es exacta: recuperado el valor FP32,
+// lo que queda es el suelo FP32-vs-FP64, que no depende del formato de 16 bits.
+//
+// comp llega vacio salvo en Spatial. Para Off porque no hay buffer; para Local
+// porque su convencion de error feedback hace que Q(u)+comp sea invalida (ver
+// la nota en el bloque de archivado). En ambos casos esto colapsa a
+// reduced_to_float, sin cambio numerico respecto al comportamiento historico.
+template <typename T>
+static std::vector<float> build_readout_field(const std::vector<T>& state_tc,
+                                              const std::vector<float>& comp) {
+    return comp.empty() ? reduced_to_float(state_tc)
+                        : build_spatial_reconstructed_field(state_tc, comp);
+}
+
 static inline __half host_float_to_tc_impl(float v, __half*) { return __float2half(v); }
 static inline __nv_bfloat16 host_float_to_tc_impl(float v, __nv_bfloat16*) { return __float2bfloat16(v); }
 
@@ -4092,7 +4196,12 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  double& t_checkpoint_ms_out,
                                                  std::vector<float>& out_last_finite_o,
                                                  std::vector<T>& out_reduced_last_finite_o,
-                                                 EnergyMeasurement& out_energy) {
+                                                 EnergyMeasurement& out_energy,
+                                                 // Residuo de compensacion que acompana a
+                                                 // out_reduced, ya emparejado con el buffer T
+                                                 // correcto (ver el volcado al final). Queda
+                                                 // VACIO en CompMode::Off: no hay buffer comp.
+                                                 std::vector<float>& out_comp) {
     const size_t count = in.size();
     float* d_in_fp32 = nullptr;
     float* d_out_fp32 = nullptr;
@@ -4463,10 +4572,17 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     double checkpoint_ms_total = 0.0;
     // Igual que en la ruta GPU_FP32: energia acumulada por tramos, con cortes
     // en los mismos bloques que pausan el cronometro (ver comentario alli
-    // sobre por que no basta con parar/reanudar el muestreo). La exclusion
-    // solo se activa con checkpointing encendido; con checkpoint_every<=0 el
-    // bucle recorre un unico tramo y el resultado es identico al anterior.
-    const bool exclude_checkpoint_energy = checkpoints_enabled(ckpt);
+    // sobre por que no basta con parar/reanudar el muestreo).
+    //
+    // El corte es INCONDICIONAL, no depende de checkpoints_enabled(ckpt). Esta
+    // ruta entra al bloque por write_fp32, que es cierto TAMBIEN en la ultima
+    // iteracion medida aunque no haya checkpointing: sin corte, ese D2H final
+    // (~1 s a 16384^2) quedaba dentro de la ventana de energia mientras el
+    // cronometro si lo excluia, y energy_j medía un trabajo distinto del que
+    // medía t_ms_iter. Las rutas GPU_FP32/GPU_FP64 no tenian el fallo porque
+    // entran por checkpoint_due() y cierran el tramo sin condicion.
+    // Coste: una frontera de tramo extra (un salto de cuantizacion NVML, ~5 J)
+    // a cambio de los ~44 J de contaminacion que elimina.
     double gpu_energy_j = 0.0;
     double gpu_window_s = 0.0;
     // Numero de tramos acumulados: fija energy_window_reliable junto con la
@@ -4565,16 +4681,12 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             // checkpoint_every): el D2H y el escaneo del host son identicos en
             // ambos casos, y dejar el ultimo fuera haria que energy_gpu_j
             // dependiera de si iters es multiplo de la cadencia.
-            std::chrono::steady_clock::time_point pause_t0;
-            RAEnergySnapshot rapl_ckpt_before{};
-            if (exclude_checkpoint_energy) {
-                // pause_t0 antes de close_energy_segment(), por el pthread_join
-                // que esa llamada hace sobre el hilo de muestreo (ver la misma
-                // nota en benchmark_gpu_fp32_stencil).
-                pause_t0 = std::chrono::steady_clock::now();
-                close_energy_segment();
-                rapl_ckpt_before = rapl_snapshot_now();
-            }
+            // pause_t0 antes de close_energy_segment(), por el pthread_join
+            // que esa llamada hace sobre el hilo de muestreo (ver la misma
+            // nota en benchmark_gpu_fp32_stencil).
+            const auto pause_t0 = std::chrono::steady_clock::now();
+            close_energy_segment();
+            const RAEnergySnapshot rapl_ckpt_before = rapl_snapshot_now();
 
             const auto ckpt_t0 = std::chrono::high_resolution_clock::now();
             // Una sola copia D2H de d_out_fp32, reutilizada tanto para
@@ -4595,13 +4707,27 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                 std::vector<T> state_tc(count);
                 CHECK_CUDA(cudaMemcpy(state_tc.data(), tc_in, count * sizeof(T),
                                       cudaMemcpyDeviceToHost));
+                // Bajo compensacion espacial el estado efectivo no es Q(u)
+                // sino Q(u)+comp: el residuo se reincorpora al leer, asi que
+                // archivar solo el buffer T perderia exactamente la parte
+                // que esa politica existe para conservar. comp_in es el
+                // buffer recien escrito (swap_comp ya corrio), el que
+                // corresponde a tc_in.
+                // Por que Local queda FUERA de la reconstruccion, y no es un descuido:
+                //
+                // La identidad Q(u) + comp == u vale SOLO con la convencion de signo de
+                // Spatial, comp = val - Q(val). Local usa retroalimentacion de error y guarda
+                // comp = Q(y) - y, con el signo opuesto y referido a y = val - comp_anterior,
+                // no a val. Sumarlo da Q(y) + (Q(y) - y) = 2Q(y) - y, que se PASA de largo en
+                // vez de corregir. Medido en diffusive con --kahan on, rel_l2_prop empeora
+                // 1.78x a 1 iteracion, 1.37x a 2, 1.20x a 5, y a 20 queda diluido a 1.000x --
+                // invisible, pero igual de incorrecto.
+                //
+                // Tampoco hay una reconstruccion alternativa valida: Q(y) - comp recupera y,
+                // no val, y val = y + comp_anterior con comp_anterior ya sobrescrito por esta
+                // misma escritura. El estado que Local propaga ES el buffer T crudo, asi que
+                // leerlo crudo no es una perdida de precision: es la lectura correcta.
                 if (comp_mode == CompMode::Spatial) {
-                    // Bajo compensacion espacial el estado efectivo no es Q(u)
-                    // sino Q(u)+comp: el residuo se reincorpora al leer, asi que
-                    // archivar solo el buffer T perderia exactamente la parte
-                    // que esa politica existe para conservar. comp_in es el
-                    // buffer recien escrito (swap_comp ya corrio), el que
-                    // corresponde a tc_in.
                     std::vector<float> comp_host(count);
                     CHECK_CUDA(cudaMemcpy(comp_host.data(), comp_in, count * sizeof(float),
                                           cudaMemcpyDeviceToHost));
@@ -4628,13 +4754,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             checkpoint_ms_total +=
                 std::chrono::duration<double, std::milli>(ckpt_t1 - ckpt_t0).count();
 
-            if (exclude_checkpoint_energy) {
-                const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
-                checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
-                power_buffer_start_sampling(power_buffer);
-                checkpoint_pause_s += std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - pause_t0).count();
-            }
+            const RAEnergySnapshot rapl_ckpt_after = rapl_snapshot_now();
+            checkpoint_cpu_energy_j += rapl_energy_delta(rapl_ckpt_before, rapl_ckpt_after);
+            power_buffer_start_sampling(power_buffer);
+            checkpoint_pause_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - pause_t0).count();
 
             timer.start();
         }
@@ -4718,6 +4842,23 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // mas arriba).
     out_reduced.resize(count);
     CHECK_CUDA(cudaMemcpy(out_reduced.data(), tc_in, count * sizeof(T), cudaMemcpyDeviceToHost));
+
+    // Residuo que corresponde a ese out_reduced, con el MISMO criterio que el
+    // bloque de archivado: SOLO Spatial, y de comp_in, que es el buffer recien
+    // escrito (el swap_comp del final de la ultima iteracion ya corrio, igual
+    // que el std::swap de tc_in/tc_out del que sale el memcpy de arriba).
+    //
+    // comp_pingpong es exactamente (comp_mode == CompMode::Spatial). En Local y
+    // en Off out_comp queda VACIO y build_readout_field colapsa a
+    // reduced_to_float: para Off porque no hay buffer, y para Local porque su
+    // convencion de signo hace que Q(u)+comp sea una reconstruccion invalida
+    // (ver la nota extensa en el bloque de archivado de checkpoints).
+    out_comp.clear();
+    if (comp_pingpong) {
+        out_comp.resize(count);
+        CHECK_CUDA(cudaMemcpy(out_comp.data(), comp_in, count * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+    }
 
     CHECK_CUDA(cudaFree(d_in_fp32));
     CHECK_CUDA(cudaFree(d_out_fp32));
@@ -5730,13 +5871,15 @@ static void run_profile_only(const Options& opt) {
         int onset_fp16 = -1;
         int first_nf_fp16 = INT_MAX;
         EnergyMeasurement e_unused_fp16;
+        std::vector<float> y_tc_fp16_comp_unused;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
                                                   opt.iters, op, comp_mode_of(opt),
                                                   opt.execution_mode, opt.graph_block, ckpt,
                                                   fp16_route_label(comp_mode_of(opt)), onset_fp16, first_nf_fp16,
                                                   t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                   t_checkpoint_ms_unused, y_tc_fp16_last_finite_unused,
-                                                  y_tc_fp16_reduced_last_finite_unused, e_unused_fp16);
+                                                  y_tc_fp16_reduced_last_finite_unused, e_unused_fp16,
+                                                  y_tc_fp16_comp_unused);
     } else {
         std::vector<float> y_tc_bf16(count, 0.0f);
         std::vector<__nv_bfloat16> y_tc_bf16_reduced;
@@ -5745,13 +5888,15 @@ static void run_profile_only(const Options& opt) {
         int onset_bf16 = -1;
         int first_nf_bf16 = INT_MAX;
         EnergyMeasurement e_unused_bf16;
+        std::vector<float> y_tc_bf16_comp_unused;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
                                                          opt.iters, op, comp_mode_of(opt),
                                                          opt.execution_mode, opt.graph_block, ckpt,
                                                          bf16_route_label(comp_mode_of(opt)), onset_bf16, first_nf_bf16,
                                                          t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                          t_checkpoint_ms_unused, y_tc_bf16_last_finite_unused,
-                                                         y_tc_bf16_reduced_last_finite_unused, e_unused_bf16);
+                                                         y_tc_bf16_reduced_last_finite_unused, e_unused_bf16,
+                                                         y_tc_bf16_comp_unused);
     }
 }
 
@@ -6140,11 +6285,12 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<float> y_tc_fp16_last_finite;
         std::vector<__half> y_tc_fp16_reduced_last_finite;
         EnergyMeasurement e_fp16;
+        std::vector<float> y_tc_fp16_comp;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, op, comp_mode,
             opt.execution_mode, opt.graph_block, ckpt, route_fp16, onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
             storage_rel_eval_iter_fp16, t_checkpoint_ms_fp16, y_tc_fp16_last_finite,
-            y_tc_fp16_reduced_last_finite, e_fp16);
+            y_tc_fp16_reduced_last_finite, e_fp16, y_tc_fp16_comp);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
         const ErrorMetrics tc_fp16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_fp16);
         // eval_iter == -1: la ruta divergio sin que ningun checkpoint
@@ -6161,7 +6307,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         // acerca lo que realmente se encadena entre iteraciones a la
         // exactitud de FP32 (ver print_propagated_error_metrics/bloque 2).
         const ErrorMetrics tc_fp16_prop_err =
-            compare_fp64_ref_vs_fp32(y_ref, reduced_to_float(y_tc_fp16_reduced));
+            compare_fp64_ref_vs_fp32(y_ref, build_readout_field(y_tc_fp16_reduced, y_tc_fp16_comp));
         // Sin instrumentar por separado el lector asume que el cuello de
         // botella es el Tensor Core; en realidad convert_float_to_half_kernel
         // (reconversion de d_out a T en cada iteracion) explica buena parte
@@ -6218,7 +6364,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                             stencil_flops(opt.nx, opt.ny, op.flops_per_cell) * static_cast<double>(opt.iters),
                             /*gpu_route=*/true);
         if (csv_enabled) {
-            write_csv_row(csv, opt, under_ncu ? "NCU_wmma_fp16" : "wmma_fp16", opt.kahan, opt.nx, opt.ny,
+            write_csv_row(csv, opt,
+                         std::string(under_ncu ? "NCU_" : "") + fp16_csv_label(comp_mode),
+                         opt.kahan, opt.nx, opt.ny,
                          opt.iters, tc_fp16.ms, tc_fp16.gflops, tc_fp16_err, first_nf_fp16,
                          storage_num_field(fp16_storage_result, fp16_storage_evaluable,
                                            fp16_storage_result.rel_max_guarded),
@@ -6240,11 +6388,12 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<float> y_tc_bf16_last_finite;
         std::vector<__nv_bfloat16> y_tc_bf16_reduced_last_finite;
         EnergyMeasurement e_bf16;
+        std::vector<float> y_tc_bf16_comp;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, op, comp_mode,
             opt.execution_mode, opt.graph_block, ckpt, route_bf16, onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
             storage_rel_eval_iter_bf16, t_checkpoint_ms_bf16, y_tc_bf16_last_finite,
-            y_tc_bf16_reduced_last_finite, e_bf16);
+            y_tc_bf16_reduced_last_finite, e_bf16, y_tc_bf16_comp);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);
         const ErrorMetrics tc_bf16_vs_cpu_err = compare_float_vectors(y_cpu, y_tc_bf16);
         // Ver comentario analogo en el bloque FP16: store_rel se evalua con
@@ -6257,7 +6406,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         // Ver comentario analogo en el bloque FP16: estado PROPAGADO (buffer
         // T crudo), no out_fp32.
         const ErrorMetrics tc_bf16_prop_err =
-            compare_fp64_ref_vs_fp32(y_ref, reduced_to_float(y_tc_bf16_reduced));
+            compare_fp64_ref_vs_fp32(y_ref, build_readout_field(y_tc_bf16_reduced, y_tc_bf16_comp));
         // Ver comentario analogo en el bloque FP16: sin este desglose el
         // 2.3x de t/iter frente a GPU FP32 clasico se le atribuiria por
         // error al Tensor Core en vez de a convert_float_to_bfloat16_kernel.
@@ -6312,7 +6461,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
                             stencil_flops(opt.nx, opt.ny, op.flops_per_cell) * static_cast<double>(opt.iters),
                             /*gpu_route=*/true);
         if (csv_enabled) {
-            write_csv_row(csv, opt, under_ncu ? "NCU_wmma_bf16" : "wmma_bf16", opt.kahan, opt.nx, opt.ny,
+            write_csv_row(csv, opt,
+                         std::string(under_ncu ? "NCU_" : "") + bf16_csv_label(comp_mode),
+                         opt.kahan, opt.nx, opt.ny,
                          opt.iters, tc_bf16.ms, tc_bf16.gflops, tc_bf16_err, first_nf_bf16,
                          storage_num_field(bf16_storage_result, bf16_storage_evaluable,
                                            bf16_storage_result.rel_max_guarded),

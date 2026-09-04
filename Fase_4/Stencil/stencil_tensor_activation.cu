@@ -36,8 +36,40 @@
 // la misma operacion sobre el MISMO buffer de entrada, valido solo para medir
 // throughput-, aqui las tres rutas encadenan genuinamente salida(i) -> entrada(i+1)
 // para poder cuantificar drift numerico acumulado a traves de iteraciones reales.
-// Reutiliza Fase_2/common.cuh por ruta relativa (no lo duplica). La suma
-// compensada Kahan queda para una entrega posterior de Fase 3.
+// Reutiliza common/cuda_checks.cuh y common/metrics.cuh por ruta relativa (no
+// los duplica). Incluye ademas la suma compensada de Kahan (CompMode::Local,
+// --kahan on) y la compensacion espacial (CompMode::Spatial, --spatial-comp
+// on) -- ver la seccion "Politica de compensacion del redondeo de
+// almacenamiento" junto a compensated_store, mas abajo.
+//
+// FASE 4 (este archivo): parte de Fase_3/Stencil/stencil_tensor_activation.cu
+// (copia exacta en el momento de bifurcar -- ver ese archivo y su README para
+// el historial de migracion desde old/Fase_4) y le agrega el mecanismo de
+// ANCLA FP64 (--anchor-every K), especificado y corregido en el documento
+// "Plan de Precision Mixta", secciones 01 y 02. Ese documento es la
+// referencia normativa: si un comentario de este archivo no coincide con lo
+// que el plan describe, el plan tiene razon y este archivo tiene un bug.
+//
+// RESUMEN DEL MECANISMO (ver el plan para el detalle completo): cada K
+// iteraciones, el paso que normalmente calcularia stencil2d_wmma_kernel se
+// calcula en su lugar completo en FP64 (reutilizando stencil2d_fp64_kernel,
+// ya presente en este archivo desde Fase 3 como referencia de maxima
+// precision) y el resultado reemplaza al de la ruta rapida. Requiere
+// --spatial-comp on: el residuo de compensacion se reconstruye/re-siembra en
+// `double`, no en `float` como el resto del archivo -- una version anterior
+// de este diseno truncaba a float en la re-siembra y por eso el ancla nunca
+// llegaba a converger a FP64 real ni con K=1 (bug ya encontrado y corregido
+// en el documento de plan, no lo repitas si tocas este codigo). NO soporta
+// --execution-mode graph todavia: los grafos capturan de antemano bloques de
+// iteraciones normales (ver build_iteration_graph mas abajo) y el ancla
+// necesita decidir en cada iteracion si toca FP64 o WMMA, lo cual no encaja
+// con una secuencia de kernels pre-capturada sin construir un tercer grafo
+// dedicado -- fuera de alcance de esta primera implementacion, ver parse_args
+// para el rechazo explicito de la combinacion.
+//
+// Busca el marcador "ANCLA FP64:" en este archivo para ubicar cada pieza del
+// mecanismo -- son las unicas secciones que difieren de Fase_3/Stencil/
+// stencil_tensor_activation.cu.
 
 #include <mma.h>
 
@@ -64,11 +96,25 @@
 // El header de telemetria queda a nivel global porque incluye <nvml.h> cuando
 // el sbatch habilita NVML; las declaraciones C de NVML no deben caer dentro
 // del namespace anonimo de este archivo.
-#include "tools/power_sampling.h"
+//
+// MIGRACION: el original (old/Fase_4/Stencil/stencil_tensor_activation.cu)
+// incluia "tools/power_sampling.h", una copia local identica -salvo reflow y
+// traduccion de comentarios, sin diferencias de firma ni de logica, ver
+// Fase_3/Stencil/README.md- a la que ahora vive en common/. Se usa esa unica
+// copia compartida en vez de duplicarla de nuevo bajo Stencil/tools/.
+#include "../../common/power_sampling.h"
 
 namespace {
 
-#include "../../Fase_2/common.cuh"
+// MIGRACION: el original incluia "../../Fase_2/common.cuh" (un solo header
+// con las macros CHECK_CUDA/CHECK_CUBLAS/CHECK_CUDNN, CudaEventTimer y las
+// funciones compare_*/ErrorMetrics). Ese archivo se separo, sin cambio de
+// comportamiento, en common/cuda_checks.cuh (macros de validacion) y
+// common/metrics.cuh (cronometro y metricas de error) -- ver
+// old/Fase_2/common.cuh para la version previa a la separacion y
+// Fase_3/Stencil/README.md para la comparacion linea a linea.
+#include "../../common/cuda_checks.cuh"
+#include "../../common/metrics.cuh"
 
 using namespace nvcuda;
 
@@ -371,6 +417,14 @@ struct Options {
     // donde no significaria nada (misma regla que --alpha bajo stress). Debe
     // ser par y > 0 (ver kDefaultGraphBlock).
     int graph_block = kDefaultGraphBlock;
+    // ANCLA FP64: 0 (por defecto) = deshabilitada, comportamiento identico a
+    // Fase 3. K > 0: cada K iteraciones de las rutas WMMA, el paso se calcula
+    // completo en FP64 (stencil2d_fp64_kernel) en vez de con Tensor Cores, y
+    // el residuo de compensacion se re-siembra en double sin truncar. Ver el
+    // comentario de cabecera del archivo y la seccion 01 del documento de
+    // plan para el mecanismo completo. Requiere --spatial-comp on (parse_args
+    // lo exige) y es incompatible con --execution-mode graph (idem).
+    int anchor_every = 0;
 };
 
 // Politica efectiva derivada de los dos flags. parse_args ya garantizo que no
@@ -517,7 +571,7 @@ static void print_usage(const char* prog) {
         << "Uso:\n"
         << "  " << prog << " [--nx NX] [--ny NY] [--iters I] [--tc fp16|bf16|both]"
            " [--checkpoint-every K] [--csv RUTA] [--profile-only] [--kahan off|on]"
-           " [--spatial-comp off|on] [--op-mode stress|diffusive] [--alpha A]"
+           " [--spatial-comp off|on] [--anchor-every K] [--op-mode stress|diffusive] [--alpha A]"
            " [--ci-mode legacy|monomode] [--ci-p P] [--ci-amplitude A]"
            " [--execution-mode normal|graph] [--cuda-graph] [--graph-block B]\n\n"
         << "Descripcion:\n"
@@ -549,6 +603,15 @@ static void print_usage(const char* prog) {
         << "  kernel limitado por memoria eso NO es gratis, ver t/iter reportado. Las\n"
         << "  rutas WMMA se reportan como WMMA_FP16_SP / WMMA_BF16_SP para que sus\n"
         << "  filas CSV no se confundan con las de --kahan off|on.\n\n"
+        << "  --anchor-every K (entero >= 0, por defecto 0 = deshabilitado) ANCLA FP64:\n"
+        << "  cada K iteraciones, el paso se recalcula completo en FP64 (sin Tensor\n"
+        << "  Cores) en vez de en baja precision, y el resultado reemplaza al de la ruta\n"
+        << "  rapida -- corrige el error de ESE paso, no el drift ya acumulado antes del\n"
+        << "  ancla. Requiere --spatial-comp on (el residuo se re-siembra en double, no\n"
+        << "  en float, sobre la convencion de esa politica) e --execution-mode normal\n"
+        << "  (incompatible con graph). Ver la seccion 01 del documento de plan para el\n"
+        << "  mecanismo completo y sus gates de validacion (K=1 debe igualar a la\n"
+        << "  referencia FP64; K=0 debe ser bit-identico al comportamiento sin ancla).\n\n"
         << "  --fp64-gpu off|on (por defecto on) corre la ruta GPU_FP64: el mismo\n"
         << "  stencil en double sobre GPU, sin Tensor Cores ni compensacion. Es la\n"
         << "  referencia de maxima precision EN GPU, pensada como denominador\n"
@@ -632,6 +695,8 @@ static void print_usage(const char* prog) {
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc both --checkpoint-every 5\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --kahan on\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc fp16 --spatial-comp on\n"
+        << "  " << prog << " --nx 4096 --ny 4096 --iters 40 --tc fp16 --spatial-comp on"
+                            " --anchor-every 8\n"
         << "  " << prog << " --nx 16384 --ny 16384 --iters 640 --tc both"
            " --op-mode diffusive --ci-mode monomode\n"
         << "  " << prog << " --nx 4096 --ny 4096 --iters 320 --tc fp16 --cuda-graph\n"
@@ -783,6 +848,10 @@ static Options parse_args(int argc, char** argv) {
                 std::exit(EXIT_FAILURE);
             }
             opt.spatial_comp = parse_on_off_flag("--spatial-comp", argv[++i]);
+        } else if (std::strcmp(argv[i], "--anchor-every") == 0) {
+            // ANCLA FP64: mismo estilo de parseo que --checkpoint-every (entero,
+            // parse_int_arg ya valida que sea numerico).
+            opt.anchor_every = parse_int_arg(i, argc, argv);
         } else if (std::strcmp(argv[i], "--fp64-gpu") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Falta valor para --fp64-gpu\n";
@@ -868,6 +937,28 @@ static Options parse_args(int argc, char** argv) {
         std::cerr << "--kahan on y --spatial-comp on son mutuamente excluyentes: son dos"
                      " politicas alternativas de compensacion del mismo redondeo de\n"
                      "almacenamiento, no dos capas acumulables. Use una u otra.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    // ANCLA FP64: validaciones nuevas de Fase 4, mismo estilo que las demas de
+    // este bloque.
+    if (opt.anchor_every < 0) {
+        std::cerr << "--anchor-every debe ser >= 0 (0 desactiva el ancla).\n";
+        std::exit(EXIT_FAILURE);
+    }
+    if (opt.anchor_every > 0 && !opt.spatial_comp) {
+        std::cerr << "--anchor-every > 0 requiere --spatial-comp on: el ancla re-siembra"
+                     " el residuo de compensacion en double, y esa reconstruccion solo\n"
+                     "esta implementada sobre la convencion de CompMode::Spatial (Q(v) +"
+                     " comp = v). --kahan on u off sin --spatial-comp no tienen el par de\n"
+                     "buffers en ping-pong que el ancla necesita re-sembrar.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    if (opt.anchor_every > 0 && opt.execution_mode == ExecutionMode::Graph) {
+        std::cerr << "--anchor-every > 0 es incompatible con --execution-mode graph: los"
+                     " grafos capturan de antemano una secuencia fija de lanzamientos WMMA\n"
+                     "normales (ver build_iteration_graph), y el ancla necesita decidir en"
+                     " cada iteracion si toca FP64 o WMMA -- no soportado en esta primera\n"
+                     "implementacion. Use --execution-mode normal (el default) con el ancla.\n";
         std::exit(EXIT_FAILURE);
     }
     if (alpha_given && opt.op_mode != OpMode::Diffusive) {
@@ -2052,13 +2143,13 @@ static void record_checkpoint(const CheckpointContext& ckpt,
     }
 }
 
-// Version FP64/FP64 de compare_fp64_ref_vs_fp32 (Fase_2/common.cuh), byte a
+// Version FP64/FP64 de compare_fp64_ref_vs_fp32 (common/metrics.cuh), byte a
 // byte igual salvo que `test` ya es double y no hay cast que aplicar. No se
-// usa compare_double_vectors -que si existe en common.cuh y compara el mismo
+// usa compare_double_vectors -que si existe en metrics.cuh y compara el mismo
 // par de tipos- porque ESA deja l2_abs y ref_l2_norm en 0.0 por diseno (ver su
 // comentario): son justamente las dos primeras columnas numericas que
 // emit_csv_drift_row imprime, asi que CSV_DRIFT saldria con ref_l2=0 y abs_l2=0
-// para toda la ruta GPU_FP64. Se define aqui, y no ampliando common.cuh, para
+// para toda la ruta GPU_FP64. Se define aqui, y no ampliando metrics.cuh, para
 // no alterar un header compartido con Fase 1 y Fase 2.
 static ErrorMetrics compare_fp64_ref_vs_fp64(const std::vector<double>& ref_fp64,
                                              const std::vector<double>& test_fp64) {
@@ -2139,7 +2230,7 @@ static void record_checkpoint_fp64(const CheckpointContext& ckpt,
 
 // Construye la medicion de energia a partir de escalares YA depurados del
 // consumo de los bloques de checkpoint. make_energy_measurement (en
-// tools/power_sampling.h) integra el buffer de muestras COMPLETO, incluido el
+// common/power_sampling.h) integra el buffer de muestras COMPLETO, incluido el
 // hueco entre parada y reanudacion del muestreo, asi que no puede descontar
 // esos tramos; las formulas de aqui son exactamente las suyas, solo cambian
 // las entradas. Ver acumulacion por tramos en las rutas GPU de abajo.
@@ -2157,7 +2248,7 @@ static EnergyMeasurement make_energy_measurement_from_segments(bool gpu_valid,
     // El contador NVML se cuantiza POR TRAMO, no sobre la suma: cada tramo
     // aporta hasta un salto de error, asi que el minimo exigido de ventana se
     // multiplica por el numero de tramos (ver REGIMEN DE VALIDEZ en
-    // tools/power_sampling.h). Sin checkpointing hay un solo tramo y esto se
+    // common/power_sampling.h). Sin checkpointing hay un solo tramo y esto se
     // reduce a time_total_s >= kEnergyWindowReliableSeconds.
     result.gpu_segment_count = gpu_segment_count;
     result.window_reliable =
@@ -2718,6 +2809,113 @@ __global__ static void seed_comp_from_conversion_kernel(const float* __restrict_
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
         comp[i] = src_fp32[i] - tc_to_float(src_tc[i]);
+    }
+}
+
+// ============================================================================
+// ANCLA FP64 -- kernels elementales nuevos de Fase 4.
+//
+// Los tres kernels de esta seccion son deliberadamente triviales (un hilo por
+// celda, sin memoria compartida, sin dependencia del tiling de
+// stencil2d_wmma_kernel): el ancla NO modifica ese kernel ni su logica de
+// compensacion espacial en absoluto. En vez de eso, opera ANTES y DESPUES de
+// el, sobre el mismo par (tc, comp) que ya usa CompMode::Spatial, ensanchando
+// comp a `double` solo quando el ancla esta activa. Ver el comentario de
+// cabecera del archivo para el razonamiento completo; aqui solo la mecanica.
+//
+// Por que esto es mas seguro que tocar stencil2d_wmma_kernel: ese kernel ya
+// esta validado con gates de regresion bit a bit (Fase 4 historica). Anadirle
+// una ruta de residuo en double habria significado duplicar su logica de
+// carga de vecinos en shared memory con un segundo tipo, sin poder compilar
+// para verificarlo. Mantenerlo intacto y envolver el ancla por fuera reduce
+// la superficie de cambio a estos ~40 lineas, faciles de auditar contra el
+// documento de plan.
+// ============================================================================
+
+// Reconstruye el valor exacto conocido hasta ahora, en double, a partir del
+// par (T, comp-double) que dejo la iteracion anterior -- sea que esa iteracion
+// haya sido un paso WMMA normal (comp-double viene de widen_comp_to_double_kernel)
+// o un paso de ancla (comp-double viene de reseed_double_from_fp64_kernel).
+// Misma convencion de signo que compensated_store<Spatial>: Q(v) + comp = v.
+template <typename T>
+__global__ static void reconstruct_exact_double_kernel(const T* __restrict__ tc_in,
+                                                        const double* __restrict__ comp_in_d,
+                                                        double* __restrict__ exact_out_d,
+                                                        int size) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        exact_out_d[i] = static_cast<double>(tc_to_float(tc_in[i])) + comp_in_d[i];
+    }
+}
+
+// Paso de ancla, mitad de re-siembra: dado el resultado FP64 completo de este
+// paso (out64, ya calculado por stencil2d_fp64_kernel sobre exact_in_d),
+// cuantiza a T y guarda el residuo SIN truncar a float -- a diferencia de
+// compensated_store<Spatial>, que trabaja en float porque su entrada (val) ya
+// es float. Es la pieza que corrige el bug de precision documentado en la
+// cabecera del archivo: la version que fallaba hacia
+// `comp[i] = float(out64[i]) - tc_to_float(T_out[i])` (redondeando out64 a
+// float ANTES de restar); aqui la resta es integramente en double.
+template <typename T>
+__global__ static void reseed_double_from_fp64_kernel(const double* __restrict__ out64,
+                                                       T* __restrict__ tc_out,
+                                                       double* __restrict__ comp_out_d,
+                                                       int size) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        const T q = float_to_tc<T>(static_cast<float>(out64[i]));
+        tc_out[i] = q;
+        comp_out_d[i] = out64[i] - static_cast<double>(tc_to_float(q));
+    }
+}
+
+// Siembra inicial del residuo en DOUBLE (equivalente de
+// seed_comp_from_conversion_kernel, pero sin truncar a float): comp64[i] =
+// double(src_fp32[i]) - double(tc_to_float(src_tc[i])). src_fp32 es el input
+// FP32 tal como llega a esta funcion (benchmark_gpu_tensor_core_stencil ya lo
+// recibe en float, no en double -- ver el comentario junto a su declaracion
+// de d_exact64 mas abajo sobre por que eso no le resta precision real al
+// ancla). Necesaria porque, a diferencia de la re-siembra de un paso de
+// ancla (reseed_double_from_fp64_kernel), aqui no hay un out64 previo del que
+// partir -- es t=0.
+template <typename T>
+__global__ static void seed_comp64_from_conversion_kernel(const float* __restrict__ src_fp32,
+                                                           const T* __restrict__ src_tc,
+                                                           double* __restrict__ comp64,
+                                                           int size) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        comp64[i] = static_cast<double>(src_fp32[i]) -
+                    static_cast<double>(tc_to_float(src_tc[i]));
+    }
+}
+
+// Vuelca out64 a d_out_fp32 (narrowing double->float), SOLO para las
+// iteraciones de ancla donde write_fp32_flag seria true en la ruta WMMA
+// normal (checkpoint o ultima iteracion medida) -- para que el consumidor de
+// d_out_fp32 (comparacion de error, CSV_DRIFT) vea un valor en esa iteracion
+// sin importar si fue un paso WMMA o un paso de ancla.
+__global__ static void narrow_double_to_float_kernel(const double* __restrict__ src64,
+                                                      float* __restrict__ dst32,
+                                                      int size) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        dst32[i] = static_cast<float>(src64[i]);
+    }
+}
+
+// Paso NORMAL (no de ancla): ensancha a double el comp-float que
+// stencil2d_wmma_kernel<CompMode::Spatial> ya calculo con su formula habitual
+// (compensated_store, sin cambios). No RESTA nada en double -- solo ensancha
+// un valor ya calculado en float -- para que --anchor-every 0 y cualquier
+// iteracion normal con el ancla activa sigan siendo bit-identicos al
+// comportamiento de Fase 3 (ver gate K=0 en el documento de plan, seccion 01).
+__global__ static void widen_comp_to_double_kernel(const float* __restrict__ comp_out_f,
+                                                    double* __restrict__ comp_out_d,
+                                                    int size) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        comp_out_d[i] = static_cast<double>(comp_out_f[i]);
     }
 }
 
@@ -4154,6 +4352,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  // argumentos, mismo orden (ver ExecutionMode).
                                                  ExecutionMode execution_mode,
                                                  int graph_block,
+                                                 // ANCLA FP64 (Fase 4): 0 = deshabilitada. Requiere
+                                                 // comp_mode == CompMode::Spatial y execution_mode ==
+                                                 // ExecutionMode::Normal (ver validacion en parse_args;
+                                                 // esta funcion confia en que el llamador ya valido).
+                                                 int anchor_every,
                                                  const CheckpointContext& ckpt,
                                                  const char* route_label,
                                                  int& onset_iter,
@@ -4198,6 +4401,40 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     float* d_comp_prev = nullptr;
     const bool comp_enabled = (comp_mode != CompMode::Off);
     const bool comp_pingpong = (comp_mode == CompMode::Spatial);
+
+    // ANCLA FP64 (Fase 4): buffers nuevos, todos condicionales a
+    // anchor_every > 0 -- con el ancla deshabilitada esta funcion no reserva
+    // ni un byte mas que la version de Fase 3. d_comp64/d_comp64_prev son el
+    // par en ping-pong del residuo en DOUBLE (mismo rol que d_comp/d_comp_prev
+    // en CompMode::Spatial, pero sin truncar -- ver el comentario de cabecera
+    // del archivo). d_exact64/d_out64 son scratch de un solo buffer cada uno
+    // (no ping-pong: dentro de un paso de ancla, uno se lee completo antes de
+    // escribir el otro, así que no hace falta alternarlos entre iteraciones).
+    const bool anchor_enabled = (anchor_every > 0);
+    double* d_comp64 = nullptr;
+    double* d_comp64_prev = nullptr;
+    double* d_exact64 = nullptr;
+    double* d_out64 = nullptr;
+    // Punteros LOGICOS desplazados por kAlignOffsetElems, igual que
+    // d_in_fp32_aligned/d_in_tc_aligned -- para que el indice i en cualquiera
+    // de estos buffers y en d_in_tc_aligned se refieran a la MISMA celda
+    // logica. El padding en si (kAlignPadElems) no aporta nada a kernels
+    // elementales sin vectorizacion como los de esta seccion; se reserva solo
+    // por coherencia con el resto de la funcion, no por necesidad propia.
+    double* d_comp64_aligned = nullptr;
+    double* d_comp64_prev_aligned = nullptr;
+    double* d_exact64_aligned = nullptr;
+    double* d_out64_aligned = nullptr;
+    if (anchor_enabled) {
+        CHECK_CUDA(cudaMalloc(&d_comp64, (count + kAlignPadElems) * sizeof(double)));
+        CHECK_CUDA(cudaMalloc(&d_comp64_prev, (count + kAlignPadElems) * sizeof(double)));
+        CHECK_CUDA(cudaMalloc(&d_exact64, (count + kAlignPadElems) * sizeof(double)));
+        CHECK_CUDA(cudaMalloc(&d_out64, (count + kAlignPadElems) * sizeof(double)));
+        d_comp64_aligned = d_comp64 + kAlignOffsetElems;
+        d_comp64_prev_aligned = d_comp64_prev + kAlignOffsetElems;
+        d_exact64_aligned = d_exact64 + kAlignOffsetElems;
+        d_out64_aligned = d_out64 + kAlignOffsetElems;
+    }
 
     // Los SEIS buffers que representan el dominio 2D completo se reservan con
     // kAlignPadElems elementos de mas y se usan a traves de un puntero
@@ -4320,6 +4557,28 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     float* comp_out = d_comp_aligned;
     float* comp_in = d_comp_prev_aligned;
 
+    // ANCLA FP64 (Fase 4): punteros vivos del ping-pong DOUBLE, mismo rol que
+    // comp_out/comp_in pero en double. Se siembran aqui, en double genuino
+    // desde la condicion inicial, para que K=1 sea exacto desde la primera
+    // iteracion (ver seed_comp64_from_conversion_kernel y el gate K=1 del
+    // documento de plan, seccion 01). El warm-up NO usa estos punteros -- las
+    // rutas de warm-up llaman launch_wmma sin pasar por el ancla en absoluto,
+    // ver mas abajo -- asi que no hace falta re-sembrarlos tras el warm-up
+    // salvo por el mismo motivo que d_comp/d_comp_prev: los aligned pueden
+    // haber quedado "usados" por el warm-up si accidentalmente se leyeran, y
+    // por eso se re-siembran otra vez despues del warm-up tambien (ver bloque
+    // de reinicio post-warmup mas abajo).
+    double* comp64_out = d_comp64_aligned;
+    double* comp64_in = d_comp64_prev_aligned;
+    if (anchor_enabled) {
+        const int blocks64 = static_cast<int>((count + kConversionThreads - 1) / kConversionThreads);
+        seed_comp64_from_conversion_kernel<T><<<blocks64, kConversionThreads>>>(
+            d_in_fp32_aligned, d_in_tc_aligned, d_comp64_aligned, static_cast<int>(count));
+        seed_comp64_from_conversion_kernel<T><<<blocks64, kConversionThreads>>>(
+            d_in_fp32_aligned, d_in_tc_aligned, d_comp64_prev_aligned, static_cast<int>(count));
+        CHECK_CUDA(cudaGetLastError());
+    }
+
     // Elige la instanciacion CompMode del kernel en tiempo de compilacion
     // segun los flags runtime: comp_mode no cambia dentro de esta llamada, asi
     // que el branch se resuelve una vez por benchmark, no por lanzamiento.
@@ -4416,6 +4675,20 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
         // Vuelve a sembrar el residuo de la conversion inicial: el bucle medido
         // debe arrancar del MISMO estado (T + residuo) que veria sin warm-up.
         seed_comp_buffers();
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+    // ANCLA FP64 (Fase 4): mismo reinicio que el bloque de arriba, aplicado a
+    // los buffers double -- el warm-up nunca los toca (launch_wmma no sabe
+    // que existen), pero se re-siembran de todas formas por simetria y porque
+    // es barato: sin esto, si algun dia el warm-up SI llegara a interactuar
+    // con ellos, este reinicio ya estaria en su sitio.
+    if (anchor_enabled) {
+        const int blocks64 = static_cast<int>((count + kConversionThreads - 1) / kConversionThreads);
+        seed_comp64_from_conversion_kernel<T><<<blocks64, kConversionThreads>>>(
+            d_in_fp32_aligned, d_in_tc_aligned, d_comp64_aligned, static_cast<int>(count));
+        seed_comp64_from_conversion_kernel<T><<<blocks64, kConversionThreads>>>(
+            d_in_fp32_aligned, d_in_tc_aligned, d_comp64_prev_aligned, static_cast<int>(count));
+        CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
     }
 
@@ -4582,6 +4855,20 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     // Cada lanzamiento normal la invierte; una tanda de grafos NO la toca,
     // porque graph_block es par.
     int pingpong_parity = 0;
+
+    // ANCLA FP64 (Fase 4): configuracion del kernel FP64 reutilizado
+    // (stencil2d_fp64_kernel), calculada una sola vez antes del bucle -- el
+    // mismo grid/block 16x16 y los mismos coeficientes double que ya usa
+    // benchmark_gpu_fp64_stencil para la ruta de referencia GPU_FP64. Se
+    // calcula incondicionalmente (no solo si anchor_enabled): es aritmetica
+    // barata y mantiene el bloque de arriba mas simple de leer.
+    const dim3 block_fp64(16, 16);
+    const dim3 grid_fp64((nx + block_fp64.x - 1) / block_fp64.x,
+                         (ny + block_fp64.y - 1) / block_fp64.y);
+    const double c_neigh_d = neighbor_coeff_d(op);
+    const double c_center_d = center_coeff_d(op);
+    const int blocks64_elem = static_cast<int>((count + kConversionThreads - 1) / kConversionThreads);
+
     for (int i = 0; i < iters;) {
         // iter_number es la iteracion GLOBAL 1..N que se va a ejecutar en esta
         // vuelta. Se fija antes del avance de i porque el bloque de checkpoint
@@ -4630,12 +4917,56 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
             }
         }
 
+        // ANCLA FP64 (Fase 4): iteracion de ancla si el ancla esta activa y
+        // esta iteracion GLOBAL es multiplo de anchor_every. iter_number, no
+        // i+1 relativo a un tramo -- el ancla dispara en las mismas
+        // iteraciones sin importar checkpointing (use_graph ya esta
+        // descartado por parse_args cuando anchor_enabled, ver validacion).
+        const bool is_anchor_iter = anchor_enabled && (iter_number % anchor_every == 0);
+
         CHECK_CUDA(cudaEventRecord(wmma_start[timed_groups]));
-        launch_wmma(tc_in, tc_out, iter_number, write_fp32);
+        if (is_anchor_iter) {
+            // Sustituye por completo el paso WMMA de esta iteracion -- no se
+            // llama a launch_wmma. Ver el comentario de cabecera del archivo
+            // y la seccion 01 del documento de plan para el mecanismo.
+            reconstruct_exact_double_kernel<T><<<blocks64_elem, kConversionThreads>>>(
+                tc_in, comp64_in, d_exact64_aligned, static_cast<int>(count));
+            CHECK_CUDA(cudaGetLastError());
+            stencil2d_fp64_kernel<<<grid_fp64, block_fp64>>>(
+                d_exact64_aligned, d_out64_aligned, nx, ny, c_neigh_d, c_center_d,
+                iter_number, d_first_nf);
+            CHECK_CUDA(cudaGetLastError());
+            reseed_double_from_fp64_kernel<T><<<blocks64_elem, kConversionThreads>>>(
+                d_out64_aligned, tc_out, comp64_out, static_cast<int>(count));
+            CHECK_CUDA(cudaGetLastError());
+            // Mantiene el par float (comp_out/comp_in) en sincronia: si la
+            // PROXIMA iteracion no es de ancla, stencil2d_wmma_kernel<Spatial>
+            // lee comp_in (float) para compensar a las celdas vecinas -- debe
+            // reflejar el resultado del ancla, no quedar desactualizado.
+            narrow_double_to_float_kernel<<<blocks64_elem, kConversionThreads>>>(
+                comp64_out, comp_out, static_cast<int>(count));
+            CHECK_CUDA(cudaGetLastError());
+            if (write_fp32) {
+                narrow_double_to_float_kernel<<<blocks64_elem, kConversionThreads>>>(
+                    d_out64_aligned, d_out_fp32_aligned, static_cast<int>(count));
+                CHECK_CUDA(cudaGetLastError());
+            }
+        } else {
+            launch_wmma(tc_in, tc_out, iter_number, write_fp32);
+            if (anchor_enabled) {
+                // Ensancha a double el comp-float recien calculado (sin
+                // truncar nada nuevo, ver widen_comp_to_double_kernel), para
+                // que quede listo si la PROXIMA iteracion es de ancla.
+                widen_comp_to_double_kernel<<<blocks64_elem, kConversionThreads>>>(
+                    comp_out, comp64_out, static_cast<int>(count));
+                CHECK_CUDA(cudaGetLastError());
+            }
+        }
         CHECK_CUDA(cudaEventRecord(wmma_stop[timed_groups]));
         ++timed_groups;
         std::swap(tc_in, tc_out);
         swap_comp();
+        if (anchor_enabled) std::swap(comp64_in, comp64_out);
         pingpong_parity ^= 1;
         ++i;
 
@@ -4840,6 +5171,20 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     }
     if (d_comp_prev != nullptr) {
         CHECK_CUDA(cudaFree(d_comp_prev));
+    }
+    // ANCLA FP64 (Fase 4): libera los buffers double, todos condicionales a
+    // anchor_enabled -- ver su reserva al comienzo de la funcion.
+    if (d_comp64 != nullptr) {
+        CHECK_CUDA(cudaFree(d_comp64));
+    }
+    if (d_comp64_prev != nullptr) {
+        CHECK_CUDA(cudaFree(d_comp64_prev));
+    }
+    if (d_exact64 != nullptr) {
+        CHECK_CUDA(cudaFree(d_exact64));
+    }
+    if (d_out64 != nullptr) {
+        CHECK_CUDA(cudaFree(d_out64));
     }
     for (cudaGraphExec_t exec : graph_exec) {
         if (exec != nullptr) CHECK_CUDA(cudaGraphExecDestroy(exec));
@@ -5709,6 +6054,11 @@ static void print_configuration(const Options& opt, const StencilOperator& op) {
     if (opt.spatial_comp) {
         std::cout << "  (rutas WMMA reportadas como WMMA_FP16_SP / WMMA_BF16_SP)\n";
     }
+    // ANCLA FP64 (Fase 4): visible en la config incluso deshabilitada (0), para
+    // que un log sin --anchor-every explicito deje constancia inequivoca de
+    // que el ancla no participo en esa corrida.
+    std::cout << "Ancla FP64 (anchor-every)  : " << opt.anchor_every
+              << (opt.anchor_every > 0 ? " (activa)" : " (deshabilitada)") << "\n";
     // Solo describe a las rutas WMMA: las demas no tienen ruta de grafo (ver
     // ExecutionMode). La columna execution_mode de CSV_SUMMARY sigue la misma
     // regla, fila por fila.
@@ -5842,7 +6192,7 @@ static void run_profile_only(const Options& opt) {
         std::vector<float> y_tc_fp16_comp_unused;
         benchmark_gpu_tensor_core_stencil<__half>(input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny,
                                                   opt.iters, op, comp_mode_of(opt),
-                                                  opt.execution_mode, opt.graph_block, ckpt,
+                                                  opt.execution_mode, opt.graph_block, opt.anchor_every, ckpt,
                                                   fp16_route_label(comp_mode_of(opt)), onset_fp16, first_nf_fp16,
                                                   t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                   t_checkpoint_ms_unused, y_tc_fp16_last_finite_unused,
@@ -5859,7 +6209,7 @@ static void run_profile_only(const Options& opt) {
         std::vector<float> y_tc_bf16_comp_unused;
         benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny,
                                                          opt.iters, op, comp_mode_of(opt),
-                                                         opt.execution_mode, opt.graph_block, ckpt,
+                                                         opt.execution_mode, opt.graph_block, opt.anchor_every, ckpt,
                                                          bf16_route_label(comp_mode_of(opt)), onset_bf16, first_nf_bf16,
                                                          t_wmma_ms_unused, t_conv_ms_unused, storage_rel_eval_iter_unused,
                                                          t_checkpoint_ms_unused, y_tc_bf16_last_finite_unused,
@@ -6256,7 +6606,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<float> y_tc_fp16_comp;
         const Metrics tc_fp16 = benchmark_gpu_tensor_core_stencil<__half>(
             input, y_tc_fp16, y_tc_fp16_reduced, opt.nx, opt.ny, opt.iters, op, comp_mode,
-            opt.execution_mode, opt.graph_block, ckpt, route_fp16, onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
+            opt.execution_mode, opt.graph_block, opt.anchor_every, ckpt, route_fp16, onset_fp16, first_nf_fp16, t_wmma_ms_fp16, t_conv_ms_fp16,
             storage_rel_eval_iter_fp16, t_checkpoint_ms_fp16, y_tc_fp16_last_finite,
             y_tc_fp16_reduced_last_finite, e_fp16, y_tc_fp16_comp);
         const ErrorMetrics tc_fp16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_fp16);
@@ -6359,7 +6709,7 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         std::vector<float> y_tc_bf16_comp;
         const Metrics tc_bf16 = benchmark_gpu_tensor_core_stencil<__nv_bfloat16>(
             input, y_tc_bf16, y_tc_bf16_reduced, opt.nx, opt.ny, opt.iters, op, comp_mode,
-            opt.execution_mode, opt.graph_block, ckpt, route_bf16, onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
+            opt.execution_mode, opt.graph_block, opt.anchor_every, ckpt, route_bf16, onset_bf16, first_nf_bf16, t_wmma_ms_bf16, t_conv_ms_bf16,
             storage_rel_eval_iter_bf16, t_checkpoint_ms_bf16, y_tc_bf16_last_finite,
             y_tc_bf16_reduced_last_finite, e_bf16, y_tc_bf16_comp);
         const ErrorMetrics tc_bf16_err        = compare_fp64_ref_vs_fp32(y_ref, y_tc_bf16);

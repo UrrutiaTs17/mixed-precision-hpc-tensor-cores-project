@@ -14,24 +14,55 @@
 # cuDNN del sistema ni modulo, la unica instalacion compatible con CUDA 12 es la
 # cuDNN 9.x (wheel cu12) del entorno Analytics.
 #
+# Nada esta hardcodeado en el cuerpo del script: la forma del problema
+# (entrada, filtro, batch, padding/stride/dilation), la precision a correr y
+# el directorio de salida son variables de entorno con un default documentado
+# mas abajo (patron VAR="${VAR:-default}"). El unico hardcodeo real que queda
+# son los paths de #SBATCH --output/--error de arriba: SLURM los procesa antes
+# de que este script exista, asi que no pueden depender de una variable
+# definida aqui adentro; para cambiarlos, pasa --output=/--error= en la propia
+# linea de sbatch.
+#
+# PRECISION por defecto es "both" (corre FP32 y FP64): el .sbatch historico
+# (old/Fase_1/Convolution/run_conv_fase1.sbatch) solo invocaba la ruta FP32
+# pese a que el binario siempre soporto --double -- ver
+# Fase_1/Convolution/README.md, seccion "Gap historico: FP64 nunca se corria".
+#
 #   sbatch run_conv_fase1.sbatch
 #   sbatch --export=ALL,SMOKE_TEST=1 run_conv_fase1.sbatch
+#   sbatch --export=ALL,PRECISION=fp32 run_conv_fase1.sbatch
+#   sbatch --export=ALL,C=2048,K=2048 run_conv_fase1.sbatch      # 2a forma historica
 #   sbatch --export=ALL,CUDNN_ROOT=/otra/ruta run_conv_fase1.sbatch
 
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
-if [[ ! -f cudnn_conv_balanced.cu && -f Convolution/cudnn_conv_balanced.cu ]]; then
+if [[ ! -f conv_baseline.cu && -f Convolution/conv_baseline.cu ]]; then
     cd Convolution
 fi
-mkdir -p logs
+
+# Directorio para binarios/artefactos auxiliares de esta corrida (no para los
+# logs de SLURM en si, ver la nota sobre #SBATCH --output/--error arriba).
+OUTPUT_DIR="${OUTPUT_DIR:-logs}"
+mkdir -p "${OUTPUT_DIR}"
 
 if command -v module >/dev/null 2>&1; then
     module load openblas || true
 fi
 
-CUDA_ARCH="${CUDA_ARCH:-80}"  # A100=80, RTX 3050=86, V100=70
-NVCC="${NVCC:-/opt/ohpc/pub/devtools/nvidia/hpc_sdk/Linux_x86_64/23.1/compilers/bin/nvcc}"
+# --- Deteccion portable del toolchain (tools/detect_toolchain.sh) --------
+# Corre igual bajo SLURM en PACCA o con `bash` directo en cualquier otra
+# maquina con el entorno conda de environment.yml activo -- ver el
+# comentario de cabecera de ese script.
+for _toolchain in "../../tools/detect_toolchain.sh" "./detect_toolchain.sh"; do
+    if [[ -f "${_toolchain}" ]]; then
+        # shellcheck source=/dev/null
+        source "${_toolchain}"
+        break
+    fi
+done
+CUDA_ARCH="$(detect_cuda_arch)"  # A100=80, RTX 3050=86, V100=70, Ada=89, Hopper=90
+NVCC="$(detect_nvcc)"
 
 normalize_include_flags() {
     local raw="${1:-}"
@@ -90,6 +121,36 @@ if [[ -d "${CUDNN_ROOT}/lib" ]]; then
 fi
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
+PRECISION="${PRECISION:-both}"  # fp32 | fp64 | both
+
+# Forma del problema. Por defecto es la primera de las dos formas historicas
+# (N=1, C=K=1024, H=W=256), la misma que Fase_2/Convolution/run_conv_tc.sbatch
+# usa por defecto, para que el baseline FP32 de Fase 1 sea comparable con la
+# ruta Tensor Core de Fase 2 sobre la misma convolucion. La segunda forma
+# historica (C=K=2048) se reproduce con --export=ALL,C=2048,K=2048.
+# SMOKE_TEST=1 cambia los defaults por una forma pequena para validar que el
+# binario compila y corre (no para medir rendimiento).
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    _default_n=1; _default_c=64; _default_h=64; _default_w=64
+    _default_k=64; _default_r=3; _default_s=3; _default_iters=2
+else
+    _default_n=1; _default_c=1024; _default_h=256; _default_w=256
+    _default_k=1024; _default_r=3; _default_s=3; _default_iters=10
+fi
+N="${N:-${_default_n}}"
+C="${C:-${_default_c}}"
+H="${H:-${_default_h}}"
+W="${W:-${_default_w}}"
+K="${K:-${_default_k}}"
+R="${R:-${_default_r}}"
+S="${S:-${_default_s}}"
+ITERS="${ITERS:-${_default_iters}}"
+PAD_H="${PAD_H:-1}"
+PAD_W="${PAD_W:-1}"
+STRIDE_H="${STRIDE_H:-1}"
+STRIDE_W="${STRIDE_W:-1}"
+DILATION_H="${DILATION_H:-1}"
+DILATION_W="${DILATION_W:-1}"
 
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
@@ -97,56 +158,67 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"
 echo "Arquitectura CUDA: sm_${CUDA_ARCH}"
 echo "NVCC=${NVCC}"
 echo "SMOKE_TEST=${SMOKE_TEST}"
+echo "PRECISION=${PRECISION}"
+echo "OUTPUT_DIR=${OUTPUT_DIR}"
 
 nvidia-smi || true
 
-echo "Compilando cudnn_conv_balanced..."
-"${NVCC}" -std=c++17 -O3 cudnn_conv_balanced.cu -o cudnn_conv_balanced \
+echo "Compilando conv_baseline..."
+"${NVCC}" -std=c++17 -O3 conv_baseline.cu -o conv_baseline \
     ${OPENBLAS_INC} ${CUDNN_INC} ${CUDNN_LIBS} ${OPENBLAS_LIBS} \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     --allow-unsupported-compiler
 
-# Mismas formas que las corridas de Fase 2, para comparar el baseline cuDNN FP32
-# contra la ruta Tensor Core de Fase 2 sobre la misma convolucion.
-# El baseline FP32 desactiva TF32 desde el codigo (cudnnSetConvolutionMathType
-# con CUDNN_FMA_MATH en cudnn_conv_balanced.cu), no por NVIDIA_TF32_OVERRIDE:
-# asi la linea base sigue siendo FP32 escalar aunque el binario se corra a mano
-# fuera de este sbatch.
-if [[ "${SMOKE_TEST}" == "1" ]]; then
-    declare -a RUNS=(
-        "1 64 64 64 64 3 3 1 1 1 1 1 1 2 fp32"
-    )
-else
-    declare -a RUNS=(
-        "1 1024 256 256 1024 3 3 1 1 1 1 1 1 10 fp32"
-        "1 2048 256 256 2048 3 3 1 1 1 1 1 1 5 fp32"
-    )
-fi
+echo
+echo "============================================================"
+echo "Corrida: N=${N}, C=${C}, H=${H}, W=${W}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS}"
+echo "Padding: (${PAD_H}, ${PAD_W}), stride: (${STRIDE_H}, ${STRIDE_W}), dilation: (${DILATION_H}, ${DILATION_W})"
+echo "============================================================"
 
-for run in "${RUNS[@]}"; do
-    read -r N C H W K R S PAD_H PAD_W STRIDE_H STRIDE_W DILATION_H DILATION_W ITERS PRECISION <<< "${run}"
-    echo
-    echo "============================================================"
-    echo "Corrida: N=${N}, C=${C}, H=${H}, W=${W}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS}, ${PRECISION}"
-    echo "Padding: (${PAD_H}, ${PAD_W}), stride: (${STRIDE_H}, ${STRIDE_W}), dilation: (${DILATION_H}, ${DILATION_W})"
-    echo "============================================================"
-    # Se evita expandir un array vacio ("${DOUBLE_FLAG[@]}"): bajo `set -u` eso
-    # aborta el job en bash < 4.4.
-    if [[ "${PRECISION}" == "fp64" ]]; then
-        ./cudnn_conv_balanced --double \
-            --n "${N}" --c "${C}" --h "${H}" --w "${W}" \
-            --k "${K}" --r "${R}" --s "${S}" \
-            --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
-            --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
-            --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
-            --iters "${ITERS}"
-    else
-        ./cudnn_conv_balanced \
-            --n "${N}" --c "${C}" --h "${H}" --w "${W}" \
-            --k "${K}" --r "${R}" --s "${S}" \
-            --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
-            --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
-            --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
-            --iters "${ITERS}"
-    fi
-done
+# El baseline FP32 desactiva TF32 desde el codigo (cudnnSetConvolutionMathType
+# con CUDNN_FMA_MATH en conv_baseline.cu), no por NVIDIA_TF32_OVERRIDE: asi la
+# linea base sigue siendo FP32 escalar aunque el binario se corra a mano fuera
+# de este sbatch.
+#
+# fp32/fp64 se lanzan con dos invocaciones completas (no con un array de
+# flags condicional): bajo `set -u`, expandir un array vacio como
+# "${flag[@]}" aborta el job en bash < 4.4, asi que se evita el patron.
+run_fp32() {
+    ./conv_baseline \
+        --n "${N}" --c "${C}" --h "${H}" --w "${W}" \
+        --k "${K}" --r "${R}" --s "${S}" \
+        --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
+        --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
+        --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
+        --iters "${ITERS}"
+}
+
+run_fp64() {
+    ./conv_baseline --double \
+        --n "${N}" --c "${C}" --h "${H}" --w "${W}" \
+        --k "${K}" --r "${R}" --s "${S}" \
+        --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
+        --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
+        --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
+        --iters "${ITERS}"
+}
+
+case "${PRECISION}" in
+    fp32)
+        run_fp32
+        ;;
+    fp64)
+        run_fp64
+        ;;
+    both)
+        echo "--- Precision: FP32 ---"
+        run_fp32
+        echo
+        echo "--- Precision: FP64 ---"
+        run_fp64
+        ;;
+    *)
+        echo "PRECISION invalida: '${PRECISION}' (use fp32, fp64 o both)" >&2
+        exit 1
+        ;;
+esac
