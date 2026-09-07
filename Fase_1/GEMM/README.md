@@ -46,8 +46,6 @@ Ejemplos:
 
 El binario no escribe ningún archivo — todo el resultado es la salida estándar; el `.sbatch` la redirige a `logs/`.
 
-## Nota importante: no ejecutar solo con FP64 puro en tamaños grandes sin barrer el rango del plan de tesis
+## Tamaños de campaña
 
-El plan de trabajo de grado promete un rango de tamaños **512–4096** para GEMM (ver `README.md` de la raíz del repo, sección "Kernels evaluados"). El `.sbatch` histórico (`old/Fase_1/GEMM/run_gemm_fase1.sbatch`) solo corría dos tamaños, **12288³ y 32768³**, muy por encima de ese rango — un hallazgo real de la auditoría previa del proyecto. A esos tamaños, la referencia de CPU (OpenBLAS `dgemm`) por sí sola toma minutos por iteración (ver el comentario dentro del `.sbatch` histórico: ~1 minuto/iteración en 16 núcleos para M=N=K=32768 en FP64, ~35 minutos las 30 iteraciones), lo que hace esas corridas costosas y no representativas del rango que la tesis realmente necesita caracterizar.
-
-`run_gemm_fase1.sbatch` (la versión nueva, en esta misma carpeta) **por defecto sí barre el rango 512–4096** (`GEMM_SIZES` por defecto: `512 1024 2048 4096`). Los tamaños históricos grandes siguen disponibles, pero como **opt-in explícito** (`INCLUDE_LEGACY_SIZES=1`), no como comportamiento por defecto. Si vas a lanzar `gemm_baseline --double` a mano (sin pasar por el `.sbatch`), evita repetir el error histórico: no lo lances directamente a 12288/32768 sin antes haber barrido tamaños dentro de 512–4096 — a esos tamaños grandes, cada corrida FP64 es cara y una sola corrida no dice nada sobre cómo escala el comportamiento dentro del rango prometido.
+`run_gemm_fase1.sbatch` barre por defecto `GEMM_SIZES="1024 2048 4096 8192"`, el mismo conjunto usado en Fase 3 y Fase 4 y dimensionado para la A100 de PACCA. `SMOKE_TEST=1` conserva una única corrida reducida de validación; esa salida no pertenece al dataset experimental.

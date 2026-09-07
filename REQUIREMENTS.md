@@ -57,7 +57,7 @@ Cada `.sbatch` del proyecto es, fuera de un clúster, un script de bash normal �
 cd Fase_4/GEMM
 bash run_gemm_chained.sbatch
 # o, para parametrizar (equivalente a --export=ALL,VAR=valor bajo SLURM):
-N_LIST="512 1024" COMP_LIST="off on" ANCHOR_LIST="0 1 5" bash run_gemm_chained.sbatch
+N_LIST="1024 2048 4096 8192" COMP_LIST="off on" ANCHOR_LIST="0 1 5" bash run_gemm_chained.sbatch
 ```
 
 `tools/detect_toolchain.sh` (que cada `.sbatch` source-ea) resuelve `nvcc`/`ncu`/`CUDA_ARCH` buscando primero en tu `PATH` (el entorno conda los deja ahí) y solo cae a las rutas fijas históricas de PACCA como último recurso — no hace falta editar ningún `.sbatch` para correr fuera del clúster. `SLURM_SUBMIT_DIR`/`SLURM_JOB_ID` (usados para nombrar logs/resultados) tienen default a `$(pwd)`/`manual` cuando no existen.

@@ -211,9 +211,9 @@ enum class TensorCoreFormat {
 // K=filtros (canales salida), R/S=alto/ancho del filtro.
 struct Options {
     int N          = 1;
-    int C          = 32;
-    int H          = 128;
-    int W          = 128;
+    int C          = 64;
+    int H          = 64;
+    int W          = 64;
     int K          = 64;
     int R          = 3;
     int S          = 3;
@@ -284,8 +284,8 @@ static void print_usage(const char* prog) {
         << "  ruta WMMA (4) con formas no divisibles.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
-        << "  " << prog << " --N 1 --C 64 --H 224 --W 224 --K 64 --R 3 --S 3 --iters 10\n"
-        << "  " << prog << " --double --N 1 --C 16 --H 64 --W 64 --K 32 --R 3 --S 3\n"
+        << "  " << prog << " --N 1 --C 64 --H 256 --W 256 --K 64 --R 3 --S 3 --iters 10\n"
+        << "  " << prog << " --double --N 1 --C 64 --H 512 --W 512 --K 64 --R 3 --S 3\n"
         << "  " << prog << " --N 1 --C 64 --H 64 --W 64 --K 64 --R 3 --S 3 --iters 2"
         << " --tc-format bf16\n"
         << "  " << prog << " --N 1 --C 64 --H 64 --W 64 --K 64 --R 3 --S 3 --iters 2"

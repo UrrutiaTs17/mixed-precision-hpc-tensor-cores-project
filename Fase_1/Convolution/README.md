@@ -23,12 +23,12 @@ FP64 no tiene este problema: no existe una ruta TF32 para doble precisión, así
 conv_baseline [opciones]
   --double            usar FP64 (por defecto FP32)
   --n <int>           batch size                  (default 1)
-  --c <int>           canales de entrada           (default 3)
-  --h <int>           alto de entrada               (default 1024)
-  --w <int>           ancho de entrada               (default 1024)
-  --k <int>           canales de salida / filtros   (default 16)
-  --r <int>           alto del filtro                (default 5)
-  --s <int>           ancho del filtro                (default 5)
+  --c <int>           canales de entrada           (default 64)
+  --h <int>           alto de entrada               (default 64)
+  --w <int>           ancho de entrada               (default 64)
+  --k <int>           canales de salida / filtros   (default 64)
+  --r <int>           alto del filtro                (default 3)
+  --s <int>           ancho del filtro                (default 3)
   --pad_h <int>       padding vertical                 (default 1)
   --pad_w <int>       padding horizontal                (default 1)
   --stride_h <int>    stride vertical                    (default 1)
@@ -38,7 +38,7 @@ conv_baseline [opciones]
   --iters <int>       iteraciones para promediar el tiempo  (default 10)
 ```
 
-Los defaults de arriba son los que trae el binario cuando se invoca sin argumentos; el `.sbatch` (ver abajo) usa sus propios defaults, pensados para comparabilidad con Fase 2, no estos.
+El binario sin argumentos ejecuta el primer tamaño del conjunto oficial; el `.sbatch` recorre los cuatro tamaños espaciales.
 
 ### Ejemplos
 
@@ -46,19 +46,14 @@ Los defaults de arriba son los que trae el binario cuando se invoca sin argument
 # Configuracion por defecto del binario, FP32.
 ./conv_baseline
 
-# Misma forma que la corrida por defecto de Fase 2, para comparar
-# cuDNN FP32 (aqui) contra cuDNN Tensor Core / WMMA (Fase 2) sobre la
-# misma convolucion.
-./conv_baseline --n 1 --c 1024 --h 256 --w 256 --k 1024 --r 3 --s 3 \
+# Una de las formas de campaña, comparable con las demás fases.
+./conv_baseline --n 1 --c 64 --h 256 --w 256 --k 64 --r 3 --s 3 \
     --pad_h 1 --pad_w 1 --stride_h 1 --stride_w 1 \
     --dilation_h 1 --dilation_w 1 --iters 10
 
 # La misma corrida, en FP64.
-./conv_baseline --double --n 1 --c 1024 --h 256 --w 256 --k 1024 --r 3 --s 3 --iters 10
+./conv_baseline --double --n 1 --c 64 --h 512 --w 512 --k 64 --r 3 --s 3 --iters 10
 
-# Filtro grande, batch>1, para ver el efecto de C*R*S grande en el
-# tiempo de cuDNN vs CPU.
-./conv_baseline --n 4 --c 64 --h 128 --w 128 --k 128 --r 7 --s 7 --iters 20
 ```
 
 ## Qué produce
@@ -83,8 +78,10 @@ Compila y corre `conv_baseline.cu` vía SLURM. Nada está hardcodeado en el cuer
 | Variable | Default | Qué controla |
 |---|---|---|
 | `PRECISION` | `both` | `fp32`, `fp64` o `both` — qué rutas de precisión correr. |
-| `N`, `C`, `H`, `W` | `1, 1024, 256, 256` | Forma del tensor de entrada. |
-| `K`, `R`, `S` | `1024, 3, 3` | Forma del filtro. |
+| `N`, `C`, `K` | `1, 64, 64` | Lote y canales, iguales a Fase 3/4. |
+| `HW_LIST` | `"64 128 256 512"` | Dominios cuadrados `H=W` a barrer. |
+| `H`, `W` | — | Compatibilidad para una corrida manual; al exportarlos reemplazan `HW_LIST` y deben ser iguales. |
+| `R`, `S` | `3, 3` | Forma del filtro. |
 | `PAD_H`, `PAD_W` | `1, 1` | Padding. |
 | `STRIDE_H`, `STRIDE_W` | `1, 1` | Stride. |
 | `DILATION_H`, `DILATION_W` | `1, 1` | Dilatación. |
@@ -94,7 +91,7 @@ Compila y corre `conv_baseline.cu` vía SLURM. Nada está hardcodeado en el cuer
 | `CUDA_ARCH` | `80` | Arquitectura objetivo (`80`=A100, `86`=RTX 3050, `70`=V100). |
 | `NVCC`, `CUDNN_ROOT`, `CUDNN_INC`, `CUDNN_LIBS`, `OPENBLAS_DIR`, `OPENBLAS_INC`, `OPENBLAS_LIBS` | rutas de PACCA | Toolchain; sobrescribibles para correr en otro clúster. |
 
-Los defaults de forma (`N=1, C=1024, H=256, W=256, K=1024, R=3, S=3`) son la primera de las dos formas que corría el `.sbatch` histórico, elegida porque es la misma que usa por defecto `Fase_2/Convolution/run_conv_tc.sbatch` — así el baseline FP32 de aquí es directamente comparable con la ruta Tensor Core de Fase 2 sin tener que alinear parámetros a mano. La segunda forma histórica (`C=K=2048`) se reproduce con `--export=ALL,C=2048,K=2048`.
+Los defaults (`N=1`, `C=K=64`, `R=S=3`, `HW_LIST="64 128 256 512"`) son idénticos a los de las campañas encadenadas de Fase 3/4. `SMOKE_TEST=1` conserva únicamente `H=W=64` con dos iteraciones y su salida no se reporta como dato experimental.
 
 Nota sobre `#SBATCH --output`/`--error`: esas dos líneas son literales (`logs/fase1_conv_baseline_%j.out`/`.err`) porque SLURM las procesa al momento del `sbatch`, antes de que el script (y por tanto `OUTPUT_DIR`) exista — no pueden depender de una variable definida dentro del script. Para cambiarlas, pásalas en la propia línea de `sbatch`: `sbatch --output=otra/ruta_%j.out --error=otra/ruta_%j.err run_conv_fase1.sbatch`.
 
@@ -104,7 +101,7 @@ Nota sobre `#SBATCH --output`/`--error`: esas dos líneas son literales (`logs/f
 sbatch run_conv_fase1.sbatch                                    # FP32 + FP64, forma por defecto
 sbatch --export=ALL,SMOKE_TEST=1 run_conv_fase1.sbatch          # validacion rapida
 sbatch --export=ALL,PRECISION=fp32 run_conv_fase1.sbatch        # solo FP32
-sbatch --export=ALL,C=2048,K=2048 run_conv_fase1.sbatch         # 2a forma historica
+sbatch --export=ALL,HW_LIST="64 128 256 512" run_conv_fase1.sbatch
 sbatch --export=ALL,CUDNN_ROOT=/otra/ruta run_conv_fase1.sbatch # otra instalacion de cuDNN
 ```
 

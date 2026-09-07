@@ -5,9 +5,9 @@
 //        -gencode arch=compute_80,code=sm_80
 //
 // Ejecutar:
-//   ./stencil_baseline --nx 1024 --ny 1024 --iters 20
-//   ./stencil_baseline --double --nx 1024 --ny 1024 --iters 20
-//   ./stencil_baseline 512 512 10          (forma posicional: nx ny iters)
+//   ./stencil_baseline --nx 4096 --ny 4096 --iters 20
+//   ./stencil_baseline --double --nx 8192 --ny 8192 --iters 20
+//   ./stencil_baseline 16384 16384 10      (forma posicional: nx ny iters)
 //
 // Que compara este programa:
 //   1. CPU serial (FP32 o FP64, segun --double) como referencia numerica.
@@ -57,8 +57,8 @@ namespace {
 // de linea de comandos. Nada de esto esta fijo en el codigo: todo tamano,
 // numero de iteraciones y precision se elige al invocar el binario.
 struct Options {
-    int nx = 2048;
-    int ny = 2048;
+    int nx = 4096;
+    int ny = 4096;
     int iters = 10;
     bool use_double = false;
 };

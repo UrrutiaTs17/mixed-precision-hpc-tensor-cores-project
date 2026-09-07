@@ -5,13 +5,13 @@
 //        -gencode arch=compute_80,code=sm_80
 //
 // Ejecutar:
-//   ./stencil_tc --nx 1024 --ny 1024 --iters 20 --tc both
+//   ./stencil_tc --nx 4096 --ny 4096 --iters 20 --tc both
 //
 // Validar Tensor Cores con Nsight Compute:
 //   ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \
 //       --metrics sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed,\
 // sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \
-//       ./stencil_tc --nx 1024 --ny 1024 --iters 20 --tc fp16
+//       ./stencil_tc --nx 4096 --ny 4096 --iters 20 --tc fp16
 //
 // Este programa compara tres rutas para un stencil 2D de 5 puntos:
 //   1. CPU FP32 serial como referencia de trazabilidad con Fase 1.
@@ -129,8 +129,8 @@ enum class TensorCoreMode {
 // eso se corrigio en su migracion), Stencil ya ejecutaba FP16 y BF16 por
 // defecto -- no hay nada que corregir aqui, se conserva tal cual.
 struct Options {
-    int nx = 2048;
-    int ny = 2048;
+    int nx = 4096;
+    int ny = 4096;
     int iters = 20;
     TensorCoreMode tc_mode = TensorCoreMode::Both;
 };
@@ -153,7 +153,7 @@ static void print_usage(const char* prog) {
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n";
 }
 
-// Lee el valor entero que sigue al flag argv[i] (p. ej. "--nx" "1024") y
+// Lee el valor entero que sigue al flag argv[i] (p. ej. "--nx" "4096") y
 // avanza i para que el bucle de parse_args no lo vuelva a procesar. Aborta
 // si el flag es el ultimo argumento.
 static int parse_int_arg(int& i, int argc, char** argv) {

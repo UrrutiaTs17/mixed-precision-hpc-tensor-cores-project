@@ -71,9 +71,14 @@ Cada carpeta de fase, y cada subcarpeta de kernel dentro de ella, tiene su propi
 
 ## Kernels evaluados
 
-- **GEMM**: multiplicación de matrices densas, 512×512 a 4096×4096.
-- **Convolución 2D**: diversos tamaños de filtro y lote.
-- **Stencil 2D**: operador de diferencias finitas (Laplaciano de 5 puntos) sobre dominios de 512² a 2048².
+- **GEMM**: matrices cuadradas `N = 1024, 2048, 4096, 8192`.
+- **Convolución 2D**: dominios cuadrados `H=W = 64, 128, 256, 512`, con `C=K=64` canales y filtro `3×3`.
+- **Stencil 2D**: dominios cuadrados `NX=NY = 4096, 8192, 16384`.
+
+Estos son los tamaños de las campañas reportables en las cuatro fases. Los
+tamaños reducidos que aparecen en pruebas de humo y gates se usan únicamente
+para validar compilación y correctitud; sus resultados no forman parte del
+dataset experimental.
 
 ## Formatos de precisión
 

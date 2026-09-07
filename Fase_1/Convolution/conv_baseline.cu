@@ -59,12 +59,12 @@ namespace {
 // filtro.
 struct ConvConfig {
     int N          = 1;
-    int C          = 3;
-    int H          = 1024;
-    int W          = 1024;
-    int K          = 16;
-    int R          = 5;
-    int S          = 5;
+    int C          = 64;
+    int H          = 64;
+    int W          = 64;
+    int K          = 64;
+    int R          = 3;
+    int S          = 3;
     int pad_h      = 1;
     int pad_w      = 1;
     int stride_h   = 1;

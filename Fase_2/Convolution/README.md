@@ -58,7 +58,7 @@ conv_tc [--N N] [--C C] [--H H] [--W W] [--K K] [--R R] [--S S]
         [--tc-format fp16|bf16|both] [--cutlass]
 ```
 
-Defaults del binario (cuando se invoca sin argumentos): `N=1, C=32, H=128, W=128, K=64, R=3, S=3, pad=1, stride=1, dilation=1, iters=20, tc-format=fp16, cutlass=desactivado`. Los defaults del `.sbatch` son otros (ver tabla abajo), pensados para comparabilidad con Fase 1.
+Defaults del binario (cuando se invoca sin argumentos): `N=1, C=K=64, H=W=64, R=S=3, pad=1, stride=1, dilation=1, iters=20, tc-format=fp16, cutlass=desactivado`. El `.sbatch` conserva esos canales y barre los cuatro tamaños espaciales oficiales.
 
 `--cutlass` activa la ruta 5 (desactivada por defecto — no se agrega al `.sbatch` como comportamiento por defecto todavía, ver tabla de variables de `run_conv_tc.sbatch` más abajo); reutiliza `--tc-format` para elegir el/los formato(s) de la ruta 5.
 
@@ -66,10 +66,9 @@ Defaults del binario (cuando se invoca sin argumentos): `N=1, C=32, H=128, W=128
 
 ```bash
 ./conv_tc
-./conv_tc --N 1 --C 64 --H 224 --W 224 --K 64 --R 3 --S 3 --iters 10
-./conv_tc --double --N 1 --C 16 --H 64 --W 64 --K 32 --R 3 --S 3
+./conv_tc --N 1 --C 64 --H 256 --W 256 --K 64 --R 3 --S 3 --iters 10
+./conv_tc --double --N 1 --C 64 --H 512 --W 512 --K 64 --R 3 --S 3
 ./conv_tc --N 1 --C 64 --H 64 --W 64 --K 64 --R 3 --S 3 --iters 2 --tc-format bf16
-./conv_tc --N 1 --C 1024 --H 256 --W 256 --K 1024 --R 3 --S 3 --iters 10 --tc-format both
 ./conv_tc --N 1 --C 64 --H 64 --W 64 --K 64 --R 3 --S 3 --iters 2 --tc-format both --cutlass
 ```
 
@@ -86,8 +85,10 @@ Compila y corre `conv_tensor_activation.cu` vía SLURM, valida que el binario co
 | `TC_FORMAT` | `both` | `fp16`, `bf16` o `both` — pasado directo como `--tc-format` (rige también la ruta 5 si `RUN_CUTLASS=1`). |
 | `RUN_CUTLASS` | `1` | Si es `1`, agrega `--cutlass` a la invocación del binario (ruta 5, CUTLASS `ImplicitGemmConvolution`). Si es `0`, el binario corre solo las rutas 1-4, igual que antes de agregar esta ruta. |
 | `CUTLASS_DIR` | `$HOME/cutlass/include` | Directorio `include/` de una copia clonada de `github.com/NVIDIA/cutlass` (header-only, serie 2.x) — se pasa como `-I${CUTLASS_DIR}` a `nvcc`. Ver `REQUIREMENTS.md`. |
-| `N`, `C`, `H`, `W` | `1, 1024, 256, 256` | Forma del tensor de entrada. |
-| `K`, `R`, `S` | `1024, 3, 3` | Forma del filtro. |
+| `N`, `C`, `K` | `1, 64, 64` | Lote y canales, iguales a Fase 3/4. |
+| `HW_LIST` | `"64 128 256 512"` | Dominios cuadrados `H=W` a barrer. |
+| `H`, `W` | — | Compatibilidad para una corrida manual; al exportarlos reemplazan `HW_LIST` y deben ser iguales. |
+| `R`, `S` | `3, 3` | Forma del filtro. |
 | `PAD_H`, `PAD_W` | `1, 1` | Padding. |
 | `STRIDE_H`, `STRIDE_W` | `1, 1` | Stride. |
 | `DILATION_H`, `DILATION_W` | `1, 1` | Dilatación. |
@@ -95,13 +96,14 @@ Compila y corre `conv_tensor_activation.cu` vía SLURM, valida que el binario co
 | `SMOKE_TEST` | `0` | Si es `1`, sustituye los defaults de forma por `C=H=W=K=64` (cumple las condiciones de divisibilidad de la ruta WMMA), `ITERS=2`, y desactiva NCU por defecto (`RUN_NCU=0`). |
 | `RUN_NCU` | `1` (`0` si `SMOKE_TEST=1`) | Si perfila con Nsight Compute tras la corrida normal. |
 | `NCU_MODE` | `quick` | `quick` (`--metrics`, rápido) o `full` (`--set`, caracterización completa). |
+| `NCU_HW` | primer valor de `HW_LIST` | Tamaño único usado para NCU; evita repetir el mismo perfil por toda la lista. |
 | `NCU_SET`, `NCU_KERNEL_REGEX`, `NCU_LAUNCH_SKIP`, `NCU_LAUNCH_COUNT` | ver script | Parámetros de la invocación de `ncu`. |
 | `WARMUP_ITERS` | `3` | Debe coincidir con `kWarmupIters` en `conv_tensor_activation.cu` — determina cuántos lanzamientos saltar antes de perfilar. No es un parámetro libre: cambiarlo sin cambiar también la constante en el `.cu` desalinea el `--launch-skip` de NCU con los warmups reales. |
 | `OUTPUT_DIR` | `logs` | Directorio para el binario compilado y los reportes `.ncu-rep` (no los logs de SLURM en sí — ver nota abajo). |
 | `CUDA_ARCH` | `80` | Arquitectura objetivo (`80`=A100, `86`=RTX 3050, `70`=V100). |
 | `NVCC`, `NCU`, `CUOBJDUMP`, `CUDNN_ROOT`, `CUDNN_INC`, `CUDNN_LIBS`, `OPENBLAS_DIR`, `OPENBLAS_INC`, `OPENBLAS_LIBS` | rutas de PACCA | Toolchain; sobrescribibles para correr en otro clúster. |
 
-Los defaults de forma son los mismos que usa por defecto `Fase_1/Convolution/run_conv_fase1.sbatch` (primera de las dos formas históricas: `N=1, C=K=1024, H=W=256`), para que el baseline FP32 de Fase 1 sea directamente comparable con la ruta Tensor Core de aquí. La segunda forma histórica (`C=K=2048`) se reproduce con `--export=ALL,C=2048,K=2048`.
+Los defaults (`N=1`, `C=K=64`, `R=S=3`, `HW_LIST="64 128 256 512"`) son idénticos a los de las demás fases. El perfilado NCU se limita al primer tamaño de la lista porque el kernel es el mismo; el barrido normal sí ejecuta los cuatro.
 
 Nota sobre `#SBATCH --output`/`--error`: esas dos líneas son literales porque SLURM las procesa al momento del `sbatch`, antes de que el script (y por tanto `OUTPUT_DIR`) exista. Para cambiarlas: `sbatch --output=otra/ruta_%j.out --error=otra/ruta_%j.err run_conv_tc.sbatch`.
 
@@ -111,7 +113,7 @@ Nota sobre `#SBATCH --output`/`--error`: esas dos líneas son literales porque S
 sbatch run_conv_tc.sbatch                                     # FP16 + BF16, forma por defecto, con NCU
 sbatch --export=ALL,SMOKE_TEST=1 run_conv_tc.sbatch           # validacion rapida, sin NCU
 sbatch --export=ALL,TC_FORMAT=fp16 run_conv_tc.sbatch         # solo FP16
-sbatch --export=ALL,C=2048,K=2048 run_conv_tc.sbatch          # 2a forma historica
+sbatch --export=ALL,HW_LIST="64 128 256 512" run_conv_tc.sbatch
 sbatch --export=ALL,RUN_NCU=0 run_conv_tc.sbatch              # sin perfilado NCU
 sbatch --export=ALL,NCU_MODE=full run_conv_tc.sbatch          # caracterizacion NCU completa
 sbatch --export=ALL,RUN_CUTLASS=0 run_conv_tc.sbatch           # sin la ruta 5 (CUTLASS)
@@ -127,4 +129,4 @@ sbatch --export=ALL,CUTLASS_DIR=/otra/ruta/cutlass/include run_conv_tc.sbatch
 
 `old/Fase_2/common.cuh` era un header compartido por los tres kernels de la Fase 2 anterior (GEMM, Convolución, Stencil), cada uno con su propia copia física del archivo. `common/cuda_checks.cuh` y `common/metrics.cuh` son la extracción de ese mismo contenido a un solo lugar para las cuatro fases — mismos structs, mismos campos, misma fórmula de error en `compare_*` (verificado campo por campo contra `old/Fase_2/common.cuh` antes de migrar); ningún llamador de este archivo necesitó cambiar. El resto del archivo — los cuatro `benchmark_*`, los kernels `im2col_fp16_kernel`/`wmma_gemm_kernel`, la orquestación en `run_experiment_float`/`run_experiment_double` — es idéntico byte a byte al original.
 
-`run_conv_tc.sbatch` reemplaza el barrido fijo de dos formas (`RUNS=(...)`) por una sola forma parametrizada por variables de entorno (ver tabla arriba); la segunda forma histórica sigue siendo alcanzable pasando `C=2048,K=2048` explícitamente. El resto de la lógica del script (resolución de cuDNN/OpenBLAS, validación HMMA, invocación de NCU) no cambió.
+`run_conv_tc.sbatch` ejecuta el barrido de tamaños espaciales mediante `HW_LIST`; la resolución de cuDNN/OpenBLAS, la validación HMMA y la invocación de NCU conservan su funcionamiento.

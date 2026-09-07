@@ -62,10 +62,12 @@ Cada fase tiene tres subcarpetas: `GEMM/`, `Convolution/`, `Stencil/` — un ker
 Cada binario se compila con el `.sbatch` de su carpeta (`sbatch run_gemm_fase1.sbatch`, etc.), que a su vez compila con `nvcc` y lanza el binario con los parámetros que le pases por variable de entorno. Ejemplo, para correr GEMM en un solo tamaño en vez del barrido por defecto:
 
 ```bash
-sbatch --export=ALL,SIZES="1024" run_gemm_fase1.sbatch
+sbatch --export=ALL,GEMM_SIZES="1024" run_gemm_fase1.sbatch
 ```
 
 Consulta el `README.md` de cada carpeta para la lista completa de variables aceptadas — todas tienen un valor por defecto documentado, así que `sbatch run_gemm_fase1.sbatch` sin argumentos ya corre algo razonable.
+
+Los tamaños reportables son comunes a las cuatro fases: GEMM usa `1024 2048 4096 8192`; Convolución usa `H=W=64 128 256 512` con `C=K=64`; Stencil usa `4096 8192 16384`. Los tamaños reducidos de `SMOKE_TEST` y de los gates son exclusivamente controles de compilación/correctitud y no se incorporan al análisis experimental.
 
 ### Qué datos obtienes
 

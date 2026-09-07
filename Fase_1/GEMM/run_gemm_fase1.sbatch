@@ -19,7 +19,7 @@
 #   sbatch run_gemm_fase1.sbatch
 #   sbatch --export=ALL,SMOKE_TEST=1 run_gemm_fase1.sbatch
 #   sbatch --export=ALL,CUDA_ARCH=86 run_gemm_fase1.sbatch
-#   sbatch --export=ALL,GEMM_SIZES="512 1024" run_gemm_fase1.sbatch
+#   sbatch --export=ALL,GEMM_SIZES="1024 2048 4096 8192" run_gemm_fase1.sbatch
 #   sbatch --export=ALL,PRECISIONS=fp64,ITERS=10 run_gemm_fase1.sbatch
 #   sbatch --export=ALL,INCLUDE_LEGACY_SIZES=1 run_gemm_fase1.sbatch
 #
@@ -94,11 +94,9 @@ SMOKE_TEST="${SMOKE_TEST:-0}"
 
 # --- Parametros del barrido -------------------------------------------------
 # GEMM_SIZES: tamanos cuadrados (M=N=K) a barrer. Por defecto cubre el rango
-# 512-4096 que promete el plan de tesis (ver Fase_1/GEMM/README.md, seccion
-# "Nota importante"). El .sbatch historico SOLO corria 12288 y 32768 -- muy
-# por encima de ese rango y con un costo de referencia OpenBLAS de minutos
-# por iteracion en FP64 -- por eso ya no son el default, solo un opt-in.
-GEMM_SIZES="${GEMM_SIZES:-512 1024 2048 4096}"
+# dimensionado para la A100 de PACCA y compartido por las cuatro fases. El
+# limite 8192 deja margen holgado incluso en el caso mas costoso de Fase 4.
+GEMM_SIZES="${GEMM_SIZES:-1024 2048 4096 8192}"
 # PRECISIONS: subconjunto de {fp32, fp64} a correr, separado por espacios.
 PRECISIONS="${PRECISIONS:-fp32 fp64}"
 # ITERS: iteraciones cronometradas por corrida (promediadas por el binario).

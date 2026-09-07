@@ -44,7 +44,7 @@
 # Parametrizar una fase especifica: exporta las mismas variables que acepta
 # su .sbatch ANTES de llamar a este script -- se propagan tal cual (este
 # script no las redeclara ni las intercepta):
-#   N_LIST="512 1024 2048" COMP_LIST="off on" ANCHOR_LIST="0 1 5 20" \
+#   N_LIST="1024 2048 4096 8192" COMP_LIST="off on" ANCHOR_LIST="0 1 5 20" \
 #       bash run_full_pipeline.sh
 #
 # Solo el post-proceso (si ya tienes results/ de una corrida anterior):

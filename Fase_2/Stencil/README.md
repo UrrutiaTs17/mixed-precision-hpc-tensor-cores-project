@@ -45,8 +45,8 @@ Es una adaptacion **didactica** para activar y validar Tensor Cores en un kernel
 
 | Flag | Default | Significado |
 |---|---|---|
-| `--nx NX` | 2048 | Ancho de la grilla |
-| `--ny NY` | 2048 | Alto de la grilla |
+| `--nx NX` | 4096 | Ancho de la grilla |
+| `--ny NY` | 4096 | Alto de la grilla |
 | `--iters I` | 20 | Iteraciones promediadas (tras 3 de calentamiento) |
 | `--tc fp16\|bf16\|both` | `both` | Formato(s) Tensor Core a ejecutar |
 | `--help`, `-h` | — | Imprime uso y termina |
@@ -54,8 +54,8 @@ Es una adaptacion **didactica** para activar y validar Tensor Cores en un kernel
 Ejemplos:
 
 ```
-./stencil_tc --nx 1024 --ny 1024 --iters 20 --tc both
-./stencil_tc --nx 2048 --ny 2048 --iters 20 --tc fp16
+./stencil_tc --nx 4096 --ny 4096 --iters 20 --tc both
+./stencil_tc --nx 8192 --ny 8192 --iters 20 --tc fp16
 ```
 
 ## Que produce
@@ -71,11 +71,11 @@ nvcc -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
 
 ## El `.sbatch`: de un tamano fijo a un barrido parametrizado
 
-El `.sbatch` historico (`old/Fase_2/Stencil/run_stencil_tc.sbatch`) corria un **unico tamano fijo, 4096x4096**. `run_stencil_tc.sbatch` (este directorio) lo reemplaza por un barrido parametrizado, con el mismo criterio de "nada hardcodeado" que Fase 1:
+`run_stencil_tc.sbatch` ejecuta un barrido parametrizado con el mismo conjunto de tamaños de Fase 3/4:
 
 | Variable | Default | Significado |
 |---|---|---|
-| `STENCIL_SIZES` | `"512 1024 2048"` | Tamanos NX=NY a barrer, separados por espacio |
+| `STENCIL_SIZES` | `"4096 8192 16384"` | Tamanos NX=NY a barrer, separados por espacio |
 | `STENCIL_ITERS` | `20` | Iteraciones promediadas por corrida |
 | `STENCIL_TC_MODES` | `"both"` | Modos Tensor Core a barrer (`fp16`, `bf16`, `both`, o combinaciones como `"fp16 bf16"`) |
 | `OUT_DIR` | `logs` | Directorio para logs/reportes `.ncu-rep` generados por el script |
@@ -92,12 +92,12 @@ Ejemplos:
 ```
 sbatch run_stencil_tc.sbatch
 sbatch --export=ALL,SMOKE_TEST=1 run_stencil_tc.sbatch
-sbatch --export=ALL,STENCIL_SIZES="1024 2048",STENCIL_ITERS=30 run_stencil_tc.sbatch
+sbatch --export=ALL,STENCIL_SIZES="4096 8192 16384",STENCIL_ITERS=30 run_stencil_tc.sbatch
 sbatch --export=ALL,STENCIL_TC_MODES=fp16 run_stencil_tc.sbatch
 sbatch --export=ALL,RUN_NCU=0 run_stencil_tc.sbatch
 ```
 
-Si se quiere reproducir el tamano historico de 4096x4096, `STENCIL_SIZES=4096`.
+El tamaño reducido de `512×512` queda reservado a `SMOKE_TEST=1` y no se usa como dato experimental.
 
 **NOTA MIGRACION (corregido):** este `.sbatch` compilaba `stencil_tc` sin `-O3` — asi estaba en el original (`old/Fase_2/Stencil/run_stencil_tc.sbatch`), a diferencia del de Fase 1, que si usa `-O3`. Eso hacia que la referencia "CPU FP32 serial" (host, escalar) corriera mucho mas lenta — medido en este entorno, ~25x mas lenta que con `-O3` a igualdad de tamano/maquina — lo que inflaba artificialmente todos los "Speedup vs CPU" que imprime el binario (no afectaba la correctitud numerica: los campos de error son identicos con y sin `-O3`, solo el rendimiento reportado de la referencia CPU). **Se agrego `-O3` a la compilacion para que Fase 2 sea consistente con Fase 1.** Cualquier "Speedup vs CPU"/"Speedup TC * vs CPU" generado con campanas anteriores a este cambio queda obsoleto y debe volver a correrse.
 

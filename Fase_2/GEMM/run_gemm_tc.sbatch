@@ -20,7 +20,7 @@
 #   sbatch run_gemm_tc.sbatch
 #   sbatch --export=ALL,SMOKE_TEST=1 run_gemm_tc.sbatch
 #   sbatch --export=ALL,CUDA_ARCH=86 run_gemm_tc.sbatch
-#   sbatch --export=ALL,GEMM_SIZES="512 1024",ITERS=10 run_gemm_tc.sbatch
+#   sbatch --export=ALL,GEMM_SIZES="1024 2048 4096 8192",ITERS=10 run_gemm_tc.sbatch
 #   sbatch --export=ALL,TC_FORMAT=fp16 run_gemm_tc.sbatch
 #   sbatch --export=ALL,RUN_NCU=0 run_gemm_tc.sbatch
 #   sbatch --export=ALL,INCLUDE_LEGACY_SIZES=1 run_gemm_tc.sbatch
@@ -109,12 +109,12 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 
 # --- Parametros del barrido -------------------------------------------------
 # GEMM_SIZES: tamanos cuadrados (M=N=K) a barrer. Por defecto cubre el rango
-# 512-4096 que promete el plan de tesis (ver Fase_1/GEMM/README.md). Todos
-# los valores por defecto son multiplos de 64 y de 32, los requisitos de
+# 1024-8192 compartido por las cuatro fases y dimensionado para la A100 de
+# PACCA. Todos los valores por defecto son multiplos de 64 y de 32, requisitos de
 # divisibilidad del kernel WMMA (m,n multiplo de 64; k multiplo de 32) -- si
 # cambias GEMM_SIZES, mantenlos multiplos de 64 o la ruta WMMA (4) terminara
 # el binario con un error de validacion en vez de correr.
-GEMM_SIZES="${GEMM_SIZES:-512 1024 2048 4096}"
+GEMM_SIZES="${GEMM_SIZES:-1024 2048 4096 8192}"
 ITERS="${ITERS:-30}"
 
 # TC_FORMAT: fp16 | bf16 | both. El .sbatch historico jamas pasaba

@@ -28,8 +28,8 @@ Las celdas de borde se copian sin modificar (condicion de frontera "identidad").
 
 | Flag | Default | Significado |
 |---|---|---|
-| `--nx NX` | 2048 | Ancho de la grilla |
-| `--ny NY` | 2048 | Alto de la grilla |
+| `--nx NX` | 4096 | Ancho de la grilla |
+| `--ny NY` | 4096 | Alto de la grilla |
 | `--iters I` | 10 | Iteraciones promediadas (CPU y GPU) |
 | `--double` | (ausente = FP32) | Usa `double` en vez de `float` |
 | `--help`, `-h` | — | Imprime uso y termina |
@@ -37,9 +37,8 @@ Las celdas de borde se copian sin modificar (condicion de frontera "identidad").
 Ejemplos:
 
 ```
-./stencil_baseline --nx 1024 --ny 1024 --iters 20
-./stencil_baseline --double --nx 2048 --ny 2048 --iters 20
-./stencil_baseline 512 512 10
+./stencil_baseline --nx 4096 --ny 4096 --iters 20
+./stencil_baseline --double --nx 8192 --ny 8192 --iters 20
 ```
 
 ## Que produce
@@ -55,13 +54,11 @@ nvcc -std=c++17 -O3 stencil_baseline.cu -o stencil_baseline \
 
 ## El `.sbatch`: de un tamano fijo a un barrido parametrizado
 
-El `.sbatch` historico de Fase 1 (`old/Fase_1/Stencil2D/run_stencil_fase1.sbatch`) corria un **unico tamano fijo, 4096x4096** — muy por encima del rango **512²-2048²** que el plan de tesis promete para esta fase (esa malla grande se eligio en su momento para que los tiempos fueran comparables con los `.sbatch` de Fase 2/Fase 3, que tambien la usaban).
-
-`run_stencil_fase1.sbatch` (este directorio) reemplaza ese tamano unico por un **barrido parametrizado**: nada de tamanos, iteraciones o precisiones esta fijo en el script, todo se controla por variable de entorno con el patron `VAR="${VAR:-default}"` ya usado en el resto del proyecto.
+`run_stencil_fase1.sbatch` ejecuta un **barrido parametrizado** con el mismo conjunto de tamaños de Fase 3/4. Todo se controla por variable de entorno con el patrón `VAR="${VAR:-default}"`.
 
 | Variable | Default | Significado |
 |---|---|---|
-| `STENCIL_SIZES` | `"512 1024 2048"` | Tamanos NX=NY (grilla cuadrada) a barrer, separados por espacio |
+| `STENCIL_SIZES` | `"4096 8192 16384"` | Tamanos NX=NY (grilla cuadrada) a barrer, separados por espacio |
 | `STENCIL_ITERS` | `20` | Iteraciones promediadas por corrida |
 | `STENCIL_PRECISIONS` | `"fp32 fp64"` | Precisiones a correr por cada tamano |
 | `OUT_DIR` | `logs` | Directorio para logs/artefactos generados por el script |
@@ -74,8 +71,8 @@ Ejemplos:
 ```
 sbatch run_stencil_fase1.sbatch
 sbatch --export=ALL,SMOKE_TEST=1 run_stencil_fase1.sbatch
-sbatch --export=ALL,STENCIL_SIZES="1024 2048",STENCIL_ITERS=30 run_stencil_fase1.sbatch
+sbatch --export=ALL,STENCIL_SIZES="4096 8192 16384",STENCIL_ITERS=30 run_stencil_fase1.sbatch
 sbatch --export=ALL,STENCIL_PRECISIONS=fp32 run_stencil_fase1.sbatch
 ```
 
-Si se quiere reproducir el tamano historico de 4096x4096 para comparar contra corridas previas, basta con `STENCIL_SIZES=4096`.
+El tamaño reducido de `512×512` queda reservado a `SMOKE_TEST=1` y no se usa como dato experimental.

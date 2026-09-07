@@ -14,14 +14,13 @@
 #
 # Nada de lo que se barre esta fijo en el script: tamanos, iteraciones y
 # precisiones se controlan por variable de entorno (patron VAR="${VAR:-default}").
-# El .sbatch original de Fase 1 corria un unico tamano fijo (4096x4096), muy
-# por encima del rango 512^2-2048^2 que promete el plan de tesis para esta
-# fase; el default de STENCIL_SIZES de abajo cubre ese rango.
+# La campana reportable usa el mismo conjunto dimensionado para PACCA que
+# Fase 3/4. El tamano reducido queda exclusivamente en SMOKE_TEST.
 #
 #   sbatch run_stencil_fase1.sbatch
 #   sbatch --export=ALL,SMOKE_TEST=1 run_stencil_fase1.sbatch
 #   sbatch --export=ALL,CUDA_ARCH=86 run_stencil_fase1.sbatch
-#   sbatch --export=ALL,STENCIL_SIZES="1024 2048",STENCIL_ITERS=30 run_stencil_fase1.sbatch
+#   sbatch --export=ALL,STENCIL_SIZES="4096 8192 16384",STENCIL_ITERS=30 run_stencil_fase1.sbatch
 #   sbatch --export=ALL,STENCIL_PRECISIONS=fp32 run_stencil_fase1.sbatch
 
 set -euo pipefail
@@ -54,11 +53,9 @@ NVCC="$(detect_nvcc)"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
-# Tamanos NX=NY (grilla cuadrada) a barrer, separados por espacio. Default
-# dentro del rango 512^2-2048^2 declarado en el plan de tesis para Fase 1;
-# se puede pasar cualquier lista, incluyendo el tamano historico de 4096 si
-# se quiere comparar contra corridas previas.
-STENCIL_SIZES="${STENCIL_SIZES:-512 1024 2048}"
+# Tamanos NX=NY (grilla cuadrada) a barrer, separados por espacio. Es el mismo
+# conjunto dimensionado para la A100 de PACCA que usan Fase 3 y Fase 4.
+STENCIL_SIZES="${STENCIL_SIZES:-4096 8192 16384}"
 
 # Iteraciones promediadas por corrida (--iters de stencil_baseline).
 STENCIL_ITERS="${STENCIL_ITERS:-20}"

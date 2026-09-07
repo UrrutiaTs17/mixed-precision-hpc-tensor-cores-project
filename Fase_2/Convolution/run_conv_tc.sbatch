@@ -33,7 +33,7 @@
 #   sbatch run_conv_tc.sbatch
 #   sbatch --export=ALL,SMOKE_TEST=1 run_conv_tc.sbatch
 #   sbatch --export=ALL,TC_FORMAT=fp16 run_conv_tc.sbatch
-#   sbatch --export=ALL,C=2048,K=2048 run_conv_tc.sbatch       # 2a forma historica
+#   sbatch --export=ALL,HW_LIST="64 128 256 512" run_conv_tc.sbatch
 #   sbatch --export=ALL,CUDA_ARCH=86 run_conv_tc.sbatch
 #   sbatch --export=ALL,CUDNN_ROOT=/otra/ruta run_conv_tc.sbatch
 #   sbatch --export=ALL,RUN_CUTLASS=0 run_conv_tc.sbatch
@@ -207,34 +207,37 @@ else
     CUTLASS_EXTRA_NVCC_FLAGS=""
 fi
 
-# Forma del problema. Por defecto es la primera de las dos formas historicas
-# (N=1, C=K=1024, H=W=256), la misma que usa por defecto
-# Fase_1/Convolution/run_conv_fase1.sbatch, para que el baseline FP32 de
-# Fase 1 sea comparable con la ruta Tensor Core de aqui sobre la misma
-# convolucion. La segunda forma historica (C=K=2048) se reproduce con
-# --export=ALL,C=2048,K=2048.
-# SMOKE_TEST=1 cambia los defaults por una forma pequena que ademas cumple
+# Forma del problema: misma campana que Fase 3/4, con 64 canales y
+# HW_LIST=64,128,256,512. H/W escalares siguen disponibles para una corrida
+# manual y, si se exportan, reemplazan el barrido por una sola malla cuadrada.
+# SMOKE_TEST conserva solo el menor tamano y cumple
 # las condiciones de divisibilidad de la ruta WMMA (K multiplo de 64,
 # outH*outW multiplo de 64, C*R*S multiplo de 32): con C=H=W=K=64, R=S=3,
 # outH*outW=4096 (mult. 64), K=64 (mult. 64), C*R*S=576 (mult. 32).
 if [[ "${SMOKE_TEST}" == "1" ]]; then
-    _default_n=1; _default_c=64; _default_h=64; _default_w=64
-    _default_k=64; _default_r=3; _default_s=3; _default_iters=2
+    _default_hw_list="64"
+    _default_iters=2
 else
-    # Run 1 historica: M=1024, N=65536, K=9216  -> ~1236 GFLOPs -> ~6.6 ms/kernel en A100.
-    # La 2a forma historica (M=2048, N=65536, K=18432, ~4948 GFLOPs, ~26.5 ms/kernel)
-    # se obtiene con --export=ALL,C=2048,K=2048.
-    _default_n=1; _default_c=1024; _default_h=256; _default_w=256
-    _default_k=1024; _default_r=3; _default_s=3; _default_iters=10
+    _default_hw_list="64 128 256 512"
+    _default_iters=10
 fi
-N="${N:-${_default_n}}"
-C="${C:-${_default_c}}"
-H="${H:-${_default_h}}"
-W="${W:-${_default_w}}"
-K="${K:-${_default_k}}"
-R="${R:-${_default_r}}"
-S="${S:-${_default_s}}"
+N="${N:-1}"
+C="${C:-64}"
+K="${K:-64}"
+R="${R:-3}"
+S="${S:-3}"
 ITERS="${ITERS:-${_default_iters}}"
+if [[ -n "${H:-}" || -n "${W:-}" ]]; then
+    H="${H:-${W}}"
+    W="${W:-${H}}"
+    if [[ "${H}" != "${W}" ]]; then
+        echo "ERROR: las campanas comparables exigen H=W (recibido H=${H}, W=${W})." >&2
+        exit 2
+    fi
+    HW_LIST="${H}"
+else
+    HW_LIST="${HW_LIST:-${_default_hw_list}}"
+fi
 PAD_H="${PAD_H:-1}"
 PAD_W="${PAD_W:-1}"
 STRIDE_H="${STRIDE_H:-1}"
@@ -251,6 +254,7 @@ echo "NCU=${NCU}"
 echo "SMOKE_TEST=${SMOKE_TEST}"
 echo "RUN_NCU=${RUN_NCU}"
 echo "TC_FORMAT=${TC_FORMAT}"
+echo "HW_LIST=${HW_LIST}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "RUN_CUTLASS=${RUN_CUTLASS}"
 echo "CUTLASS_DIR=${CUTLASS_DIR}"
@@ -299,12 +303,6 @@ else
 fi
 
 echo "Ejecutando benchmarks de convolucion 2D con Tensor Cores..."
-echo
-echo "============================================================"
-echo "Corrida: N=${N}, C=${C}, H=${H}, W=${W}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS}"
-echo "Padding: (${PAD_H}, ${PAD_W}), stride: (${STRIDE_H}, ${STRIDE_W}), dilation: (${DILATION_H}, ${DILATION_W})"
-echo "Formato Tensor Core: ${TC_FORMAT}"
-echo "============================================================"
 
 # Ruta 5 (CUTLASS): un solo flag adicional, valido para las mismas formas
 # que TC_FORMAT (fp16/bf16/both) -- ver conv_tensor_activation.cu y
@@ -317,18 +315,28 @@ fi
 # La ruta 2 (cuDNN "clasico") corre con CUDNN_FMA_MATH desde el codigo, de
 # modo que el speedup TC se mide contra FP32 escalar y no contra TF32, que
 # es lo que cuDNN elige por defecto en Ampere (ver Fase_2/Convolution/README.md).
-./conv_tc \
-    --N "${N}" --C "${C}" --H "${H}" --W "${W}" \
-    --K "${K}" --R "${R}" --S "${S}" \
-    --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
-    --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
-    --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
-    --iters "${ITERS}" \
-    --tc-format "${TC_FORMAT}" \
-    "${CUTLASS_RUN_FLAGS[@]}"
+for HW in ${HW_LIST}; do
+    echo
+    echo "============================================================"
+    echo "Corrida: N=${N}, C=${C}, H=W=${HW}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS}"
+    echo "Padding: (${PAD_H}, ${PAD_W}), stride: (${STRIDE_H}, ${STRIDE_W}), dilation: (${DILATION_H}, ${DILATION_W})"
+    echo "Formato Tensor Core: ${TC_FORMAT}"
+    echo "============================================================"
+    ./conv_tc \
+        --N "${N}" --C "${C}" --H "${HW}" --W "${HW}" \
+        --K "${K}" --R "${R}" --S "${S}" \
+        --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
+        --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
+        --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
+        --iters "${ITERS}" \
+        --tc-format "${TC_FORMAT}" \
+        "${CUTLASS_RUN_FLAGS[@]}"
+done
 
 if [[ "${RUN_NCU}" == "1" ]]; then
-    REPORT="${OUTPUT_DIR}/ncu_wmma_conv_N${N}_C${C}_H${H}_W${W}_K${K}_R${R}_S${S}_job${SLURM_JOB_ID:-manual}"
+    read -r _first_hw _ <<< "${HW_LIST}"
+    NCU_HW="${NCU_HW:-${_first_hw}}"
+    REPORT="${OUTPUT_DIR}/ncu_wmma_conv_N${N}_C${C}_H${NCU_HW}_W${NCU_HW}_K${K}_R${R}_S${S}_job${SLURM_JOB_ID:-manual}"
     # Con batch N>1 el benchmark lanza N invocaciones del kernel WMMA por
     # iteracion, por lo que hay que saltar WARMUP_ITERS*N lanzamientos para
     # no perfilar los warmups. WARMUP_ITERS debe coincidir con kWarmupIters
@@ -354,7 +362,7 @@ if [[ "${RUN_NCU}" == "1" ]]; then
         --export "${REPORT}" \
         --force-overwrite \
         ./conv_tc \
-            --N "${N}" --C "${C}" --H "${H}" --W "${W}" \
+            --N "${N}" --C "${C}" --H "${NCU_HW}" --W "${NCU_HW}" \
             --K "${K}" --R "${R}" --S "${S}" \
             --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
             --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \

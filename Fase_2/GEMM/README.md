@@ -41,6 +41,8 @@ nvcc -std=c++17 gemm_tensor_activation.cu -o gemm_tc \
 
 En PACCA, usa `run_gemm_tc.sbatch` — además de compilar, valida con `cuobjdump --dump-sass` que el binario realmente contiene instrucciones `HMMA` antes de perfilar con Nsight Compute (si no las contiene, típicamente `m`/`n`/`k` no eran divisibles y el kernel WMMA no se activó).
 
+La campaña barre por defecto `GEMM_SIZES="1024 2048 4096 8192"`, el mismo conjunto dimensionado para la A100 de PACCA que usan Fase 1, Fase 3 y Fase 4. El tamaño único de `SMOKE_TEST=1` es solo de validación y no forma parte del dataset experimental.
+
 ## CUTLASS: dependencia opcional
 
 `gemm_tensor_activation.cu` incluye los headers de CUTLASS con `#if __has_include(<cutlass/gemm/device/gemm.h>)`: si `-I$CUTLASS_DIR/include` no está en el path de compilación, el binario compila igual con las cuatro rutas 1-4, y pedir `--cutlass` en tiempo de ejecución termina el proceso con un mensaje explicando cómo habilitarlo, en vez de fallar la compilación para todos. Ver `REQUIREMENTS.md` para la URL del repositorio y la versión recomendada.

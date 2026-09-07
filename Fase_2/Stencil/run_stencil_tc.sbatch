@@ -11,15 +11,14 @@
 
 # Fase 2 Tensor Core (WMMA) para Stencil 2D. Nada de lo que se barre esta
 # fijo en el script: tamanos, formato Tensor Core e iteraciones se controlan
-# por variable de entorno (patron VAR="${VAR:-default}"). El .sbatch
-# original corria un unico tamano fijo (4096x4096); el default de
-# STENCIL_SIZES de abajo cubre en cambio el rango 512^2-2048^2 declarado en
-# el plan de tesis para esta fase.
+# por variable de entorno (patron VAR="${VAR:-default}"). La campana reportable
+# usa el mismo conjunto dimensionado para PACCA que Fase 3/4; el tamano
+# reducido queda exclusivamente en SMOKE_TEST.
 #
 #   sbatch run_stencil_tc.sbatch
 #   sbatch --export=ALL,SMOKE_TEST=1 run_stencil_tc.sbatch
 #   sbatch --export=ALL,CUDA_ARCH=86 run_stencil_tc.sbatch
-#   sbatch --export=ALL,STENCIL_SIZES="1024 2048",STENCIL_ITERS=30 run_stencil_tc.sbatch
+#   sbatch --export=ALL,STENCIL_SIZES="4096 8192 16384",STENCIL_ITERS=30 run_stencil_tc.sbatch
 #   sbatch --export=ALL,STENCIL_TC_MODES=fp16 run_stencil_tc.sbatch
 #   sbatch --export=ALL,RUN_NCU=0 run_stencil_tc.sbatch
 
@@ -61,12 +60,9 @@ if [[ -z "${NCU}" ]]; then
     RUN_NCU=0
 fi
 
-# Tamanos NX=NY (grilla cuadrada) a barrer, separados por espacio. Default
-# dentro del rango 512^2-2048^2 declarado en el plan de tesis para esta fase;
-# se puede pasar cualquier lista, incluyendo el tamano historico de 4096 si
-# se quiere comparar contra corridas previas (mismo que usa el hint de ncu
-# impreso por el propio binario, print_nsight_hint).
-STENCIL_SIZES="${STENCIL_SIZES:-512 1024 2048}"
+# Tamanos NX=NY (grilla cuadrada) a barrer, separados por espacio. Es el mismo
+# conjunto dimensionado para la A100 de PACCA que usan Fase 3 y Fase 4.
+STENCIL_SIZES="${STENCIL_SIZES:-4096 8192 16384}"
 
 # Iteraciones promediadas por corrida (--iters de stencil_tc).
 STENCIL_ITERS="${STENCIL_ITERS:-20}"

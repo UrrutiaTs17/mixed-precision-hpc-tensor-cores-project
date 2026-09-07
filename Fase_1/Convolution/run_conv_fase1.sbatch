@@ -31,7 +31,7 @@
 #   sbatch run_conv_fase1.sbatch
 #   sbatch --export=ALL,SMOKE_TEST=1 run_conv_fase1.sbatch
 #   sbatch --export=ALL,PRECISION=fp32 run_conv_fase1.sbatch
-#   sbatch --export=ALL,C=2048,K=2048 run_conv_fase1.sbatch      # 2a forma historica
+#   sbatch --export=ALL,HW_LIST="64 128 256 512" run_conv_fase1.sbatch
 #   sbatch --export=ALL,CUDNN_ROOT=/otra/ruta run_conv_fase1.sbatch
 
 set -euo pipefail
@@ -123,28 +123,34 @@ fi
 SMOKE_TEST="${SMOKE_TEST:-0}"
 PRECISION="${PRECISION:-both}"  # fp32 | fp64 | both
 
-# Forma del problema. Por defecto es la primera de las dos formas historicas
-# (N=1, C=K=1024, H=W=256), la misma que Fase_2/Convolution/run_conv_tc.sbatch
-# usa por defecto, para que el baseline FP32 de Fase 1 sea comparable con la
-# ruta Tensor Core de Fase 2 sobre la misma convolucion. La segunda forma
-# historica (C=K=2048) se reproduce con --export=ALL,C=2048,K=2048.
-# SMOKE_TEST=1 cambia los defaults por una forma pequena para validar que el
-# binario compila y corre (no para medir rendimiento).
+# Forma del problema: misma campana que Fase 3/4, con 64 canales y
+# HW_LIST=64,128,256,512. H/W escalares siguen disponibles
+# para una corrida manual y, si se exportan, reemplazan el barrido por una sola
+# malla cuadrada. SMOKE_TEST conserva solo el menor tamano para validacion.
 if [[ "${SMOKE_TEST}" == "1" ]]; then
-    _default_n=1; _default_c=64; _default_h=64; _default_w=64
-    _default_k=64; _default_r=3; _default_s=3; _default_iters=2
+    _default_hw_list="64"
+    _default_iters=2
 else
-    _default_n=1; _default_c=1024; _default_h=256; _default_w=256
-    _default_k=1024; _default_r=3; _default_s=3; _default_iters=10
+    _default_hw_list="64 128 256 512"
+    _default_iters=10
 fi
-N="${N:-${_default_n}}"
-C="${C:-${_default_c}}"
-H="${H:-${_default_h}}"
-W="${W:-${_default_w}}"
-K="${K:-${_default_k}}"
-R="${R:-${_default_r}}"
-S="${S:-${_default_s}}"
+N="${N:-1}"
+C="${C:-64}"
+K="${K:-64}"
+R="${R:-3}"
+S="${S:-3}"
 ITERS="${ITERS:-${_default_iters}}"
+if [[ -n "${H:-}" || -n "${W:-}" ]]; then
+    H="${H:-${W}}"
+    W="${W:-${H}}"
+    if [[ "${H}" != "${W}" ]]; then
+        echo "ERROR: las campanas comparables exigen H=W (recibido H=${H}, W=${W})." >&2
+        exit 2
+    fi
+    HW_LIST="${H}"
+else
+    HW_LIST="${HW_LIST:-${_default_hw_list}}"
+fi
 PAD_H="${PAD_H:-1}"
 PAD_W="${PAD_W:-1}"
 STRIDE_H="${STRIDE_H:-1}"
@@ -159,6 +165,7 @@ echo "Arquitectura CUDA: sm_${CUDA_ARCH}"
 echo "NVCC=${NVCC}"
 echo "SMOKE_TEST=${SMOKE_TEST}"
 echo "PRECISION=${PRECISION}"
+echo "HW_LIST=${HW_LIST}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 
 nvidia-smi || true
@@ -169,12 +176,6 @@ echo "Compilando conv_baseline..."
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     --allow-unsupported-compiler
 
-echo
-echo "============================================================"
-echo "Corrida: N=${N}, C=${C}, H=${H}, W=${W}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS}"
-echo "Padding: (${PAD_H}, ${PAD_W}), stride: (${STRIDE_H}, ${STRIDE_W}), dilation: (${DILATION_H}, ${DILATION_W})"
-echo "============================================================"
-
 # El baseline FP32 desactiva TF32 desde el codigo (cudnnSetConvolutionMathType
 # con CUDNN_FMA_MATH en conv_baseline.cu), no por NVIDIA_TF32_OVERRIDE: asi la
 # linea base sigue siendo FP32 escalar aunque el binario se corra a mano fuera
@@ -184,8 +185,9 @@ echo "============================================================"
 # flags condicional): bajo `set -u`, expandir un array vacio como
 # "${flag[@]}" aborta el job en bash < 4.4, asi que se evita el patron.
 run_fp32() {
+    local hw="$1"
     ./conv_baseline \
-        --n "${N}" --c "${C}" --h "${H}" --w "${W}" \
+        --n "${N}" --c "${C}" --h "${hw}" --w "${hw}" \
         --k "${K}" --r "${R}" --s "${S}" \
         --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
         --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
@@ -194,8 +196,9 @@ run_fp32() {
 }
 
 run_fp64() {
+    local hw="$1"
     ./conv_baseline --double \
-        --n "${N}" --c "${C}" --h "${H}" --w "${W}" \
+        --n "${N}" --c "${C}" --h "${hw}" --w "${hw}" \
         --k "${K}" --r "${R}" --s "${S}" \
         --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
         --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
@@ -203,22 +206,29 @@ run_fp64() {
         --iters "${ITERS}"
 }
 
-case "${PRECISION}" in
-    fp32)
-        run_fp32
-        ;;
-    fp64)
-        run_fp64
-        ;;
-    both)
-        echo "--- Precision: FP32 ---"
-        run_fp32
-        echo
-        echo "--- Precision: FP64 ---"
-        run_fp64
-        ;;
-    *)
-        echo "PRECISION invalida: '${PRECISION}' (use fp32, fp64 o both)" >&2
-        exit 1
-        ;;
-esac
+for HW in ${HW_LIST}; do
+    echo
+    echo "============================================================"
+    echo "Corrida: N=${N}, C=${C}, H=W=${HW}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS}"
+    echo "Padding: (${PAD_H}, ${PAD_W}), stride: (${STRIDE_H}, ${STRIDE_W}), dilation: (${DILATION_H}, ${DILATION_W})"
+    echo "============================================================"
+    case "${PRECISION}" in
+        fp32)
+            run_fp32 "${HW}"
+            ;;
+        fp64)
+            run_fp64 "${HW}"
+            ;;
+        both)
+            echo "--- Precision: FP32 ---"
+            run_fp32 "${HW}"
+            echo
+            echo "--- Precision: FP64 ---"
+            run_fp64 "${HW}"
+            ;;
+        *)
+            echo "PRECISION invalida: '${PRECISION}' (use fp32, fp64 o both)" >&2
+            exit 1
+            ;;
+    esac
+done
