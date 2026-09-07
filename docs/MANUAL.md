@@ -31,7 +31,6 @@ Fase_3/      → encadenamiento genuino + drift + compensación
 Fase_4/      → ancla FP64 + energía completa + Pareto 3D + estadística
 tools/       → utilidades de perfilamiento compartidas
 docs/        → este manual
-old/         → código anterior a la reconstrucción, de referencia
 ```
 
 Cada fase tiene tres subcarpetas: `GEMM/`, `Convolution/`, `Stencil/` — un kernel HPC distinto cada una. Dentro de cada una hay un `README.md` con el detalle específico de ese kernel en esa fase; este manual da la vista general y el flujo de trabajo, los README de cada carpeta dan el detalle de flags y columnas de CSV.

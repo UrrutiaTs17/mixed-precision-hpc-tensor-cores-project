@@ -60,8 +60,6 @@ mixed-precision-hpc-tensor-cores-project/
 ├── docs/
 │   └── MANUAL.md         # Manual del estudiante: qué es cada archivo, cómo correrlo,
 │                          # qué datos produce, cómo se analizan.
-├── old/                  # Snapshot completo del código anterior a esta reconstrucción,
-│                          # conservado como referencia (ver old/README.md).
 ├── REQUIREMENTS.md       # Software y entorno necesarios para compilar y correr.
 ├── run_full_pipeline.sh        # Orquestador para una máquina propia con GPU.
 ├── run_full_pipeline_pacca.sh  # Orquestador para un clúster con SLURM (jobs + dependencias).

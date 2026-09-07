@@ -1,1 +1,0 @@
-../../../Fase_3/Stencil/tools/power_sampling.h
