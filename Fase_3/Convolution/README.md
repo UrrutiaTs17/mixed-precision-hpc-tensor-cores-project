@@ -20,7 +20,20 @@ Mismo patrón que GEMM: `conv(T+comp, W) = conv(T,W) + conv(comp,W)` (la convolu
 
 **Misma corrección que GEMM** (ver `Fase_3/GEMM/README.md`): `comp` se siembra desde el redondeo real de `x0→T` (`seed_comp_from_double_kernel`), no desde cero — de lo contrario la ruta `_comp` arrastra un piso de error evitable desde la primera iteración.
 
-**Mismo punto de mayor riesgo que GEMM**: si el orden de operandos de `cublasDgemm` estuviera al revés, el binario compilaría y correría igual, comparando peras con manzanas sin ningún error visible. Verificar con `--hw` chico (p. ej. 64, el mínimo) contra una referencia independiente antes de confiar en cualquier resultado.
+**Mismo punto de mayor riesgo que GEMM** — ✅ verificado. Si el orden de operandos de `cublasDgemm` estuviera al revés, el binario compilaría y correría igual, comparando peras con manzanas sin ningún error visible. Esa verificación ya existe y ya pasó:
+
+```bash
+python3 ../tools/verificar_orden_operandos_conv.py --hw 64
+```
+
+`Fase_3/tools/verificar_orden_operandos_conv.py` extrae de este archivo — sin reimplementarlos — las constantes (`kChannels`, `kFilterR`, `kFilterS`, `kCRS`), `grid1d()`, `build_block_diagonal_filter()`, `im2col_double_kernel()` y `gpu_fp64_conv_step()`, los compila en un binario mínimo y compara contra dos referencias NumPy independientes entre sí. Verifica **cuatro** cosas, no una:
+
+1. **Orden de operandos** de `cublasDgemm` (el análogo exacto de GEMM).
+2. **Indexación del `im2col`**: una transposición `r↔s` o leer el filtro volteado (convolución en vez de correlación) darían un resultado finito y plausible. Con el Laplaciano de 5 puntos, que es *simétrico*, ninguno de los dos es visible — por eso el script corre un segundo caso con un filtro deliberadamente **asimétrico**, que es la única forma de distinguirlos.
+3. **Padding "SAME"** (`pad=1, stride=1, dilation=1`): las celdas del borde deben leer ceros. Un `wrap`/`replicate` dejaría el interior exacto y solo alteraría el anillo exterior, diluido en una norma global — el script reporta el error del **borde por separado** para que un fallo de padding se nombre como tal.
+4. **Estructura bloque-diagonal** de `W`: un filtro que mezclara canales seguiría dando números finitos, y la afirmación "64 simulaciones de Stencil independientes" dejaría de ser cierta sin que nada lo delatara.
+
+Resultado en GPU Ampere real (`sm_86`, 2026-09-06): pasa las cuatro. `rel_linf = 2.2e-16` contra la correlación con padding de ceros, frente a `1.04` si el filtro estuviera volteado y `0.48` si estuviera transpuesto; bloques fuera de la diagonal exactamente `0`; error del borde (`2.0e-16`) indistinguible del del interior (`2.2e-16`).
 
 ## `im2col`: tres variantes, no una
 

@@ -119,7 +119,16 @@ Construido (`Fase_3/GEMM/gemm_chained.cu`, `Fase_3/Convolution/conv_chained.cu`)
 - **GEMM**: `X(n+1) = X(n) · A`, con `A = c·H` un operador fijo construido a partir de una matriz de Hadamard de Sylvester (entradas exactamente `±1`, sin error de redondeo del operador en ningún formato — a diferencia de una matriz ortogonal genérica). Analogía directa con la iteración de potencias.
 - **Convolución**: `X(n+1) = conv(X(n), W)`, con `W` el mismo Laplaciano de 5 puntos de Stencil expresado como filtro 3×3, replicado **bloque-diagonal** en 64 canales (`C=K=64`, cada canal evoluciona independiente — no es un capricho: con `C=K=1` el GEMM subyacente del `im2col` desperdiciaría 63 de cada 64 filas del tile WMMA de `common/wmma_gemm.cuh`, dando cifras de rendimiento engañosas).
 
-Ambos usan compensación por linealidad (`--comp on`, `comp` en `float`, sin ancla — eso es Fase 4) y una referencia FP64 encadenada vía cuBLAS. **El punto de mayor riesgo silencioso de los dos archivos**: cuBLAS es *column-major*, el resto del archivo es *row-major* — la llamada a `cublasDgemm` invierte el orden "natural" de los operandos para que ambas convenciones calculen la misma operación matemática sobre el mismo buffer. Si estuviera al revés, el binario compilaría y correría igual, comparando peras con manzanas sin ningún error visible — verificar con un tamaño chico contra una referencia independiente (NumPy/SciPy) antes de cualquier campaña. Ver la derivación completa junto a `gpu_fp64_step()`/`gpu_fp64_conv_step()` en cada `.cu`, y los `README.md` de `Fase_3/GEMM/` y `Fase_3/Convolution/` para el resto del diseño (rutas, esquema de CSV, qué falta).
+Ambos usan compensación por linealidad (`--comp on`, `comp` en `float`, sin ancla — eso es Fase 4) y una referencia FP64 encadenada vía cuBLAS. **El punto de mayor riesgo silencioso de los dos archivos**: cuBLAS es *column-major*, el resto del archivo es *row-major* — la llamada a `cublasDgemm` invierte el orden "natural" de los operandos para que ambas convenciones calculen la misma operación matemática sobre el mismo buffer. Si estuviera al revés, el binario compilaría y correría igual, comparando peras con manzanas sin ningún error visible.
+
+**Esa verificación ya existe y ya pasó** (GPU Ampere real, 2026-09-06):
+
+```bash
+python3 Fase_3/tools/verificar_orden_operandos_gemm.py --n 32
+python3 Fase_3/tools/verificar_orden_operandos_conv.py --hw 64
+```
+
+Los dos scripts **extraen** del `.cu` el texto de las funciones bajo prueba —no las reimplementan, para verificar el código que corre en la campaña y no una copia—, lo compilan en un binario mínimo que expone el resultado crudo, y lo comparan contra NumPy. El de Convolución cubre además la indexación del `im2col` (con un filtro asimétrico, la única forma de detectar una transposición `r↔s` o un filtro volteado: el Laplaciano es simétrico y los oculta), el padding "SAME" —reportando el error del borde por separado— y la estructura bloque-diagonal del filtro. Ver la derivación completa junto a `gpu_fp64_step()`/`gpu_fp64_conv_step()` en cada `.cu`, y `Fase_3/tools/README.md`.
 
 ---
 

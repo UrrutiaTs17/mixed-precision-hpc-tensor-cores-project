@@ -20,11 +20,21 @@ Esto no es una elección arbitraria — corrige un hallazgo real de la segunda r
 
 `comp` se siembra desde el redondeo *real* de `x0→T` (`seed_comp_from_double_kernel`), no desde cero — mismo patrón que `Fase_4/Stencil`. Sembrar `comp` en cero descartaría el error de la primerísima conversión `x0→T`, que quedaría sin corregir para siempre (se propaga amplificado por `A` en cada iteración) en vez de quedar capturado desde el principio, como exige la propiedad de reconstrucción `Q(v)+comp=v` que el resto del mecanismo asume ya válida desde `t=0`. El gate K=1 de `Fase_4/GEMM/README.md` depende de esta siembra para converger a la referencia FP64.
 
-## El punto de mayor riesgo: orden de operandos en la referencia FP64
+## El punto de mayor riesgo: orden de operandos en la referencia FP64 — ✅ verificado
 
 cuBLAS es *column-major*; el kernel WMMA de `common/wmma_gemm.cuh` es *row-major*. Para que ambas rutas calculen exactamente `X·A` sobre el mismo buffer sin transponer nada explícitamente, la llamada a `cublasDgemm` invierte el orden de los operandos (`A` primero, `X` segundo) — ver la derivación completa en el comentario de `gpu_fp64_step()` en el `.cu`. Si esto estuviera al revés, el binario compilaría y correría igual, pero compararía peras con manzanas sin ningún error visible.
 
-**Antes de confiar en cualquier resultado**: verificar con un `N` chico (16 o 32) contra una referencia CPU independiente (por ejemplo, tres líneas de Python con NumPy) que `gpu_fp64_step` calcula genuinamente `X·A` y no `A·X` ni `X^T·A`.
+Esa verificación **ya existe y ya pasó**:
+
+```bash
+python3 ../tools/verificar_orden_operandos_gemm.py --n 32
+```
+
+`Fase_3/tools/verificar_orden_operandos_gemm.py` extrae el texto de `gpu_fp64_step()` de este archivo — sin reimplementarlo, para que verifique el código que corre en la campaña y no una copia —, lo compila en un binario mínimo que expone el resultado crudo, y lo compara contra `X @ A` calculado explícitamente en NumPy. Exige además que la función sea idéntica en Fase 3 y Fase 4.
+
+Resultado en GPU Ampere real (`sm_86`, 2026-09-06): `rel_linf = 0.0` contra `X·A`, con las hipótesis alternativas a distancia `1.28` (`A·X`), `1.12` (`Xᵀ·A`) y `1.23` (`(X·A)ᵀ`). El orden de operandos es correcto.
+
+Ese script es también el paso 1 de `tools/validacion_preliminar.sbatch`, que hay que correr antes de cualquier campaña.
 
 ## Kernel WMMA: compartido con Fase 2, no reimplementado
 
