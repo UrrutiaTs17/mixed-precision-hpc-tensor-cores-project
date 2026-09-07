@@ -9,24 +9,72 @@
 #SBATCH --exclusive
 #SBATCH --time=48:00:00
 
+# Fase 2 Tensor Core (WMMA) para Stencil 2D. Nada de lo que se barre esta
+# fijo en el script: tamanos, formato Tensor Core e iteraciones se controlan
+# por variable de entorno (patron VAR="${VAR:-default}"). El .sbatch
+# original corria un unico tamano fijo (4096x4096); el default de
+# STENCIL_SIZES de abajo cubre en cambio el rango 512^2-2048^2 declarado en
+# el plan de tesis para esta fase.
+#
+#   sbatch run_stencil_tc.sbatch
+#   sbatch --export=ALL,SMOKE_TEST=1 run_stencil_tc.sbatch
+#   sbatch --export=ALL,CUDA_ARCH=86 run_stencil_tc.sbatch
+#   sbatch --export=ALL,STENCIL_SIZES="1024 2048",STENCIL_ITERS=30 run_stencil_tc.sbatch
+#   sbatch --export=ALL,STENCIL_TC_MODES=fp16 run_stencil_tc.sbatch
+#   sbatch --export=ALL,RUN_NCU=0 run_stencil_tc.sbatch
+
 set -euo pipefail
 
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 if [[ ! -f stencil_tensor_activation.cu && -f Stencil/stencil_tensor_activation.cu ]]; then
     cd Stencil
 fi
-mkdir -p logs
+
+# Directorio de salida para logs/reportes generados por este script (no
+# confundir con #SBATCH --output/--error de arriba: SLURM resuelve esas dos
+# rutas al momento de encolar el job, antes de que el script corra, asi que
+# no pueden depender de una variable definida aqui dentro).
+OUT_DIR="${OUT_DIR:-logs}"
+mkdir -p "${OUT_DIR}"
 
 # Sin dependencias externas: stencil_tc solo usa mma.h / cuda_fp16.h / cuda_bf16.h,
 # por lo que no se cargan modulos (OpenBLAS/cuDNN no aplican aqui).
 
 # Arquitectura por defecto para A100.
-# Puedes sobrescribirla con:
-#   sbatch --export=ALL,CUDA_ARCH=86 run_stencil_tc.sbatch
-CUDA_ARCH="${CUDA_ARCH:-80}"  # A100=80, RTX 3050=86, V100=70
+# --- Deteccion portable del toolchain (tools/detect_toolchain.sh) --------
+# Corre igual bajo SLURM en PACCA o con `bash` directo en cualquier otra
+# maquina con el entorno conda de environment.yml activo -- ver el
+# comentario de cabecera de ese script.
+for _toolchain in "../../tools/detect_toolchain.sh" "./detect_toolchain.sh"; do
+    if [[ -f "${_toolchain}" ]]; then
+        # shellcheck source=/dev/null
+        source "${_toolchain}"
+        break
+    fi
+done
+CUDA_ARCH="$(detect_cuda_arch)"  # A100=80, RTX 3050=86, V100=70, Ada=89, Hopper=90
 
-NVCC="${NVCC:-/opt/ohpc/pub/devtools/nvidia/hpc_sdk/Linux_x86_64/23.1/compilers/bin/nvcc}"
-NCU="${NCU:-${HOME}/fcrojasv/nsight_compute/ncu}"
+NVCC="$(detect_nvcc)"
+NCU="$(detect_ncu || true)"
+if [[ -z "${NCU}" ]]; then
+    echo "AVISO: Nsight Compute (ncu) no encontrado -- se deshabilita el perfilado (RUN_NCU forzado a 0)." >&2
+    RUN_NCU=0
+fi
+
+# Tamanos NX=NY (grilla cuadrada) a barrer, separados por espacio. Default
+# dentro del rango 512^2-2048^2 declarado en el plan de tesis para esta fase;
+# se puede pasar cualquier lista, incluyendo el tamano historico de 4096 si
+# se quiere comparar contra corridas previas (mismo que usa el hint de ncu
+# impreso por el propio binario, print_nsight_hint).
+STENCIL_SIZES="${STENCIL_SIZES:-512 1024 2048}"
+
+# Iteraciones promediadas por corrida (--iters de stencil_tc).
+STENCIL_ITERS="${STENCIL_ITERS:-20}"
+
+# Modos Tensor Core a barrer, separados por espacio: "fp16", "bf16", "both"
+# (fp16+bf16 en una sola invocacion) o una combinacion, p. ej. "fp16 bf16"
+# para forzar dos invocaciones separadas en vez de una con --tc both.
+STENCIL_TC_MODES="${STENCIL_TC_MODES:-both}"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 if [[ "${SMOKE_TEST}" == "1" ]]; then
@@ -70,11 +118,24 @@ echo "NVCC=${NVCC}"
 echo "NCU=${NCU}"
 echo "SMOKE_TEST=${SMOKE_TEST}"
 echo "RUN_NCU=${RUN_NCU}"
+echo "OUT_DIR=${OUT_DIR}"
+echo "STENCIL_SIZES=${STENCIL_SIZES}"
+echo "STENCIL_ITERS=${STENCIL_ITERS}"
+echo "STENCIL_TC_MODES=${STENCIL_TC_MODES}"
 
 nvidia-smi || true
 
 echo "Compilando stencil_tc..."
-"${NVCC}" -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
+# NOTA MIGRACION (actualizada): el .sbatch original de Fase 2
+# (old/Fase_2/Stencil/run_stencil_tc.sbatch) compilaba sin -O3, a diferencia
+# de Fase 1 -- eso hacia correr el bucle "CPU FP32 serial" (host, escalar)
+# ~25x mas lento de lo real en este entorno, inflando artificialmente todos
+# los "Speedup vs CPU"/"Speedup TC * vs CPU" que imprime el binario (no
+# afectaba la correctitud numerica, solo el rendimiento reportado de la
+# referencia CPU). Se agrega -O3 aqui para volver a Fase 2 consistente con
+# Fase 1: cualquier "Speedup vs CPU" generado ANTES de este cambio queda
+# obsoleto y debe volver a correrse.
+"${NVCC}" -std=c++17 -O3 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     --allow-unsupported-compiler
 
@@ -115,56 +176,59 @@ fi
 
 echo "Ejecutando benchmarks de stencil 2D con Tensor Cores..."
 
+# SMOKE_TEST=1 corre un unico tamano pequeno con --tc both para validar
+# rapido que el binario compila y ejecuta, sin esperar el barrido completo
+# ni el perfilado NCU (RUN_NCU se fuerza a 0 arriba salvo que se sobrescriba).
 if [[ "${SMOKE_TEST}" == "1" ]]; then
-    declare -a RUNS=(
-        "512 512 3 both"
-    )
+    RUN_SIZES="512"
+    RUN_ITERS=3
+    RUN_TC_MODES="both"
 else
-    # Dimensiones de referencia del proyecto (mismas del hint Nsight en el .cu).
-    declare -a RUNS=(
-        "4096 4096 20 both"
-    )
+    RUN_SIZES="${STENCIL_SIZES}"
+    RUN_ITERS="${STENCIL_ITERS}"
+    RUN_TC_MODES="${STENCIL_TC_MODES}"
 fi
 
-for run in "${RUNS[@]}"; do
-    read -r NX NY ITERS TC <<< "${run}"
-    echo
-    echo "============================================================"
-    echo "Corrida: NX=${NX}, NY=${NY}, ITERS=${ITERS}, TC=${TC}"
-    echo "============================================================"
-    ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}"
+for SIZE in ${RUN_SIZES}; do
+    for TC in ${RUN_TC_MODES}; do
+        echo
+        echo "============================================================"
+        echo "Corrida: NX=${SIZE}, NY=${SIZE}, ITERS=${RUN_ITERS}, TC=${TC}"
+        echo "============================================================"
+        ./stencil_tc --nx "${SIZE}" --ny "${SIZE}" --iters "${RUN_ITERS}" --tc "${TC}"
 
-    if [[ "${RUN_NCU}" == "1" ]]; then
-        # Con --tc both el binario lanza primero todos los kernels FP16 y luego
-        # los BF16; como --launch-skip cuenta lanzamientos que matchean el regex
-        # de forma global, un solo pase de ncu con skip=3 solo capturaria la
-        # instanciacion FP16. Se perfila cada tipo por separado (--tc fp16 /
-        # --tc bf16): un reporte por precision con skip/count deterministas.
-        if [[ "${TC}" == "both" ]]; then
-            NCU_TC_TYPES=(fp16 bf16)
-        else
-            NCU_TC_TYPES=("${TC}")
+        if [[ "${RUN_NCU}" == "1" ]]; then
+            # Con --tc both el binario lanza primero todos los kernels FP16 y luego
+            # los BF16; como --launch-skip cuenta lanzamientos que matchean el regex
+            # de forma global, un solo pase de ncu con skip=3 solo capturaria la
+            # instanciacion FP16. Se perfila cada tipo por separado (--tc fp16 /
+            # --tc bf16): un reporte por precision con skip/count deterministas.
+            if [[ "${TC}" == "both" ]]; then
+                NCU_TC_TYPES=(fp16 bf16)
+            else
+                NCU_TC_TYPES=("${TC}")
+            fi
+            if [[ "${NCU_MODE}" == "full" ]]; then
+                NCU_CAPTURE_ARGS=(--set "${NCU_SET}")
+            else
+                NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
+            fi
+            for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
+                REPORT="${OUT_DIR}/ncu_wmma_stencil_nx${SIZE}_ny${SIZE}_${TC_TYPE}_job${SLURM_JOB_ID:-manual}"
+                echo
+                echo "Perfilando WMMA ${TC_TYPE} con Nsight Compute (NCU_MODE=${NCU_MODE})..."
+                echo "Reporte: ${REPORT}.ncu-rep"
+                # `time` (y stderr de ncu) se redirigen al .out para correlacionar
+                # duracion vs #SBATCH --time en corridas con --set full.
+                { time "${NCU}" "${NCU_CAPTURE_ARGS[@]}" \
+                    --target-processes all \
+                    --kernel-name "regex:${NCU_KERNEL_REGEX}" \
+                    --launch-skip "${NCU_LAUNCH_SKIP}" \
+                    --launch-count "${NCU_LAUNCH_COUNT}" \
+                    --export "${REPORT}" \
+                    --force-overwrite \
+                    ./stencil_tc --nx "${SIZE}" --ny "${SIZE}" --iters "${RUN_ITERS}" --tc "${TC_TYPE}"; } 2>&1
+            done
         fi
-        if [[ "${NCU_MODE}" == "full" ]]; then
-            NCU_CAPTURE_ARGS=(--set "${NCU_SET}")
-        else
-            NCU_CAPTURE_ARGS=(--metrics "${NCU_QUICK_METRICS}")
-        fi
-        for TC_TYPE in "${NCU_TC_TYPES[@]}"; do
-            REPORT="logs/ncu_wmma_stencil_nx${NX}_ny${NY}_${TC_TYPE}_job${SLURM_JOB_ID:-manual}"
-            echo
-            echo "Perfilando WMMA ${TC_TYPE} con Nsight Compute (NCU_MODE=${NCU_MODE})..."
-            echo "Reporte: ${REPORT}.ncu-rep"
-            # `time` (y stderr de ncu) se redirigen al .out para correlacionar
-            # duracion vs #SBATCH --time en corridas con --set full.
-            { time "${NCU}" "${NCU_CAPTURE_ARGS[@]}" \
-                --target-processes all \
-                --kernel-name "regex:${NCU_KERNEL_REGEX}" \
-                --launch-skip "${NCU_LAUNCH_SKIP}" \
-                --launch-count "${NCU_LAUNCH_COUNT}" \
-                --export "${REPORT}" \
-                --force-overwrite \
-                ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC_TYPE}"; } 2>&1
-        done
-    fi
+    done
 done

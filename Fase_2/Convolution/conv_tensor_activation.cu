@@ -1,3 +1,5 @@
+// Fase_2/Convolution/conv_tensor_activation.cu
+//
 // Compilar con:
 // nvcc -std=c++17 conv_tensor_activation.cu -o conv_tc \
 //      -I/usr/include/openblas \
@@ -8,16 +10,29 @@
 // En PACCA (A100, sm_80) la compilacion y el perfilado con Nsight Compute se
 // lanzan via SLURM: sbatch run_conv_tc.sbatch  (no ejecutar ncu con sudo).
 //
-// Este programa compara tres rutas de convolucion 2D hacia adelante:
+// Este programa compara CUATRO rutas de convolucion 2D hacia adelante:
 // 1. CPU con OpenBLAS (via transformacion im2col + SGEMM/DGEMM).
 // 2. GPU con cuDNN FP32 clasico (sin Tensor Cores).
-// 3. GPU con cuDNN y Tensor Cores (entradas FP16, acumulacion y salida FP32).
+// 3. GPU con cuDNN y Tensor Cores (entradas FP16 y/o BF16, acumulacion y
+//    salida FP32) -- formato seleccionable con --tc-format.
+// 4. GPU con im2col propio en GPU (FP16) + kernel WMMA propio (Tensor Cores
+//    manejados directamente, sin pasar por cuDNN).
 //
-// Con --double: unicamente se ejecutan las rutas CPU FP64 y cuDNN FP64,
-// ya que la ruta Tensor Core opera con FP16 de entrada.
+// Con --double: unicamente se ejecutan las rutas 1 y 2 (CPU FP64 y cuDNN
+// FP64), ya que las rutas 3 y 4 operan con entrada de 16 bits.
 //
 // Las matrices de activacion y filtros se almacenan en formato NCHW,
 // convencion usada tanto por cuDNN como por el im2col de referencia en CPU.
+//
+// Ver Fase_2/Convolution/README.md, seccion "Como interpretar los
+// resultados", antes de resumir cualquier corrida en un solo numero de
+// "speedup de Tensor Cores": las rutas 2 vs 3 y 2 vs 4 miden cosas distintas
+// y no son intercambiables.
+//
+// Migrado de old/Fase_2/Convolution/conv_tensor_activation.cu sin cambios de
+// logica numerica. El unico cambio de este archivo respecto al original es
+// de donde vienen CHECK_CUDA/CHECK_CUDNN/CudaEventTimer/Metrics/ErrorMetrics/
+// compare_* -- ver el comentario junto al #include de mas abajo.
 
 #include <algorithm>
 #include <chrono>
@@ -36,9 +51,85 @@
 #include <cuda_pipeline_primitives.h>
 #include <mma.h>
 
+// CUTLASS es header-only (repositorio github.com/NVIDIA/cutlass, serie 2.x,
+// ver REQUIREMENTS.md) -- no agrega dependencias de enlazado, solo requiere
+// -I<CUTLASS_DIR>/include al compilar (ver run_conv_tc.sbatch, CUTLASS_DIR).
+// Kernel de convolucion implicita (Ruta 5, ver mas abajo) via la API 2.x
+// clasica (cutlass::conv::kernel::DefaultConv2dFprop +
+// cutlass::conv::device::ImplicitGemmConvolution), siguiendo la estructura
+// de examples/16_ampere_tensorop_conv2dfprop del repo oficial de CUTLASS.
+// Verificado contra CUTLASS v2.11.0. Con otra version, confirmar estos
+// nombres de header contra examples/16_ampere_tensorop_conv2dfprop/
+// ampere_tensorop_conv2dfprop.cu del arbol real antes de compilar.
+//
+// Los headers de CUTLASS quedan detras de __has_include (igual que
+// Fase_2/GEMM/gemm_tensor_activation.cu) para que la ausencia de
+// -I$CUTLASS_DIR/include solo desactive la ruta 5 en vez de romper la
+// compilacion de las cuatro rutas 1-4, que no dependen de CUTLASS -- ver el
+// uso de HAVE_CUTLASS junto a run_cutlass_conv_impl y en el punto de llamada
+// de run_benchmark, mas abajo.
+#if __has_include(<cutlass/conv/device/implicit_gemm_convolution.h>)
+#define HAVE_CUTLASS 1
+#include <cutlass/cutlass.h>
+#include <cutlass/half.h>
+#include <cutlass/bfloat16.h>
+#include <cutlass/tensor_coord.h>
+#include <cutlass/tensor_ref.h>
+#include <cutlass/matrix_coord.h>
+#include <cutlass/arch/arch.h>
+#include <cutlass/arch/mma.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle.h>
+#include <cutlass/layout/tensor.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/conv/convolution.h>
+#include <cutlass/conv/conv2d_problem_size.h>
+#include <cutlass/conv/kernel/default_conv2d_fprop.h>
+#include <cutlass/conv/device/implicit_gemm_convolution.h>
+// Lista de headers necesaria para los simbolos que usa directamente la
+// Ruta 5 mas abajo (Tensor4DCoord, MatrixCoord, TensorRef, Conv2dProblemSize,
+// Mode, IteratorAlgorithm, LinearCombination, DefaultConv2dFprop,
+// ImplicitGemmConvolution), verificada contra CUTLASS v2.11.0. Con otra
+// version, un simbolo incompleto casi siempre es un header transitivo que
+// aqui se asume incluido y en esa version no lo esta (o esta en otra ruta)
+// -- revisar examples/16_ampere_tensorop_conv2dfprop/CMakeLists.txt o el
+// propio .cu del ejemplo para la lista exacta de includes que usa.
+#else
+#define HAVE_CUTLASS 0
+#endif
+
 namespace {
 
-#include "../common.cuh"
+// CHECK_CUDA / CHECK_CUDNN (common/cuda_checks.cuh) y CudaEventTimer /
+// Metrics / ErrorMetrics / compare_fp64_ref_vs_fp32 / compare_float_vectors /
+// compare_double_vectors (common/metrics.cuh) reemplazan lo que este archivo
+// obtenia de old/Fase_2/common.cuh -- un header que GEMM, Convolucion y
+// Stencil de la Fase 2 anterior incluian cada uno por su lado. common/
+// consolida esas mismas definiciones (mismos structs, mismos campos, misma
+// formula de error) para las cuatro fases y los tres kernels; la firma de
+// cada macro/clase/funcion usada abajo no cambio, asi que el resto de este
+// archivo es identico al original. Deben incluirse dentro de este namespace
+// anonimo -- ver la nota de uso en la cabecera de cada header de common/.
+#include "../../common/cuda_checks.cuh"
+#include "../../common/metrics.cuh"
+
+// Valida una llamada a CUTLASS (cutlass::Status). Mismo patron y motivo que
+// CHECK_CUDA/CHECK_CUDNN de common/cuda_checks.cuh; se define aqui (no en
+// common/) porque CUTLASS solo lo usa la Ruta 5 de este archivo -- ningun
+// otro .cu del proyecto lo necesita todavia.
+// cutlass::cutlassGetStatusString (declarada en cutlass/cutlass.h) expone
+// un string legible para cutlass::Status -- verificado contra CUTLASS
+// v2.11.0.
+#define CHECK_CUTLASS(call)                                                   \
+  do {                                                                        \
+    cutlass::Status status_cutlass_ = (call);                                 \
+    if (status_cutlass_ != cutlass::Status::kSuccess) {                       \
+      std::cerr << "CUTLASS error at " << __FILE__ << ":" << __LINE__         \
+                << " -> " << cutlass::cutlassGetStatusString(status_cutlass_) \
+                << std::endl;                                                 \
+      std::exit(EXIT_FAILURE);                                                \
+    }                                                                         \
+  } while (0)
 
 constexpr int kWarmupIters       = 3;
 constexpr int kConversionThreads = 256;
@@ -135,6 +226,11 @@ struct Options {
     int iters      = 20;
     bool use_double = false;
     TensorCoreFormat tc_format = TensorCoreFormat::FP16;
+    // Ruta 5 (CUTLASS ImplicitGemm), opt-in via --cutlass. Reutiliza
+    // tc_format (fp16/bf16/both) para elegir que formato(s) de la Ruta 5
+    // correr, igual que ya hace la Ruta 3 (cuDNN Tensor Core) -- no se
+    // agrega un flag de formato separado para no duplicar --tc-format.
+    bool run_cutlass = false;
 };
 
 // Dimensiones de la salida: derivadas de la formula estandar de convolucion.
@@ -168,24 +264,32 @@ static void print_usage(const char* prog) {
         << "  " << prog << " [--N N] [--C C] [--H H] [--W W] [--K K] [--R R] [--S S]\n"
         << "             [--pad_h P] [--pad_w P] [--stride_h S] [--stride_w S]\n"
         << "             [--dilation_h D] [--dilation_w D] [--iters I] [--double]\n"
-        << "             [--tc-format fp16|bf16|both]\n\n"
+        << "             [--tc-format fp16|bf16|both] [--cutlass]\n\n"
         << "Descripcion:\n"
-        << "  Compara cuatro rutas de convolucion 2D hacia adelante:\n"
+        << "  Compara hasta cinco rutas de convolucion 2D hacia adelante:\n"
         << "    1. CPU im2col + OpenBLAS (FP32/FP64)\n"
         << "    2. GPU cuDNN clasico (FP32/FP64, sin Tensor Cores)\n"
         << "    3. GPU cuDNN con Tensor Cores (FP16/BF16 entrada, FP32 acumulacion)\n"
         << "    4. GPU im2col FP16 + kernel WMMA custom (Tensor Cores directos)\n"
+        << "    5. GPU CUTLASS ImplicitGemmConvolution (FP16/BF16, opt-in con --cutlass)\n"
         << "  La ruta WMMA (4) requiere K multiplo de 64, outH*outW multiplo de 64\n"
         << "  y C*R*S multiplo de 32. Si no se cumple se omite con aviso.\n"
         << "  Con --double solo se ejecutan las rutas 1 y 2.\n"
-        << "  --tc-format selecciona el formato de la ruta 3 (por defecto fp16).\n"
-        << "  BF16 requiere GPU Ampere o superior (compute capability >= 8.0).\n\n"
+        << "  --tc-format selecciona el formato de las rutas 3 y 5 (por defecto fp16).\n"
+        << "  BF16 requiere GPU Ampere o superior (compute capability >= 8.0).\n"
+        << "  --cutlass activa la ruta 5 (desactivada por defecto); usa layout NHWC\n"
+        << "  internamente (conversion NCHW<->NHWC documentada junto al codigo de la ruta).\n"
+        << "  CUTLASS puede rechazar en tiempo de ejecucion formas no soportadas por su\n"
+        << "  iterador optimizado; en ese caso la ruta se omite con aviso, igual que la\n"
+        << "  ruta WMMA (4) con formas no divisibles.\n\n"
         << "Ejemplos:\n"
         << "  " << prog << "\n"
         << "  " << prog << " --N 1 --C 64 --H 224 --W 224 --K 64 --R 3 --S 3 --iters 10\n"
         << "  " << prog << " --double --N 1 --C 16 --H 64 --W 64 --K 32 --R 3 --S 3\n"
         << "  " << prog << " --N 1 --C 64 --H 64 --W 64 --K 64 --R 3 --S 3 --iters 2"
-        << " --tc-format bf16\n";
+        << " --tc-format bf16\n"
+        << "  " << prog << " --N 1 --C 64 --H 64 --W 64 --K 64 --R 3 --S 3 --iters 2"
+        << " --tc-format both --cutlass\n";
 }
 
 static int parse_int_arg(int& i, int argc, char** argv) {
@@ -224,6 +328,7 @@ static Options parse_args(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--dilation_w") == 0) opt.dilation_w = parse_int_arg(i, argc, argv);
         else if (std::strcmp(argv[i], "--iters")      == 0) opt.iters      = parse_int_arg(i, argc, argv);
         else if (std::strcmp(argv[i], "--double")     == 0) opt.use_double = true;
+        else if (std::strcmp(argv[i], "--cutlass")    == 0) opt.run_cutlass = true;
         else if (std::strcmp(argv[i], "--tc-format")  == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Falta valor para --tc-format\n";
@@ -1285,6 +1390,348 @@ static Metrics benchmark_gpu_wmma_conv(const std::vector<float>& x,
 }
 
 // =========================================================================
+// Ruta 5 - GPU CUTLASS ImplicitGemmConvolution (Tensor Cores, FP16/BF16)
+//
+// A diferencia de las rutas 3 (cuDNN) y 4 (WMMA propio), CUTLASS instancia
+// la convolucion como una plantilla C++ resuelta en tiempo de compilacion
+// (cutlass::conv::kernel::DefaultConv2dFprop) en vez de elegir un algoritmo
+// en tiempo de ejecucion. La estructura de esta ruta sigue casi literal el
+// ejemplo oficial examples/16_ampere_tensorop_conv2dfprop del repositorio
+// github.com/NVIDIA/cutlass (API 2.x, no CuTe/3.x) -- ver el comentario
+// junto al #include de CUTLASS mas arriba. Compilado y verificado en GPU
+// Ampere+ real contra CUTLASS v2.11.0 -- ver README.md.
+//
+// *** LAYOUT: NHWC, no NCHW ***
+// Toda esta ruta 5 usa cutlass::layout::TensorNHWC, tanto para la activacion
+// (N,H,W,C) como para el filtro (que CUTLASS trata con la misma clase de
+// layout, interpretando las dimensiones como K,R,S,C -- "KRSC") y para la
+// salida (N,outH,outW,K). El resto del archivo (CPU, cuDNN, WMMA) trabaja
+// en NCHW/KCRS. Por eso esta ruta:
+//   1. Sube x (NCHW) y w (KCRS) a GPU en FP32.
+//   2. Los convierte a NHWC/KRSC + FP16 o BF16 con convert_nchw_to_nhwc_kernel
+//      (kernel generico de transposicion+cast, parametrizado por las 4
+//      dimensiones -- funciona igual para activacion y filtro porque ambos
+//      son un arreglo 4D con el eje de canales en la posicion 1).
+//   3. Corre CUTLASS sobre esos buffers NHWC/KRSC, con salida NHWC FP32.
+//   4. Convierte la salida NHWC -> NCHW con convert_nhwc_to_nchw_float_kernel
+//      antes de copiarla a host, para que sea comparable elemento a elemento
+//      con y_ref/y_cpu/y_gpu/y_tc/y_wmma (todos NCHW).
+// Este paso de conversion es el punto real de riesgo de esta ruta: un error
+// de indices en cualquiera de los dos kernels de abajo produciria una salida
+// con error alto pero sin fallar la compilacion ni la ejecucion -- por eso
+// se comparan explicitamente contra la referencia FP64 y contra la CPU FP32,
+// igual que las otras rutas, en vez de asumir que "corrio sin abortar" basta.
+// =========================================================================
+
+// Transpone un tensor 4D FP32 de layout "canal en la posicion 1"
+// (NCHW para activaciones [N,C,H,W], KCRS para filtros [K,C,R,S]) a layout
+// "canal en la posicion 3" (NHWC / KRSC), casteando a la vez a ElementDst
+// (cutlass::half_t o cutlass::bfloat16_t). Sirve para ambos casos porque
+// solo depende de las 4 dimensiones (D0,D1,D2,D3), no de su significado.
+template <typename ElementDst>
+__global__ static void convert_nchw_to_nhwc_kernel(
+        const float* __restrict__ src, ElementDst* __restrict__ dst,
+        int D0, int D1, int D2, int D3) {
+    const long long idx   = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long total = static_cast<long long>(D0) * D1 * D2 * D3;
+    if (idx >= total) return;
+
+    // Descomponer idx segun el orden de almacenamiento NCHW/KCRS de src
+    // (D1 = canales, la dimension mas "externa" tras D0).
+    long long t = idx;
+    const int d3 = static_cast<int>(t % D3); t /= D3;
+    const int d2 = static_cast<int>(t % D2); t /= D2;
+    const int d1 = static_cast<int>(t % D1); t /= D1;
+    const int d0 = static_cast<int>(t);
+
+    // Recomponer el indice destino en NHWC/KRSC (D1 = canales pasa a ser la
+    // dimension mas "interna").
+    const long long dst_idx =
+        ((static_cast<long long>(d0) * D2 + d2) * D3 + d3) * D1 + d1;
+    dst[dst_idx] = static_cast<ElementDst>(src[idx]);
+}
+
+// Inverso de convert_nchw_to_nhwc_kernel, especializado para el caso de la
+// salida: NHWC FP32 (ElementOutput de CUTLASS en esta ruta) -> NCHW FP32,
+// para que y quede en el mismo layout que las demas rutas.
+__global__ static void convert_nhwc_to_nchw_float_kernel(
+        const float* __restrict__ src, float* __restrict__ dst,
+        int N, int H, int W, int C) {
+    const long long idx   = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long total = static_cast<long long>(N) * H * W * C;
+    if (idx >= total) return;
+
+    // src esta en NHWC: descomponer con C como dimension mas interna.
+    long long t = idx;
+    const int c = static_cast<int>(t % C); t /= C;
+    const int w = static_cast<int>(t % W); t /= W;
+    const int h = static_cast<int>(t % H); t /= H;
+    const int n = static_cast<int>(t);
+
+    // dst en NCHW.
+    const long long dst_idx =
+        ((static_cast<long long>(n) * C + c) * H + h) * W + w;
+    dst[dst_idx] = src[idx];
+}
+
+// Implementacion generica de la Ruta 5, parametrizada por el tipo de dato de
+// 16 bits de CUTLASS (cutlass::half_t o cutlass::bfloat16_t). Comparten toda
+// la logica salvo el tipo de operando; separarla en un template evita tener
+// dos copias que se puedan desincronizar (como pasaria si se duplicara a
+// mano, igual que benchmark_gpu_tensor_cores_conv/_bf16 en la ruta 3, que si
+// estan duplicadas porque alli cada una necesita su propio
+// cudnnConvolutionDescriptor_t -- aqui no hay ese impedimento).
+//
+// La seccion de configuracion de tipos de CUTLASS
+// (ThreadblockShape/WarpShape/InstructionShape/NumStages/EpilogueOp) y la
+// construccion de Conv2dProblemSize/Arguments de abajo siguen la estructura
+// de examples/16_ampere_tensorop_conv2dfprop, verificadas por compilacion y
+// ejecucion contra CUTLASS v2.11.0. Con otra version de CUTLASS, los puntos
+// con mas probabilidad de no coincidir exactamente son la lista de
+// parametros de template de DefaultConv2dFprop, el orden de argumentos del
+// constructor de Conv2dProblemSize, y los campos de ImplicitGemm::Arguments
+// -- comparar contra el ejemplo real de esa version si algo no coincide.
+#if HAVE_CUTLASS
+template <typename ElementIO>
+static Metrics run_cutlass_conv_impl(const std::vector<float>& x,
+                                      const std::vector<float>& w,
+                                      std::vector<float>& y,
+                                      const Options& opt,
+                                      const OutputDims& d,
+                                      const char* format_label) {
+    using ElementInputA        = ElementIO;
+    using ElementInputB        = ElementIO;
+    using ElementOutput        = float;
+    using ElementAccumulator   = float;
+    using ElementComputeEpilogue = float;
+
+    using LayoutInputA = cutlass::layout::TensorNHWC;
+    using LayoutInputB = cutlass::layout::TensorNHWC;  // "KRSC", ver nota de layout arriba.
+    using LayoutOutput = cutlass::layout::TensorNHWC;
+
+    // Forma de tile / instruccion de ejemplo 16 (Ampere, sm_80). 128x128x32
+    // por bloque, 64x64x32 por warp, mma.sync 16x8x16 -- valida para FP16 y
+    // BF16 por igual en Ampere (misma instruccion HMMA de 16 bits).
+    using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+    using WarpShape        = cutlass::gemm::GemmShape<64, 64, 32>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput,
+        128 / cutlass::sizeof_bits<ElementOutput>::value,
+        ElementAccumulator,
+        ElementComputeEpilogue>;
+
+    using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>;
+
+    // NumStages=3: pipeline multietapa de Ampere (analogo al cp.async de 3
+    // etapas de la ruta 4 de este mismo archivo); Turing (sm_75) usaria 2.
+    constexpr int NumStages = 3;
+
+    using Conv2dFpropKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+        ElementInputA, LayoutInputA,
+        ElementInputB, LayoutInputB,
+        ElementOutput, LayoutOutput,
+        ElementAccumulator,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        ThreadblockShape,
+        WarpShape,
+        InstructionShape,
+        EpilogueOp,
+        SwizzleThreadBlock,
+        NumStages,
+        cutlass::arch::OpMultiplyAdd,
+        cutlass::conv::IteratorAlgorithm::kOptimized
+    >::Kernel;
+
+    using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<Conv2dFpropKernel>;
+
+    // --- Forma del problema, en las coordenadas NHWC/KRSC de CUTLASS ---
+    const cutlass::Tensor4DCoord input_size {opt.N, opt.H, opt.W, opt.C};
+    const cutlass::Tensor4DCoord filter_size{opt.K, opt.R, opt.S, opt.C};
+    const cutlass::Tensor4DCoord padding    {opt.pad_h, opt.pad_h, opt.pad_w, opt.pad_w};
+    const cutlass::MatrixCoord   conv_stride{opt.stride_h, opt.stride_w};
+    const cutlass::MatrixCoord   dilation   {opt.dilation_h, opt.dilation_w};
+
+    // El constructor de Conv2dProblemSize usado aqui
+    // (input/filter/padding/stride/dilation/mode/split_k_slices, sin
+    // output_size explicito) calcula P/Q (alto/ancho de salida)
+    // internamente con la misma formula estandar que compute_output_dims()
+    // de este archivo. Se valida ese supuesto explicitamente mas abajo
+    // (comparando N/P/Q/K contra d) en vez de confiar en que ambas formulas
+    // coincidan sin chequeo.
+    const cutlass::conv::Conv2dProblemSize problem_size(
+        input_size, filter_size, padding, conv_stride, dilation,
+        cutlass::conv::Mode::kCrossCorrelation,
+        /*split_k_slices=*/1);
+
+    // problem_size.output_size() devuelve int64_t (el conteo total de
+    // elementos N*P*Q*K), no un Tensor4DCoord -- la forma 4D se construye
+    // directamente desde los campos N/P/Q/K de Conv2dProblemSize.
+    const cutlass::Tensor4DCoord cutlass_output_size(
+        problem_size.N, problem_size.P, problem_size.Q, problem_size.K);
+    if (cutlass_output_size.n() != d.outN || cutlass_output_size.h() != d.outH ||
+        cutlass_output_size.w() != d.outW || cutlass_output_size.c() != d.outC) {
+        std::cerr << "CUTLASS conv " << format_label << " omitida: "
+                  << "output_size() de CUTLASS (" << cutlass_output_size.n() << ","
+                  << cutlass_output_size.h() << "," << cutlass_output_size.w() << ","
+                  << cutlass_output_size.c() << ") no coincide con la formula de "
+                  << "compute_output_dims() de este archivo (" << d.outN << "," << d.outH
+                  << "," << d.outW << "," << d.outC << "). Revisar la formula de padding/"
+                  << "stride/dilation de Conv2dProblemSize contra el ejemplo oficial.\n";
+        return Metrics{};
+    }
+
+    // --- Subir x (NCHW) y w (KCRS) en FP32, convertir a NHWC/KRSC ElementIO ---
+    float* d_x_fp32 = nullptr;
+    float* d_w_fp32 = nullptr;
+    ElementInputA* d_x_nhwc = nullptr;
+    ElementInputB* d_w_nhwc = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_x_fp32, x.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_w_fp32, w.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_x_nhwc, x.size() * sizeof(ElementInputA)));
+    CHECK_CUDA(cudaMalloc(&d_w_nhwc, w.size() * sizeof(ElementInputB)));
+    CHECK_CUDA(cudaMemcpy(d_x_fp32, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_w_fp32, w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    {
+        const int total_x  = static_cast<int>(x.size());
+        const int blocks_x = (total_x + kConversionThreads - 1) / kConversionThreads;
+        convert_nchw_to_nhwc_kernel<ElementInputA><<<blocks_x, kConversionThreads>>>(
+            d_x_fp32, d_x_nhwc, opt.N, opt.C, opt.H, opt.W);
+        CHECK_CUDA(cudaGetLastError());
+
+        const int total_w  = static_cast<int>(w.size());
+        const int blocks_w = (total_w + kConversionThreads - 1) / kConversionThreads;
+        convert_nchw_to_nhwc_kernel<ElementInputB><<<blocks_w, kConversionThreads>>>(
+            d_w_fp32, d_w_nhwc, opt.K, opt.C, opt.R, opt.S);
+        CHECK_CUDA(cudaGetLastError());
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaFree(d_x_fp32));
+    CHECK_CUDA(cudaFree(d_w_fp32));
+
+    // Salida NHWC FP32. beta=0 => el tensor "C" del epilogo no se lee: se
+    // reutiliza el mismo buffer de salida como tensor_c y tensor_d (patron
+    // habitual en los ejemplos de CUTLASS para evitar una allocacion extra).
+    ElementOutput* d_y_nhwc = nullptr;
+    float*         d_y_nchw = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_y_nhwc, y.size() * sizeof(ElementOutput)));
+    CHECK_CUDA(cudaMalloc(&d_y_nchw, y.size() * sizeof(float)));
+
+    const cutlass::TensorRef<ElementInputA, LayoutInputA> tensor_a(
+        d_x_nhwc, LayoutInputA::packed(input_size));
+    const cutlass::TensorRef<ElementInputB, LayoutInputB> tensor_b(
+        d_w_nhwc, LayoutInputB::packed(filter_size));
+    const cutlass::TensorRef<ElementOutput, LayoutOutput> tensor_c(
+        d_y_nhwc, LayoutOutput::packed(cutlass_output_size));
+    const cutlass::TensorRef<ElementOutput, LayoutOutput> tensor_d(
+        d_y_nhwc, LayoutOutput::packed(cutlass_output_size));
+
+    const ElementComputeEpilogue alpha(1);
+    const ElementComputeEpilogue beta(0);
+
+    // VERIFICAR EN PACCA: orden y numero de campos de ImplicitGemm::Arguments
+    // (problem_size, tensor_a, tensor_b, tensor_c, tensor_d, {alpha, beta}).
+    // Es el mismo orden que usa examples/16_ampere_tensorop_conv2dfprop de
+    // memoria, pero es exactamente el tipo de detalle que cambia entre
+    // versiones de CUTLASS sin avisar en tiempo de compilacion (los campos
+    // son todos convertibles entre si via inicializacion agregada).
+    typename ImplicitGemm::Arguments arguments{
+        problem_size,
+        tensor_a,
+        tensor_b,
+        tensor_c,
+        tensor_d,
+        {alpha, beta}
+    };
+
+    ImplicitGemm implicit_gemm_op;
+
+    // can_implement() es la forma de CUTLASS de decir "esta combinacion de
+    // forma/tipo/algoritmo no esta soportada" en tiempo de ejecucion -- a
+    // diferencia de la ruta 4 (WMMA propio), que valida divisibilidad a mano
+    // antes de lanzar el kernel, aqui se deja que la propia libreria decida
+    // y simplemente se omite la ruta con aviso si dice que no puede, en vez
+    // de abortar todo el binario (CHECK_CUTLASS aborta; aqui no se usa esa
+    // macro a proposito para este chequeo puntual).
+    cutlass::Status status = implicit_gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        std::cerr << "CUTLASS conv " << format_label << " omitida: can_implement()"
+                     " devolvio " << cutlass::cutlassGetStatusString(status)
+                  << " para N=" << opt.N << " C=" << opt.C << " H=" << opt.H
+                  << " W=" << opt.W << " K=" << opt.K << " R=" << opt.R
+                  << " S=" << opt.S << ".\n";
+        CHECK_CUDA(cudaFree(d_x_nhwc));
+        CHECK_CUDA(cudaFree(d_w_nhwc));
+        CHECK_CUDA(cudaFree(d_y_nhwc));
+        CHECK_CUDA(cudaFree(d_y_nchw));
+        return Metrics{};
+    }
+
+    const size_t workspace_size = implicit_gemm_op.get_workspace_size(arguments);
+    void* d_workspace = nullptr;
+    if (workspace_size > 0) CHECK_CUDA(cudaMalloc(&d_workspace, workspace_size));
+
+    CHECK_CUTLASS(implicit_gemm_op.initialize(arguments, d_workspace));
+
+    for (int i = 0; i < kWarmupIters; ++i) {
+        CHECK_CUTLASS(implicit_gemm_op());
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CudaEventTimer timer;
+    timer.start();
+    for (int i = 0; i < opt.iters; ++i) {
+        CHECK_CUTLASS(implicit_gemm_op());
+    }
+    const float total_ms = timer.stop_and_elapsed_ms();
+
+    // Convertir salida NHWC -> NCHW fuera del intervalo medido (ver nota de
+    // layout al inicio de esta ruta).
+    const int y_count     = static_cast<int>(y.size());
+    const int conv_blocks = (y_count + kConversionThreads - 1) / kConversionThreads;
+    convert_nhwc_to_nchw_float_kernel<<<conv_blocks, kConversionThreads>>>(
+        d_y_nhwc, d_y_nchw, d.outN, d.outH, d.outW, d.outC);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(y.data(), d_y_nchw, y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    if (d_workspace) CHECK_CUDA(cudaFree(d_workspace));
+    CHECK_CUDA(cudaFree(d_y_nchw));
+    CHECK_CUDA(cudaFree(d_y_nhwc));
+    CHECK_CUDA(cudaFree(d_x_nhwc));
+    CHECK_CUDA(cudaFree(d_w_nhwc));
+
+    return build_metrics(opt, d, static_cast<double>(total_ms) / opt.iters);
+}
+
+// Instancia FP16 de la Ruta 5. Nombre pedido explicitamente para esta ruta
+// (en vez de benchmark_gpu_cutlass_conv, que seguiria mas de cerca el
+// prefijo benchmark_gpu_* de las rutas 2-4).
+static Metrics run_cutlass_conv(const std::vector<float>& x,
+                                 const std::vector<float>& w,
+                                 std::vector<float>& y,
+                                 const Options& opt,
+                                 const OutputDims& d) {
+    return run_cutlass_conv_impl<cutlass::half_t>(x, w, y, opt, d, "FP16");
+}
+
+// Instancia BF16 de la Ruta 5, analoga a benchmark_gpu_tensor_cores_conv_bf16
+// en la ruta 3 (mismo patron: una funcion por formato). Requiere Ampere o
+// superior -- ya validado en run_experiment_float antes de llamar aqui,
+// igual que para la ruta 3 BF16.
+static Metrics run_cutlass_conv_bf16(const std::vector<float>& x,
+                                      const std::vector<float>& w,
+                                      std::vector<float>& y,
+                                      const Options& opt,
+                                      const OutputDims& d) {
+    return run_cutlass_conv_impl<cutlass::bfloat16_t>(x, w, y, opt, d, "BF16");
+}
+#endif  // HAVE_CUTLASS
+
+// =========================================================================
 // Reportes finales
 // =========================================================================
 
@@ -1303,7 +1750,15 @@ static void print_float_report(const Options& opt,
                                 const ErrorMetrics& tc_vs_cpu_err,
                                 const ErrorMetrics& wmma_vs_cpu_err,
                                 const ErrorMetrics& wmma_vs_tc_err,
-                                const ErrorMetrics& tc_bf16_vs_cpu_err) {
+                                const ErrorMetrics& tc_bf16_vs_cpu_err,
+                                // Ruta 5 (CUTLASS) -- parametros agregados al final de la
+                                // lista para no reordenar/tocar los de las rutas 1-4.
+                                const Metrics& cutlass_fp16,
+                                const Metrics& cutlass_bf16,
+                                const ErrorMetrics& cutlass_fp16_err,
+                                const ErrorMetrics& cutlass_fp16_vs_cpu_err,
+                                const ErrorMetrics& cutlass_bf16_err,
+                                const ErrorMetrics& cutlass_bf16_vs_cpu_err) {
     const bool show_fp16 = (opt.tc_format == TensorCoreFormat::FP16 ||
                             opt.tc_format == TensorCoreFormat::Both);
     const bool show_bf16 = (opt.tc_format == TensorCoreFormat::BF16 ||
@@ -1371,6 +1826,47 @@ static void print_float_report(const Options& opt,
     } else {
         std::cout << "GPU WMMA custom             : omitida (alineacion no cumplida)\n";
     }
+
+    // Ruta 5 (CUTLASS ImplicitGemmConvolution). Solo se corrio si --cutlass
+    // estaba activo; cutlass_fp16.ms/cutlass_bf16.ms quedan en 0 si la ruta
+    // no corrio (flag desactivado, formato no pedido via --tc-format, o
+    // can_implement() la rechazo en tiempo de ejecucion -- ver run_cutlass_conv_impl).
+    if (opt.run_cutlass && show_fp16) {
+        if (cutlass_fp16.ms > 0.0) {
+            std::cout << "\nGPU CUTLASS ImplicitGemm FP16 - tiempo   : " << cutlass_fp16.ms << " ms\n";
+            std::cout << "GPU CUTLASS ImplicitGemm FP16 - rend.    : " << cutlass_fp16.gflops
+                      << " GFLOP/s (" << cutlass_fp16.tflops << " TFLOP/s)\n";
+            std::cout << "Speedup CUTLASS FP16 vs CPU              : " << cpu.ms / cutlass_fp16.ms << "x\n";
+            // Comparacion (c) del README: libreria FP32 (ruta 2) vs. CUTLASS (ruta 5).
+            std::cout << "Speedup CUTLASS FP16 vs FP32 escalar     : " << gpu.ms / cutlass_fp16.ms << "x\n";
+            std::cout << "Error max abs vs FP64                    : " << cutlass_fp16_err.max_abs << "\n";
+            std::cout << "Error relativo L2 vs FP64                : " << cutlass_fp16_err.rel_l2 << "\n";
+            std::cout << "Error max abs vs CPU FP32                : " << cutlass_fp16_vs_cpu_err.max_abs << "\n";
+            std::cout << "Error rel L2 vs CPU FP32                 : " << cutlass_fp16_vs_cpu_err.rel_l2 << "\n";
+            std::cout << "Speedup CUTLASS FP16 vs cuDNN TC         : " << tc.ms / cutlass_fp16.ms << "x\n";
+        } else {
+            std::cout << "\nGPU CUTLASS ImplicitGemm FP16            : omitida (ver aviso mas arriba)\n";
+        }
+    }
+    if (opt.run_cutlass && show_bf16) {
+        if (cutlass_bf16.ms > 0.0) {
+            std::cout << "\nGPU CUTLASS ImplicitGemm BF16 - tiempo   : " << cutlass_bf16.ms << " ms\n";
+            std::cout << "GPU CUTLASS ImplicitGemm BF16 - rend.    : " << cutlass_bf16.gflops
+                      << " GFLOP/s (" << cutlass_bf16.tflops << " TFLOP/s)\n";
+            std::cout << "Speedup CUTLASS BF16 vs CPU              : " << cpu.ms / cutlass_bf16.ms << "x\n";
+            std::cout << "Speedup CUTLASS BF16 vs FP32 escalar     : " << gpu.ms / cutlass_bf16.ms << "x\n";
+            std::cout << "Error max abs vs FP64                    : " << cutlass_bf16_err.max_abs << "\n";
+            std::cout << "Error relativo L2 vs FP64                : " << cutlass_bf16_err.rel_l2 << "\n";
+            std::cout << "Error max abs vs CPU FP32                : " << cutlass_bf16_vs_cpu_err.max_abs << "\n";
+            std::cout << "Error rel L2 vs CPU FP32                 : " << cutlass_bf16_vs_cpu_err.rel_l2 << "\n";
+            if (show_bf16 && tc_bf16.ms > 0.0) {
+                std::cout << "Speedup CUTLASS BF16 vs cuDNN TC BF16    : " << tc_bf16.ms / cutlass_bf16.ms << "x\n";
+            }
+        } else {
+            std::cout << "\nGPU CUTLASS ImplicitGemm BF16            : omitida (ver aviso mas arriba)\n";
+        }
+    }
+
     std::cout << "===============================================\n";
 }
 
@@ -1411,6 +1907,8 @@ static void run_experiment_float(const Options& opt) {
     std::vector<float> y_cpu(y_count, 0.0f), y_gpu(y_count, 0.0f);
     std::vector<float> y_tc(y_count, 0.0f),  y_wmma(y_count, 0.0f);
     std::vector<float> y_tc_bf16(y_count, 0.0f);
+    // Ruta 5 (CUTLASS): buffers de salida separados, mismo patron que y_tc/y_tc_bf16.
+    std::vector<float> y_cutlass_fp16(y_count, 0.0f), y_cutlass_bf16(y_count, 0.0f);
     initialize_matrix_float(x);
     initialize_matrix_float(w);
 
@@ -1456,6 +1954,38 @@ static void run_experiment_float(const Options& opt) {
         tc_bf16_vs_cpu = compare_float_vectors(y_cpu, y_tc_bf16);
     }
 
+    // Ruta 5 (CUTLASS), opt-in con --cutlass; reutiliza want_fp16/want_bf16
+    // (derivados de --tc-format) para decidir que formato(s) correr, igual
+    // que la ruta 3.
+    Metrics cutlass_fp16{}, cutlass_bf16{};
+    ErrorMetrics cutlass_fp16_err{}, cutlass_fp16_vs_cpu{};
+    ErrorMetrics cutlass_bf16_err{}, cutlass_bf16_vs_cpu{};
+    if (opt.run_cutlass) {
+#if HAVE_CUTLASS
+        if (want_fp16) {
+            cutlass_fp16 = run_cutlass_conv(x, w, y_cutlass_fp16, opt, d);
+            if (cutlass_fp16.ms > 0.0) {
+                cutlass_fp16_err    = compare_fp64_ref_vs_fp32(y_ref, y_cutlass_fp16);
+                cutlass_fp16_vs_cpu = compare_float_vectors(y_cpu, y_cutlass_fp16);
+            }
+        }
+        if (want_bf16) {
+            cutlass_bf16 = run_cutlass_conv_bf16(x, w, y_cutlass_bf16, opt, d);
+            if (cutlass_bf16.ms > 0.0) {
+                cutlass_bf16_err    = compare_fp64_ref_vs_fp32(y_ref, y_cutlass_bf16);
+                cutlass_bf16_vs_cpu = compare_float_vectors(y_cpu, y_cutlass_bf16);
+            }
+        }
+#else
+        std::cerr << "Se pidio --cutlass pero el binario se compilo sin CUTLASS disponible"
+                     " en el include path.\n"
+                  << "Recompila agregando -I$CUTLASS_DIR/include, apuntando a un checkout de"
+                     " github.com/NVIDIA/cutlass (serie 2.x) -- ver REQUIREMENTS.md y"
+                     " Fase_2/Convolution/README.md." << std::endl;
+        std::exit(EXIT_FAILURE);
+#endif
+    }
+
     // Metricas primarias: contra el ground truth FP64 (objetivo especifico #3).
     const ErrorMetrics cpu_err       = compare_fp64_ref_vs_fp32(y_ref, y_cpu);
     const ErrorMetrics gpu_err       = compare_fp64_ref_vs_fp32(y_ref, y_gpu);
@@ -1468,7 +1998,10 @@ static void run_experiment_float(const Options& opt) {
 
     print_float_report(opt, cpu, gpu, tc, wmma, tc_bf16,
                        cpu_err, gpu_err, tc_err, wmma_err, tc_bf16_err,
-                       gpu_vs_cpu, tc_vs_cpu, wmma_vs_cpu, wmma_vs_tc, tc_bf16_vs_cpu);
+                       gpu_vs_cpu, tc_vs_cpu, wmma_vs_cpu, wmma_vs_tc, tc_bf16_vs_cpu,
+                       cutlass_fp16, cutlass_bf16,
+                       cutlass_fp16_err, cutlass_fp16_vs_cpu,
+                       cutlass_bf16_err, cutlass_bf16_vs_cpu);
 }
 
 static void run_experiment_double(const Options& opt) {

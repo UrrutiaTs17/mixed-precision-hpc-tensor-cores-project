@@ -1,25 +1,76 @@
+// Fase_2/Stencil/stencil_tensor_activation.cu
+//
 // Compilar con:
-// nvcc -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
-//      -gencode arch=compute_80,code=sm_80
+//   nvcc -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
+//        -gencode arch=compute_80,code=sm_80
 //
 // Ejecutar:
-// ./stencil_tc --nx 4096 --ny 4096 --iters 20 --tc both
+//   ./stencil_tc --nx 1024 --ny 1024 --iters 20 --tc both
 //
 // Validar Tensor Cores con Nsight Compute:
-// ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \
-//     --metrics sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed,\
-//sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \
-//     ./stencil_tc --nx 4096 --ny 4096 --iters 20 --tc fp16
+//   ncu --kernel-name regex:.*stencil2d_wmma_kernel.* \
+//       --metrics sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed,\
+// sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed \
+//       ./stencil_tc --nx 1024 --ny 1024 --iters 20 --tc fp16
 //
 // Este programa compara tres rutas para un stencil 2D de 5 puntos:
-// 1. CPU FP32 serial como referencia numerica.
-// 2. GPU CUDA FP32 clasico, sin Tensor Cores.
-// 3. GPU Tensor Core con WMMA: entradas FP16/BF16 y salida/acumulacion FP32.
+//   1. CPU FP32 serial como referencia de trazabilidad con Fase 1.
+//   2. GPU CUDA FP32 clasico, sin Tensor Cores (misma ruta que Fase 1, aqui
+//      como punto de comparacion directo contra la ruta Tensor Core).
+//   3. GPU Tensor Core con WMMA: entradas FP16/BF16 y salida/acumulacion FP32.
 //
-// La ruta WMMA reescribe cada tile interior 16x16 como cinco operaciones MMA:
-// left*0.25I + right*0.25I + 0.25I*up + 0.25I*down + center*(-I).
-// Es una adaptacion didactica para validar activacion de Tensor Cores en stencil;
-// no pretende ser el stencil mas eficiente posible en memoria.
+// A diferencia de GEMM y Convolucion, Stencil NO usa cuBLAS/cuDNN: no existe
+// aqui una "ruta de biblioteca" con la que comparar. Las unicas dos rutas de
+// GPU son el kernel CUDA clasico (arriba) y el kernel WMMA propio (abajo);
+// ambas son codigo propio con el mismo nivel de esfuerzo de optimizacion, lo
+// que hace de Stencil el unico de los tres kernels donde "con Tensor Cores"
+// vs. "sin Tensor Cores" es una comparacion limpia de entrada. Ver
+// Fase_2/Stencil/README.md para el detalle.
+//
+// --- La reformulacion WMMA (LO MAS IMPORTANTE DE ESTE ARCHIVO) ---
+//
+// wmma::mma_sync solo sabe hacer una cosa: multiplicar dos matrices 16x16 y
+// acumular el resultado (C += A*B). No existe una operacion de Tensor Core
+// que sume cinco vecinos y reste el centro directamente. La idea de este
+// kernel (stencil2d_wmma_kernel, abajo) es reescribir esa suma de 5 puntos
+// como una SUMA DE PRODUCTOS DE MATRICES, para que cada termino se pueda
+// ejecutar como un mma_sync:
+//
+//     salida = 0.25*arriba + 0.25*abajo + 0.25*izquierda + 0.25*derecha - centro
+//
+// se reescribe, para cada tile 16x16, como cinco multiplicaciones matriciales
+// contra una matriz identidad ESCALADA (I es la identidad 16x16):
+//
+//     salida = izquierda*(0.25I) + derecha*(0.25I) + (0.25I)*arriba
+//            + (0.25I)*abajo     + centro*(-I)
+//
+// Multiplicar una matriz X por (cI) para un escalar c dispersa cada fila de
+// X escalada por c en la posicion correspondiente de la fila de salida --es
+// decir, X*(cI) = c*X (y (cI)*X = c*X por el otro lado). Encadenando cinco
+// mma_sync sobre el mismo acumulador (acc_frag, inicializado en 0 con
+// wmma::fill_fragment) se obtiene exactamente la suma de arriba, con cada
+// termino calculado por el pipeline de Tensor Cores en vez de por ALUs
+// escalares. Es una adaptacion DIDACTICA para activar y validar Tensor Cores
+// en un kernel de stencil (que no es una multiplicacion de matrices por
+// naturaleza) -- no pretende ser el stencil mas eficiente posible en trafico
+// de memoria: mover un tile 5 veces por 5 mma_sync tiene mucho mas overhead
+// que el simple __syncwarp() + 4 sumas + 1 resta del kernel FP32 clasico. La
+// ganancia que se mide aqui es la de USAR Tensor Cores, no la de un stencil
+// optimizado en ancho de banda.
+//
+// identity_pos guarda 0.25*I (se usa para los 4 vecinos); identity_neg guarda
+// -1*I (se usa para el centro). Ambas se calculan una sola vez en el host
+// (initialize_scaled_identity) y se copian a GPU antes del bucle de
+// benchmark: son constantes para toda la corrida, no dependen de los datos.
+//
+// Migracion: version limpia y documentada de
+// old/Fase_2/Stencil/stencil_tensor_activation.cu, sin cambios de logica
+// numerica. El cambio de fondo respecto al original es de infraestructura,
+// no de aritmetica: las macros/estructuras de common.cuh (CHECK_CUDA,
+// CudaEventTimer, Metrics, ErrorMetrics, compare_*) se toman ahora de
+// common/cuda_checks.cuh y common/metrics.cuh (ver common/README.md) en vez
+// de duplicarse localmente; sus firmas son identicas a las que ya usaba este
+// archivo, asi que ningun sitio de llamada cambio.
 
 #include <mma.h>
 
@@ -39,10 +90,17 @@
 
 namespace {
 
-#include "../common.cuh"
+#include "../../common/cuda_checks.cuh"
+#include "../../common/metrics.cuh"
 
 using namespace nvcuda;
 
+// Lado del tile cuadrado (filas = columnas = k, en la convencion M=N=K de
+// WMMA) sobre el que operan los fragmentos de Tensor Core. 16 es una
+// restriccion de la API WMMA para T=half/__nv_bfloat16 con acumulador FP32
+// en las arquitecturas objetivo de este proyecto (Volta/Ampere): no es un
+// parametro de tuning, sino un valor fijado por la forma de fragmento que
+// wmma::fragment<..., 16, 16, 16, ...> soporta, por eso no es un flag de CLI.
 constexpr int kTile = 16;
 constexpr int kWarpThreads = 32;
 
@@ -65,6 +123,11 @@ enum class TensorCoreMode {
     Both
 };
 
+// Parametros de un experimento, resueltos por parse_args() a partir de flags
+// de linea de comandos. tc_mode por defecto es Both: a diferencia de GEMM y
+// Convolucion (donde el codigo original solo corria un formato por defecto y
+// eso se corrigio en su migracion), Stencil ya ejecutaba FP16 y BF16 por
+// defecto -- no hay nada que corregir aqui, se conserva tal cual.
 struct Options {
     int nx = 2048;
     int ny = 2048;
@@ -72,6 +135,7 @@ struct Options {
     TensorCoreMode tc_mode = TensorCoreMode::Both;
 };
 
+// Indice lineal (row-major) de la celda (x, y) en una grilla de ancho nx.
 __host__ __device__ inline int idx2d(int x, int y, int nx) {
     return y * nx + x;
 }
@@ -89,6 +153,9 @@ static void print_usage(const char* prog) {
         << "  " << prog << " --nx 4096 --ny 4096 --iters 20 --tc bf16\n";
 }
 
+// Lee el valor entero que sigue al flag argv[i] (p. ej. "--nx" "1024") y
+// avanza i para que el bucle de parse_args no lo vuelva a procesar. Aborta
+// si el flag es el ultimo argumento.
 static int parse_int_arg(int& i, int argc, char** argv) {
     if (i + 1 >= argc) {
         std::cerr << "Falta valor para " << argv[i] << "\n";
@@ -106,6 +173,8 @@ static TensorCoreMode parse_tc_mode(const char* value) {
     std::exit(EXIT_FAILURE);
 }
 
+// Parsea argv en un Options; aborta con print_usage() ante flags no
+// reconocidos o valores fuera de rango (nx/ny < 3, iters <= 0).
 static Options parse_args(int argc, char** argv) {
     Options opt;
     for (int i = 1; i < argc; ++i) {
@@ -138,6 +207,10 @@ static Options parse_args(int argc, char** argv) {
     return opt;
 }
 
+// Imprime las caracteristicas de la GPU activa (device 0), incluyendo
+// relojes de GPU/memoria que Fase 1 no reportaba -- utiles aqui porque el
+// rendimiento de Tensor Cores depende mas del reloj sostenido que el kernel
+// FP32 clasico, limitado por ancho de banda.
 static void print_gpu_info() {
     int device_count = 0;
     CHECK_CUDA(cudaGetDeviceCount(&device_count));
@@ -181,6 +254,9 @@ static void print_gpu_info() {
     std::cout << "===========================================================\n\n";
 }
 
+// WMMA FP16 requiere Compute Capability >= 7.0 (Volta). Se valida contra la
+// GPU activa antes de lanzar cualquier kernel Tensor Core para fallar con un
+// mensaje claro en vez de un error CUDA opaco de "invalid instruction".
 static bool device_supports_fp16_tensor_cores() {
     int dev = 0;
     cudaDeviceProp prop;
@@ -189,6 +265,8 @@ static bool device_supports_fp16_tensor_cores() {
     return prop.major >= 7;
 }
 
+// WMMA BF16 requiere Compute Capability >= 8.0 (Ampere): BF16 no existia en
+// Tensor Cores antes de Ampere.
 static bool device_supports_bf16_tensor_cores() {
     int dev = 0;
     cudaDeviceProp prop;
@@ -197,10 +275,17 @@ static bool device_supports_bf16_tensor_cores() {
     return prop.major >= 8;
 }
 
+// FLOPs de una aplicacion completa del stencil: 5 por punto interior (3
+// sumas + 1 multiplicacion + 1 resta), igual que en Fase 1. Los puntos de
+// borde no cuentan porque solo se copian.
 static double stencil_flops(int nx, int ny) {
     return 5.0 * static_cast<double>(nx - 2) * static_cast<double>(ny - 2);
 }
 
+// Empaqueta un tiempo medio en ms en Metrics (ms/gflops/tflops), calculando
+// el rendimiento a partir de stencil_flops. Punto unico de esta formula para
+// que las cuatro rutas (CPU, GPU FP32, WMMA FP16, WMMA BF16) reporten
+// GFLOP/s de forma consistente.
 static Metrics build_metrics(int nx, int ny, double avg_ms) {
     Metrics m;
     m.ms = avg_ms;
@@ -209,6 +294,12 @@ static Metrics build_metrics(int nx, int ny, double avg_ms) {
     return m;
 }
 
+// Genera la grilla de entrada: onda seno/coseno de baja frecuencia mas una
+// perturbacion determinista (sin RNG, a diferencia de Fase 1) derivada de
+// (x + 3y) mod 17. Determinista sin semilla porque esta version compara
+// tambien contra una referencia FP64 bit-a-bit reproducible (ver
+// compute_cpu_stencil_fp64): cualquier fuente de aleatoriedad complicaria
+// esa comparacion sin aportar nada a lo que se quiere medir aqui.
 static void initialize_grid(std::vector<float>& v, int nx, int ny) {
     for (int y = 0; y < ny; ++y) {
         for (int x = 0; x < nx; ++x) {
@@ -220,6 +311,8 @@ static void initialize_grid(std::vector<float>& v, int nx, int ny) {
     }
 }
 
+// Referencia CPU FP32 serial: mismo esquema que Fase 1 (una pasada de
+// calentamiento, luego `iters` pasadas cronometradas con std::chrono).
 static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
                                      std::vector<float>& out,
                                      int nx,
@@ -278,6 +371,9 @@ static void compute_cpu_stencil_fp64(const std::vector<double>& in,
     }
 }
 
+// Kernel GPU CUDA clasico (sin Tensor Cores), FP32: el mismo esquema de
+// 5 puntos que el kernel de Fase 1, para servir de comparacion directa
+// contra la ruta WMMA de abajo sin diferencias de version.
 __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx, int ny) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -296,6 +392,10 @@ __global__ static void stencil2d_fp32_kernel(const float* in, float* out, int nx
     out[idx2d(x, y, nx)] = 0.25f * (up + down + left + right) - center;
 }
 
+// Ruta GPU CUDA clasica: copia la entrada, calienta con kWarmupIters
+// pasadas, cronometra `iters` lanzamientos con CudaEventTimer (tiempo de GPU
+// puro) y trae el resultado de vuelta. Mismo patron que run_gpu_stencil de
+// Fase 1, adaptado al cronometro compartido (CudaEventTimer) de common/.
 static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
                                           std::vector<float>& out,
                                           int nx,
@@ -335,6 +435,10 @@ static Metrics benchmark_gpu_fp32_stencil(const std::vector<float>& in,
     return build_metrics(nx, ny, static_cast<double>(total_ms) / iters);
 }
 
+// Convierte un buffer FP32 a FP16, elemento a elemento (un hilo por
+// elemento). Se usa tanto para preparar la entrada de la ruta Tensor Core
+// como, reutilizado via convert_input_to_tc, para "aterrizar" la salida
+// (ver storage_roundtrip_max_abs mas abajo).
 __global__ static void convert_float_to_half_kernel(const float* src, __half* dst, int size) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
@@ -342,6 +446,7 @@ __global__ static void convert_float_to_half_kernel(const float* src, __half* ds
     }
 }
 
+// Igual que convert_float_to_half_kernel, pero a __nv_bfloat16.
 __global__ static void convert_float_to_bfloat16_kernel(const float* src,
                                                         __nv_bfloat16* dst,
                                                         int size) {
@@ -351,6 +456,10 @@ __global__ static void convert_float_to_bfloat16_kernel(const float* src,
     }
 }
 
+// Sobrecargas __device__ para convertir un valor Tensor Core (half o
+// bfloat16) a float dentro de un kernel, usadas por la rama de "tile
+// parcial" de stencil2d_wmma_kernel (donde no vale la pena montar
+// fragmentos WMMA para unas pocas celdas de borde).
 __device__ inline float tc_to_float(__half v) {
     return __half2float(v);
 }
@@ -367,6 +476,10 @@ static __nv_bfloat16 make_tc_value_bfloat16(float x) {
     return __float2bfloat16(x);
 }
 
+// Construye, en el host, una matriz identidad kTile x kTile escalada por
+// `scale` (0.25 para los 4 vecinos, -1.0 para el centro -- ver la nota de
+// reformulacion WMMA al inicio del archivo). Especializada por tipo porque
+// half y bfloat16 no comparten una funcion de conversion float->T comun.
 template <typename T>
 static void initialize_scaled_identity(std::vector<T>& mat, float scale);
 
@@ -386,6 +499,38 @@ void initialize_scaled_identity<__nv_bfloat16>(std::vector<__nv_bfloat16>& mat, 
     }
 }
 
+// Kernel Tensor Core (WMMA): reformula el Laplaciano 2D de 5 puntos como
+// cinco multiplicaciones de matrices 16x16 acumuladas (ver la nota extensa
+// al inicio del archivo para la derivacion algebraica completa). Resumen
+// operativo:
+//
+//   1 warp = 1 tile de 16x16 celdas interiores. El grid es 1D sobre tiles
+//   linealizados (tiles_x * tiles_y en total); cada warp deriva su esquina
+//   (x0, y0) de su tile_id = blockIdx.x * kWarpsPerBlock + warp_id.
+//
+//   Si el tile cae completo dentro de la grilla (full_tile): los 32 hilos
+//   del warp cargan a shared memory sus 5 tiles vecinos (izquierda, derecha,
+//   arriba, abajo, centro) desde memoria global, uno por celda mediante
+//   __syncwarp() (no __syncthreads(): cada warp es independiente, y algunos
+//   warps del ultimo bloque pueden retornar antes por falta de trabajo sin
+//   bloquear a los demas). Luego arma los fragmentos WMMA y encadena los 5
+//   mma_sync sobre el mismo acumulador FP32 (acc_frag), en el orden
+//   izquierda, derecha, arriba, abajo, centro -- el orden no importa para el
+//   resultado (la suma en FP32 del acumulador es conmutativa en este caso:
+//   no hay cancelaciones catastroficas entre terminos de magnitud similar),
+//   solo se fija para que la traza de instrucciones sea reproducible.
+//
+//   Si el tile queda parcialmente fuera de la grilla (borde del dominio):
+//   NO vale la pena montar fragmentos WMMA para cubrir unas pocas celdas
+//   validas de un tile de 256; en su lugar cada hilo resuelve sus celdas
+//   asignadas con la formula escalar de siempre (via tc_to_float), igual
+//   que hace el kernel FP32 clasico en sus bordes.
+//
+// La entrada (T = __half o __nv_bfloat16) ya llego convertida por
+// convert_input_to_tc antes del lanzamiento; el acumulador y la salida son
+// siempre FP32 (WMMA en estas arquitecturas no acumula en 16 bits para esta
+// combinacion de tipos), asi que la unica perdida de precision del operando
+// ocurre al convertir la entrada a T, no durante la suma.
 template <typename T>
 __global__ static void stencil2d_wmma_kernel(const T* in,
                                              float* out,
@@ -442,6 +587,12 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         }
         __syncwarp();
 
+        // a_frag/b_frag: portadores reutilizables para cada uno de los 5
+        // operandos "de datos" (izquierda, derecha, arriba, abajo, centro).
+        // id_a_frag/id_pos_b_frag/id_neg_b_frag: las matrices identidad
+        // escaladas (0.25I y -I), cargadas una sola vez y reutilizadas en
+        // los 5 mma_sync -- son las mismas para los 4 vecinos (0.25I) y para
+        // el centro (-I), no cambian por tile ni por iteracion.
         wmma::fragment<wmma::matrix_a, kTile, kTile, kTile, T, wmma::row_major> a_frag;
         wmma::fragment<wmma::matrix_b, kTile, kTile, kTile, T, wmma::row_major> b_frag;
         wmma::fragment<wmma::matrix_a, kTile, kTile, kTile, T, wmma::row_major> id_a_frag;
@@ -455,18 +606,23 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         wmma::load_matrix_sync(id_neg_b_frag, identity_neg, kTile);
         wmma::load_matrix_sync(id_a_frag, identity_pos, kTile);
 
+        // izquierda * 0.25I  ->  acc += 0.25 * izquierda
         wmma::load_matrix_sync(a_frag, left_tile, kTile);
         wmma::mma_sync(acc_frag, a_frag, id_pos_b_frag, acc_frag);
 
+        // derecha * 0.25I  ->  acc += 0.25 * derecha
         wmma::load_matrix_sync(a_frag, right_tile, kTile);
         wmma::mma_sync(acc_frag, a_frag, id_pos_b_frag, acc_frag);
 
+        // 0.25I * arriba  ->  acc += 0.25 * arriba
         wmma::load_matrix_sync(b_frag, up_tile, kTile);
         wmma::mma_sync(acc_frag, id_a_frag, b_frag, acc_frag);
 
+        // 0.25I * abajo  ->  acc += 0.25 * abajo
         wmma::load_matrix_sync(b_frag, down_tile, kTile);
         wmma::mma_sync(acc_frag, id_a_frag, b_frag, acc_frag);
 
+        // centro * (-I)  ->  acc += -1 * centro  (cierra el Laplaciano)
         wmma::load_matrix_sync(a_frag, center_tile, kTile);
         wmma::mma_sync(acc_frag, a_frag, id_neg_b_frag, acc_frag);
 
@@ -481,6 +637,8 @@ __global__ static void stencil2d_wmma_kernel(const T* in,
         return;
     }
 
+    // Tile parcial (toca el borde del dominio): resolucion escalar celda a
+    // celda, sin WMMA -- ver la explicacion en el comentario del kernel.
     for (int linear = lane; linear < kTile * kTile; linear += kWarpThreads) {
         const int local_x = linear % kTile;
         const int local_y = linear / kTile;
@@ -544,6 +702,12 @@ static double storage_roundtrip_max_abs(const std::vector<float>& computed,
     return max_abs;
 }
 
+// Ruta GPU Tensor Core: convierte la entrada FP32 a T (half o bfloat16),
+// prepara las identidades escaladas, calienta con kWarmupIters pasadas de
+// stencil2d_wmma_kernel, cronometra `iters` lanzamientos con CudaEventTimer,
+// y ademas convierte la salida (que el kernel siempre produce en FP32) de
+// vuelta a T para poder medir el error de solo-almacenamiento en 16 bits
+// (ver storage_roundtrip_max_abs).
 template <typename T>
 static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
                                                  std::vector<float>& out,
@@ -605,11 +769,11 @@ static Metrics benchmark_gpu_tensor_core_stencil(const std::vector<float>& in,
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaMemcpy(out.data(), d_out, count * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // NUEVO: el resultado WMMA solo existia en float (d_out). Se reutiliza
-    // el mismo conversor ya usado para la entrada (convert_input_to_tc)
-    // para tambien convertir y almacenar la salida en el tipo reducido:
-    // asi el resultado queda realmente guardado en FP16/BF16, no solo
-    // calculado internamente en float.
+    // El resultado WMMA solo existia en float (d_out) dentro del acumulador
+    // de Tensor Cores. Se reutiliza el mismo conversor ya usado para la
+    // entrada (convert_input_to_tc) para tambien convertir y almacenar la
+    // salida en el tipo reducido: asi el resultado queda realmente guardado
+    // en FP16/BF16, no solo calculado internamente en float.
     convert_input_to_tc<T>(d_out, d_out_reduced, count);
     CHECK_CUDA(cudaDeviceSynchronize());
     out_reduced.resize(count);
@@ -662,6 +826,10 @@ static void print_nsight_hint(const char* exe_name) {
     std::cout << "      " << exe_name << " --nx 4096 --ny 4096 --iters 20 --tc fp16\n";
 }
 
+// Orquesta el experimento completo: valida soporte de Tensor Cores en la GPU
+// activa, genera la entrada, calcula la referencia FP64 y la CPU FP32, corre
+// la ruta GPU FP32 clasica y, segun opt.tc_mode, una o ambas rutas WMMA
+// (FP16 y/o BF16), imprimiendo tiempos/rendimiento/error de cada una.
 static void run_benchmark(const Options& opt, const char* exe_name) {
     print_configuration(opt);
 

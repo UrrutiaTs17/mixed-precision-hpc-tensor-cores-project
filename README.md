@@ -1,118 +1,114 @@
-# Evaluación Experimental de Precisión Mixta con Tensor Cores en GPUs NVIDIA
+# Evaluación Experimental del Impacto Numérico y Energético de la Computación en Precisión Mixta mediante Tensor Cores en GPUs NVIDIA para Kernels HPC
 
-## Descripción General
+Trabajo de grado — Escuela de Ingeniería de Sistemas e Informática, Universidad Industrial de Santander (UIS).
 
-Este proyecto investiga el impacto numérico y energético de la computación en **precisión mixta** utilizando **Tensor Cores** en GPUs NVIDIA para kernels representativos de HPC.
+## De qué trata este proyecto
 
-**Objetivo Principal**: Determinar empíricamente las configuraciones de precisión mixta que ofrezcan el mejor compromiso entre **rendimiento computacional**, **consumo energético** y **exactitud numérica**.
+La computación científica de alto rendimiento (HPC) ha dependido históricamente de la doble precisión (FP64) para garantizar estabilidad numérica. Las GPUs NVIDIA modernas, en cambio, dedican una porción enorme de su silicio a **Tensor Cores**: unidades especializadas que multiplican y acumulan matrices a velocidades muy superiores, pero usando formatos de menor precisión (FP16, BF16). Usarlos en kernels clásicos de HPC —GEMM, Convolución, Stencil— promete velocidad y ahorro energético, al costo de introducir error de redondeo.
 
-## Kernels Evaluados
+Este proyecto **no busca demostrar que Tensor Cores "funcionan"** — busca **cuantificar exactamente cuándo y cuánto conviene usarlos**: para cada kernel, ¿qué combinación de formato y técnica de corrección da el mejor compromiso entre tiempo de ejecución, energía consumida y error numérico, y a partir de qué punto la ganancia de velocidad deja de valer la pérdida de exactitud?
 
-- **GEMM**: Multiplicación de matrices densas (512×512 a 4096×4096)
-- **Convolución 2D**: Operaciones de convolución con diversos tamaños de filtro
-- **Stencil 2D**: Operadores de diferencias finitas (512² a 2048² elementos)
+La pregunta de investigación completa está en el documento *Plan de Trabajo de Grado* (raíz del repositorio). En términos operativos, el proyecto:
 
-## Formatos de Precisión
+1. Implementa GEMM, Convolución 2D y Stencil 2D en FP64, FP32, FP16 y BF16, activando Tensor Cores explícitamente (cuBLAS/cuDNN y kernels WMMA propios).
+2. Mide rendimiento (latencia, TFLOPS) y energía (NVML para GPU, RAPL para CPU host, Energy-Delay Product) de cada combinación.
+3. Mide cómo se degrada la exactitud numérica en esquemas iterativos, y evalúa técnicas de compensación (suma de Kahan, compensación espacial, y el mecanismo de ancla FP64 descrito más abajo) contra una referencia FP64 (ground truth).
+4. Construye un Frente de Pareto en el espacio (Tiempo, Energía, Error) por cada kernel, para traducir los datos en una directriz de ingeniería: qué precisión usar según la tolerancia al error de la aplicación.
 
-- **FP64**: Doble precisión (línea base de referencia)
-- **FP32**: Precisión simple
-- **FP16**: Media precisión (con Tensor Cores)
-- **BF16**: Brain Floating Point (con Tensor Cores)
+## Qué corrige realmente el proyecto (y qué no)
 
-## Fases del Proyecto
+Es fácil malinterpretar el objetivo como "usar Tensor Cores y arreglar el error con Kahan hasta llegar a FP64". No es así, y vale la pena ser precisos:
 
-1. **Fase 1**: Construcción de línea base analítica (FP64 y FP32)
-2. **Fase 2**: Integración de precisión mixta y activación de Tensor Cores (throughput, sin encadenar iteraciones)
-3. **Fase 3**: Encadenamiento genuino de iteraciones en el Stencil 2D (salida(i) → entrada(i+1)) para cuantificar drift numérico acumulado, horizonte de overflow por formato y consumo energético (NVML), comparando suma compensada Kahan local frente a compensación espacial
-4. **Fase 4**: Campañas de variabilidad estadística y análisis del Frente de Pareto 3D (rendimiento-energía-error) sobre el operador de estrés difusivo
+- **FP64 es siempre la referencia**, nunca el objetivo a igualar. Todo lo demás (FP32, FP16, BF16, con o sin compensación) se mide *contra* FP64, no se fuerza *a* FP64.
+- Hay **dos capas de corrección de error, no una**. Los Tensor Cores ya acumulan internamente en FP32 aunque los operandos sean FP16/BF16 — eso es hardware, siempre activo, gratis. Las técnicas de compensación (Kahan, compensación espacial) atacan un problema distinto: el redondeo de **guardar** el estado en FP16/BF16 entre iteraciones de un esquema encadenado.
+- La suma de Kahan clásica, aplicada célula por célula, tiene un problema estructural: el residuo de una celda nunca lo relee ninguna de sus vecinas, que son las que sufren el error real de propagación. Bajo el operador de estrés que usa la campaña principal, esto la vuelve **indistinguible de no compensar** (incluso algo peor: +6% a +9% de error). Bajo un operador más difusivo, en cambio, sí ayuda (-24% a -26%) — su compensación depende de que el residuo esté correlacionado temporalmente, algo que el operador de estrés no garantiza. La **compensación espacial** (explota la linealidad del operador) funciona en ambos casos y de forma más consistente, y es una contribución propia del proyecto. Ver `Fase_3/Stencil/README.md` para el detalle completo por modo de operador.
+- El techo alcanzable con compensación por almacenamiento es **precisión cercana a FP32**, no a FP64 — es un límite de información, no de esfuerzo de ingeniería: no se puede recuperar con una técnica de compensación lo que el hardware nunca calculó. Para acercarse más a FP64 sin pagar su costo completo, el proyecto incorpora un mecanismo adicional: el **ancla FP64** (ver abajo).
 
-## Herramientas Utilizadas
+## El mecanismo de ancla FP64
 
-- **Compilador**: NVIDIA nvcc (CUDA)
-- **Bibliotecas**: cuBLAS, cuDNN, CUTLASS
-- **Profiling**: NVIDIA Nsight Compute
-- **Telemetría**: NVML (GPU, por contador de energía de 2 lecturas), RAPL (CPU)
-- **Post-procesamiento**: Python 3 (biblioteca estándar) para extracción y resumen de CSV
-- **Métricas**: Normas L₂ y L∞, horizonte de overflow (n*), Energy-Delay Product (EDP)
-- **Ejecución**: SLURM (sbatch) sobre el clúster PACCA — la compilación CUDA no se realiza en local
+Cada `K` iteraciones, en vez de calcular ese paso en baja precisión, se calcula **una vez, completo, en FP64**, y el resultado reemplaza al de la ruta rápida. El costo extra es una evaluación FP64 por cada `K` pasos — no una repetición de las `K` iteraciones anteriores (eso costaría igual que correr todo en FP64). Corrige el error de *ese* paso; no reconstruye el drift ya acumulado antes del ancla. Cuánto ayuda en la práctica —y a partir de qué `K` deja de valer la pena frente a su costo— es una pregunta empírica que el proyecto mide, no asume.
 
-## Estructura del Repositorio
+La especificación completa (pseudocódigo, gates de validación, diseño experimental) está en el documento **Plan de Precisión Mixta**, secciones 01 (Stencil) y 02 (extensión a GEMM/Convolución, que primero necesitan encadenarse igual que Stencil).
+
+## Estructura del repositorio
 
 ```
 mixed-precision-hpc-tensor-cores-project/
-├── Fase_1/                        # Línea base analítica (FP64 y FP32)
-│   ├── GEMM/                      # gemm_compare_balanced.cu + run_gemm_fase1.sbatch
-│   ├── Convolution/                # cudnn_conv_balanced.cu + run_conv_fase1.sbatch
-│   └── Stencil2D/                  # stencil2d_baseline.cu + run_stencil_fase1.sbatch
-├── Fase_2/                        # Precisión mixta y activación de Tensor Cores
+├── common/              # Código compartido: validación CUDA/cuBLAS/cuDNN, métricas de
+│                         # tiempo/error, telemetría de energía, motor de ancla+compensación.
+├── Fase_1/               # Línea base FP64/FP32, sin Tensor Cores.
 │   ├── GEMM/
 │   ├── Convolution/
-│   ├── Stencil/
-│   ├── common.cuh                  # Utilidades compartidas (CHECK_CUDA, CudaEventTimer, Metrics, ErrorMetrics, compare_*)
-│   └── telemetry.cuh
-├── Fase_3/                        # Encadenamiento genuino: drift, horizonte de overflow y energía
 │   └── Stencil/
-│       ├── stencil_tensor_activation.cu  # rutas CPU_FP32/FP64, GPU_FP32/FP64 y WMMA FP16/BF16 (Kahan local o compensación espacial)
-│       ├── run_stencil_tc.sbatch         # barrido de métricas dentro del horizonte finito (checkpoints, energía NVML)
-│       ├── run_stencil_horizon.sbatch    # medición del horizonte de overflow real por formato
-│       ├── stencil_jobs.sh               # orquestador de la campaña de cierre (sub-campañas, ver --help)
-│       └── tools/
-│           ├── extract_csv.py            # separa el log de cada job en CSV de drift/horizonte/energía/resumen
-│           ├── power_sampling.h          # energía GPU vía contador NVML (2 lecturas, sin hilo de muestreo)
-│           └── README.md                 # semántica detallada de columnas CSV y de las rutas de referencia
-├── tools/
-│   └── common_ncu.sh        # Definiciones compartidas de perfilado con Nsight Compute
-├── README.md
-└── .gitignore
+├── Fase_2/               # Activación de Tensor Cores (FP16/BF16), sin encadenar iteraciones.
+│   ├── GEMM/
+│   ├── Convolution/
+│   └── Stencil/
+├── Fase_3/               # Encadenamiento genuino (salida(i) → entrada(i+1)), drift,
+│   ├── GEMM/              # compensación. Los tres kernels, no solo Stencil.
+│   ├── Convolution/
+│   ├── Stencil/
+│   └── tools/            # Post-proceso de CSV (extracción, resumen).
+├── Fase_4/               # Ancla FP64, diseño factorial, telemetría de energía
+│   ├── GEMM/              # completa, Frente de Pareto 3D, análisis estadístico.
+│   ├── Convolution/
+│   ├── Stencil/
+│   └── tools/
+├── tools/                # Utilidades compartidas: perfilamiento (Nsight Compute),
+│                          # detección de toolchain, validación preliminar y
+│                          # post-proceso sin GPU.
+├── docs/
+│   └── MANUAL.md         # Manual del estudiante: qué es cada archivo, cómo correrlo,
+│                          # qué datos produce, cómo se analizan.
+├── old/                  # Snapshot completo del código anterior a esta reconstrucción,
+│                          # conservado como referencia (ver old/README.md).
+├── REQUIREMENTS.md       # Software y entorno necesarios para compilar y correr.
+├── run_full_pipeline.sh        # Orquestador para una máquina propia con GPU.
+├── run_full_pipeline_pacca.sh  # Orquestador para un clúster con SLURM (jobs + dependencias).
+├── Documento Plan Proyecto de Grado.docx.pdf   # Plan de tesis oficial.
+└── README.md             # Este archivo.
 ```
 
-> Fase 4 se desarrolla en la rama `fase4-estadistica-variabilidad` y aún no se integra a `main`.
+Cada carpeta de fase, y cada subcarpeta de kernel dentro de ella, tiene su propio `README.md` con el detalle de qué hace, qué parámetros acepta y qué produce. El manual en `docs/MANUAL.md` es la puerta de entrada recomendada si es la primera vez que trabajas en el proyecto — enlaza a todo lo demás en el orden en que conviene leerlo.
 
-## Ambiente Requerido
+## Kernels evaluados
 
-- GPU NVIDIA con soporte para Tensor Cores (Volta, Turing, Ampere o superior)
-- CUDA Toolkit 11.0 o superior
-- cuBLAS y cuDNN compatible con CUDA
-- Herramientas de profiling de NVIDIA
+- **GEMM**: multiplicación de matrices densas, 512×512 a 4096×4096.
+- **Convolución 2D**: diversos tamaños de filtro y lote.
+- **Stencil 2D**: operador de diferencias finitas (Laplaciano de 5 puntos) sobre dominios de 512² a 2048².
 
-## Compilación y Ejecución
+## Formatos de precisión
 
-La compilación y ejecución de los kernels CUDA se realiza en el clúster PACCA vía SLURM, no en local:
+FP64 (referencia), FP32, FP16 (Tensor Cores), BF16 (Tensor Cores). FP8/INT8 quedan explícitamente fuera de alcance (ver la sección de Limitaciones del plan de tesis) — su rango dinámico es insuficiente para variables físicas de simulaciones continuas.
 
-```bash
-# Desde el directorio de la fase correspondiente
-sbatch run_stencil_tc.sbatch
-```
+## Herramientas
 
-Cada `.sbatch` invoca `nvcc` con los flags de arquitectura y enlazado (cuBLAS, cuDNN, NVML) que correspondan a esa fase.
+- **Compilador**: NVIDIA `nvcc`.
+- **Bibliotecas**: cuBLAS, cuDNN, OpenBLAS (referencia de CPU).
+- **Profiling**: NVIDIA Nsight Compute — verificación real de activación de Tensor Cores (conteo de instrucciones HMMA), no solo aspiracional.
+- **Telemetría**: NVML (GPU), RAPL (CPU host).
+- **Post-procesamiento**: Python 3 (`scipy`, `statsmodels`, `pandas`, `numpy`, `matplotlib`) — ver `REQUIREMENTS.md`.
+- **Ejecución**: cualquier máquina con GPU NVIDIA Ampere+ (`sm_80+`) y el entorno conda de `environment.yml` — ver `REQUIREMENTS.md`. PACCA (vía SLURM/`sbatch`) es una opción, no un requisito: todo `.sbatch` del proyecto corre igual con `bash archivo.sbatch` directo, sin SLURM.
 
-## Métricas Principales
+## Por dónde empezar
 
-- **Throughput (TFLOPS/GFLOPS)**: Operaciones en punto flotante por segundo
-- **Latencia**: Tiempo de ejecución por iteración y total
-- **Horizonte de overflow (n\*)**: Iteración en la que una ruta deja de ser finita
-- **EDP (Energy-Delay Product)** y **energía por iteración**: Producto energía × tiempo y consumo GPU normalizado
-- **Error Numérico**: Desviación (L₂, L∞) respecto al patrón FP64 (referencia)
+1. Lee `REQUIREMENTS.md` para el entorno necesario — `conda env create -f environment.yml` deja todo listo (toolchain CUDA + análisis en Python) en cualquier máquina con GPU Ampere+.
+2. Lee `docs/MANUAL.md` — es la guía completa, pensada para quien se une al proyecto sin haber visto el código antes: qué es cada archivo, qué ejecuta, qué datos obtiene, cómo se analizan, y cómo lanzar tanto una corrida individual como una campaña completa.
+3. **Antes de cualquier campaña**, corre la validación preliminar: `bash tools/validacion_preliminar.sbatch`. Es un job corto que verifica el orden de operandos de `cublasDgemm` en GEMM y Convolución, hace una prueba de humo de los tres kernels y corre los gates K=0/K=1 del ancla FP64. Sale con `0` solo si todo pasa.
+4. Para lanzar la campaña:
+   - En un clúster con SLURM: `bash run_full_pipeline_pacca.sh` — envía cada fase como un job independiente encadenado con `--dependency=afterok` (`DRY_RUN=1` imprime el grafo sin enviar nada). Es el camino recomendado: no exige tener la GPU reservada durante decenas de horas seguidas.
+   - En una máquina propia: `bash run_full_pipeline.sh` corre las cuatro fases en secuencia y termina con la estadística y el Frente de Pareto 3D. **Su default es la campaña completa**; para una prueba rápida, `PIPELINE_MODE=smoke`.
+5. Si vas a modificar el mecanismo de ancla o compensación, lee primero el documento **Plan de Precisión Mixta** (comparte el link con tu director/compañeros si no lo tienes) — es la especificación normativa; el código debe seguirla, no al revés.
 
 ## Equipo
 
-### Director
-- **Gilberto Javier Díaz Toro**, Ph.D.
-  - Escuela de Ingeniería de Sistemas e Informática - UIS
+**Director**
+- Gilberto Javier Díaz Toro, Ph.D. — Escuela de Ingeniería de Sistemas e Informática, UIS
 
-### Autores / Investigadores
-- **Karen Dayana Mateus Gomez** (Código: 2212765)
-  - Escuela de Ingeniería de Sistemas e Informática - UIS
-  
-- **William Andrés Urrutia Torres** (Código: 2220058)
-  - Escuela de Ingeniería de Sistemas e Informática - UIS
+**Autores / Investigadores**
+- Karen Dayana Mateus Gomez (2212765) — Escuela de Ingeniería de Sistemas e Informática, UIS
+- William Andrés Urrutia Torres (2220058) — Escuela de Ingeniería de Sistemas e Informática, UIS
 
-### Institución
-**Universidad Industrial de Santander (UIS)**
-- Facultad de Ingenierías Físicomecánicas
-- Escuela de Ingeniería de Sistemas e Informática
+**Institución**: Universidad Industrial de Santander (UIS), Facultad de Ingenierías Fisicomecánicas, Escuela de Ingeniería de Sistemas e Informática.
 
----
-
-**Fecha de Presentación**: Bucaramanga, 09 de Abril de 2026  
-**Modalidad**: Trabajo de Investigación
+**Modalidad**: Trabajo de investigación.

@@ -1,0 +1,65 @@
+# environment.yml
+#
+# Entorno conda para compilar y ejecutar TODO el proyecto (Fase 1-4, los tres
+# kernels) en cualquier maquina con una GPU NVIDIA Ampere o mas nueva (compute
+# capability >= 8.0 -- ver REQUIREMENTS.md, seccion "Requisito de hardware:
+# por que Ampere+ y no cualquier GPU con Tensor Cores", antes de asumir que
+# esto corre en cualquier GPU con Tensor Cores; no es cierto: Volta/Turing
+# quedan fuera por el pipeline cp.async que usa common/wmma_gemm.cuh).
+#
+# Instalar:
+#   conda env create -f environment.yml
+#   conda activate mixed-precision-hpc
+#
+# Actualizar un entorno ya creado (tras editar este archivo):
+#   conda env update -f environment.yml --prune
+#
+# Verificar que nvcc quedo en el PATH del entorno:
+#   nvcc --version
+#
+# Con el entorno activo, cualquier .sbatch del proyecto corre directamente
+# con `bash archivo.sbatch` (sin sbatch/SLURM) -- ver
+# tools/detect_toolchain.sh, que cada .sbatch source-ea para encontrar nvcc
+# en el PATH en vez de la ruta fija del cluster PACCA.
+name: mixed-precision-hpc
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - git
+
+  # --- Toolchain CUDA (nvcc, cuBLAS, cuDNN) --------------------------------
+  # `cuda-toolkit` del canal `nvidia` trae nvcc, cublas (dev + runtime),
+  # cuobjdump y el resto del toolkit de compilacion -- la misma familia de
+  # paquetes que usa el propio instalador oficial de NVIDIA, empaquetada
+  # para conda. Fijar una version compatible con el driver instalado en la
+  # maquina (ver `nvidia-smi` -> "CUDA Version" en la esquina superior
+  # derecha, que es la version MAXIMA de CUDA que el driver soporta -- el
+  # toolkit puede ser igual o menor, nunca mayor).
+  - nvidia::cuda-toolkit=12.4
+  - conda-forge::cudnn=8.9
+
+  # --- BLAS de CPU (referencia de Fase 1/2 para GEMM/Convolucion) ---------
+  - conda-forge::openblas
+
+  # --- Analisis (post-proceso de CSV, estadistica, Pareto) ----------------
+  - numpy
+  - pandas
+  - scipy
+  - statsmodels     # ANOVA factorial + post-hoc Tukey HSD (scipy.stats no trae Tukey HSD)
+  - matplotlib
+
+# Nsight Compute (ncu, perfilado opcional -- RUN_NCU=1) NO esta en este
+# environment.yml: el paquete conda `nvidia::nsight-compute` no publica
+# builds para todas las plataformas de forma confiable. Si tu plataforma lo
+# tiene, puedes agregar `- nvidia::nsight-compute` a mano; si no, instala
+# Nsight Compute por separado (https://developer.nvidia.com/nsight-compute)
+# o simplemente no lo uses -- tools/detect_toolchain.sh detecta su ausencia
+# y fuerza RUN_NCU=0 con un aviso, en vez de fallar la compilacion/corrida.
+
+# CUTLASS (ruta 5, opcional, GEMM/Convolucion Fase 2) tampoco es un paquete
+# conda -- es header-only, se clona aparte (ver REQUIREMENTS.md):
+#   git clone --branch v2.11.0 https://github.com/NVIDIA/cutlass "$HOME/cutlass"
