@@ -126,20 +126,16 @@ echo "STENCIL_TC_MODES=${STENCIL_TC_MODES}"
 nvidia-smi || true
 
 echo "Compilando stencil_tc..."
-# NOTA MIGRACION: el .sbatch original de Fase 2 (old/Fase_2/Stencil/run_stencil_tc.sbatch)
-# ya compilaba sin -O3 (a diferencia del de Fase 1, que si lo usa) y se
-# conserva igual aqui para no alterar el comportamiento migrado. Es
-# sospechoso: sin -O3 el bucle "CPU FP32 serial" (host, escalar) corre
-# mucho mas lento -- medido en este entorno, ~25x mas lento que con -O3 en
-# la misma maquina/tamano -- lo que infla artificialmente todos los
-# "Speedup vs CPU"/"Speedup TC * vs CPU" que imprime el binario. No afecta
-# la correctitud numerica (los campos de error dan identicos con y sin
-# -O3), solo el rendimiento reportado de la referencia CPU. Se reporta aqui
-# en vez de agregar -O3 silenciosamente porque cambiar la bandera de
-# compilacion cambiaria numeros ya publicados de "Speedup vs CPU" en
-# corridas anteriores; que decidir corresponde a quien mantiene la
-# campana de resultados, no a esta migracion.
-"${NVCC}" -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
+# NOTA MIGRACION (actualizada): el .sbatch original de Fase 2
+# (old/Fase_2/Stencil/run_stencil_tc.sbatch) compilaba sin -O3, a diferencia
+# de Fase 1 -- eso hacia correr el bucle "CPU FP32 serial" (host, escalar)
+# ~25x mas lento de lo real en este entorno, inflando artificialmente todos
+# los "Speedup vs CPU"/"Speedup TC * vs CPU" que imprime el binario (no
+# afectaba la correctitud numerica, solo el rendimiento reportado de la
+# referencia CPU). Se agrega -O3 aqui para volver a Fase 2 consistente con
+# Fase 1: cualquier "Speedup vs CPU" generado ANTES de este cambio queda
+# obsoleto y debe volver a correrse.
+"${NVCC}" -std=c++17 -O3 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
     --allow-unsupported-compiler
 

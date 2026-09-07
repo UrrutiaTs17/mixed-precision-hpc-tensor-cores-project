@@ -220,7 +220,7 @@ echo "CUTLASS_DIR=${CUTLASS_DIR}"
 nvidia-smi || true
 
 echo "Compilando gemm_tc..."
-"${NVCC}" -std=c++17 gemm_tensor_activation.cu -o "${RESULTS_DIR}/gemm_tc" \
+"${NVCC}" -std=c++17 -O3 gemm_tensor_activation.cu -o "${RESULTS_DIR}/gemm_tc" \
     ${OPENBLAS_INC} -lcublas ${OPENBLAS_LIBS} \
     ${CUTLASS_INC} ${CUTLASS_EXTRA_NVCC_FLAGS} \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \

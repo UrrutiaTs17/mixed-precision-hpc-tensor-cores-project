@@ -258,7 +258,7 @@ echo "CUTLASS_DIR=${CUTLASS_DIR}"
 nvidia-smi || true
 
 echo "Compilando conv_tc..."
-"${NVCC}" -std=c++17 conv_tensor_activation.cu -o conv_tc \
+"${NVCC}" -std=c++17 -O3 conv_tensor_activation.cu -o conv_tc \
     ${OPENBLAS_INC} ${CUDNN_INC} ${CUDNN_LIBS} ${OPENBLAS_LIBS} \
     ${CUTLASS_INC} ${CUTLASS_EXTRA_NVCC_FLAGS} \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
