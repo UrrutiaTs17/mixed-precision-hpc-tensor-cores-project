@@ -15,9 +15,13 @@
 # variables de entorno via --export, con los mismos defaults documentados
 # abajo si no se pasa nada.
 #
-#   sbatch run_gemm_chained.sbatch
-#   sbatch --export=ALL,N_LIST="512 1024 2048 4096",COMP_LIST="off on" run_gemm_chained.sbatch
+#   sbatch run_gemm_chained.sbatch                       # CAMPANA COMPLETA
+#   sbatch --export=ALL,SMOKE_TEST=1 run_gemm_chained.sbatch   # prueba de humo
+#   sbatch --export=ALL,N_LIST="1024 2048",COMP_LIST="off on" run_gemm_chained.sbatch
 #   sbatch --export=ALL,TC_FORMAT=fp16,CHECKPOINT_EVERY=1 run_gemm_chained.sbatch
+#
+# OJO: el default de N_LIST/ITERS_LIST es la CAMPANA COMPLETA (ver la seccion
+# de barrido mas abajo), no una prueba rapida. Para eso esta SMOKE_TEST=1.
 #
 # Mismo patron de deteccion de NVML/toolchain que Fase_4/Stencil/run_stencil_tc.sbatch
 # -- ver ese archivo si algo de esta seccion inicial no es obvio.
@@ -72,9 +76,46 @@ else
     echo "NVML no disponible para el enlace; se usara el stub de telemetria GPU."
 fi
 
-# --- Barrido: tamanos, formato, compensacion ---------------------------------
-N_LIST="${N_LIST:-1024}"                 # cada valor debe ser potencia de 2
-ITERS="${ITERS:-20}"
+# --- Prueba de humo ----------------------------------------------------------
+# SMOKE_TEST=1 recorta el barrido al punto mas chico de cada lista y a 3
+# iteraciones: sirve para confirmar que el binario compila, corre y emite
+# CSV_SUMMARY/CSV_DRIFT bien formados ANTES de comprometer horas de cola. NO es
+# un punto de la campana; sus numeros no se reportan.
+SMOKE_TEST="${SMOKE_TEST:-0}"
+
+# --- Barrido: tamanos, iteraciones, formato, compensacion --------------------
+# N_LIST: cada valor debe ser potencia de 2 (construccion de Sylvester-Hadamard,
+# ver el aviso de cabecera del .cu).
+#
+# PRESUPUESTO DE MEMORIA (A100-PCIE-40GB, 39.49 GiB) -- no subir N_LIST sin
+# rehacer esta cuenta. Por elemento de la matriz NxN, con --tc both, --comp on
+# y el ancla activa (el caso mas caro, Fase 4):
+#     referencia FP64 (d_x64_in/out)          16 B
+#     operador A en fp64 + fp16 + bf16        12 B
+#     ruta sin comp  (2xT + t_raw)             8 B
+#     ruta con comp  (2xT + t_raw + 2xcomp
+#                     + comp_tc_raw + comp_as_tc)  22 B
+#     ancla FP64 (4 buffers double)           32 B
+#                                            -------
+#                                             90 B/elemento
+#   N=4096 ->  1.51 GB     N=8192  ->  6.04 GB   (15 % de la tarjeta)
+#   N=16384 -> 24.2 GB (61 %: DESCARTADO, sin margen de seguridad)
+#   N=32768 -> 96.6 GB (imposible)
+# El limite superior 8192 deja un margen de 6.5x, muy por encima del 2x que
+# exige el criterio de dimensionamiento del proyecto.
+#
+# ITERS_LIST reemplaza al antiguo escalar ITERS. La variable ITERS SIGUE
+# funcionando y GANA si se exporta: `ITERS=20 bash run_gemm_chained.sbatch`
+# corre una sola pasada a 20 iteraciones, exactamente como antes de este
+# cambio. Solo cuando NO se exporta se usa el barrido de campana.
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    N_LIST="${N_LIST:-1024}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-3}}"
+    RUN_NCU="${RUN_NCU:-0}"
+else
+    N_LIST="${N_LIST:-1024 2048 4096 8192}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-20 40 80}}"
+fi
 TC_FORMAT="${TC_FORMAT:-both}"           # fp16 | bf16 | both
 COMP_LIST="${COMP_LIST:-off on}"         # compensacion por linealidad
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
@@ -111,7 +152,7 @@ echo "GIT_COMMIT=${GIT_COMMIT}"
 echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=N_LIST=${N_LIST} ITERS=${ITERS} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED} TARGET_LAMBDA=${TARGET_LAMBDA}"
+echo "RUN_PARAMS=N_LIST=${N_LIST} ITERS_LIST=${ITERS_LIST} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED} TARGET_LAMBDA=${TARGET_LAMBDA} SMOKE_TEST=${SMOKE_TEST}"
 
 # Validacion SASS pre-perfilado -- mismo patron que Fase_4/Stencil.
 _nvcc_dir="$(dirname "${NVCC}")"
@@ -146,8 +187,16 @@ done
 
 echo "Ejecutando gemm_chained (Fase 3: encadenamiento genuino, sin ancla)..."
 
+# El perfilado NCU se restringe a la PRIMERA pasada de ITERS_LIST: ncu mide
+# wmma_gemm_kernel en un solo lanzamiento (--launch-count 1) y ese kernel es
+# identico para cualquier valor de --iters, asi que repetirlo por cada
+# iteracion de la lista multiplicaria el tiempo de cola sin producir un dato
+# nuevo. Mismo criterio que ya usa Fase_4/Stencil con KAHAN_LIST/ANCHOR_LIST.
+read -r _iters_first _ <<< "${ITERS_LIST}"
+
 {
 for N in ${N_LIST}; do
+  for ITERS in ${ITERS_LIST}; do
     for COMP in ${COMP_LIST}; do
         echo
         echo "============================================================"
@@ -156,6 +205,10 @@ for N in ${N_LIST}; do
         ./gemm_chained --n "${N}" --iters "${ITERS}" --tc "${TC_FORMAT}" \
             --comp "${COMP}" --checkpoint-every "${CHECKPOINT_EVERY}" \
             --seed "${SEED}" --target-lambda "${TARGET_LAMBDA}"
+
+        if [[ "${ITERS}" != "${_iters_first}" ]]; then
+            continue
+        fi
 
         if [[ "${RUN_NCU}" == "1" ]]; then
             if [[ "${NCU_MODE}" == "full" ]]; then
@@ -171,6 +224,7 @@ for N in ${N_LIST}; do
                 ./gemm_chained --n "${N}" --iters 1 --tc "${TC_FORMAT}" --comp "${COMP}"
         fi
     done
+  done
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 

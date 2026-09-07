@@ -14,9 +14,13 @@
 # carpeta). Mismo patron que Fase_3/GEMM/run_gemm_chained.sbatch -- nada
 # hardcodeado, todo via --export.
 #
-#   sbatch run_conv_chained.sbatch
-#   sbatch --export=ALL,HW_LIST="64 128 256",COMP_LIST="off on" run_conv_chained.sbatch
+#   sbatch run_conv_chained.sbatch                        # CAMPANA COMPLETA
+#   sbatch --export=ALL,SMOKE_TEST=1 run_conv_chained.sbatch    # prueba de humo
+#   sbatch --export=ALL,HW_LIST="64 128",COMP_LIST="off on" run_conv_chained.sbatch
 #   sbatch --export=ALL,TC_FORMAT=fp16,CHECKPOINT_EVERY=1 run_conv_chained.sbatch
+#
+# OJO: el default de HW_LIST/ITERS_LIST es la CAMPANA COMPLETA (ver la seccion
+# de barrido mas abajo), no una prueba rapida. Para eso esta SMOKE_TEST=1.
 
 set -euo pipefail
 
@@ -66,12 +70,62 @@ else
     echo "NVML no disponible para el enlace; se usara el stub de telemetria GPU."
 fi
 
-# --- Barrido: tamano espacial, formato, compensacion --------------------------
-# HW debe hacer que hw*hw sea multiplo de 64 (dimension N del GEMM
-# subyacente via im2col) -- 64, 128, 192, 256... funcionan (ver validacion en
-# parse_args de conv_chained.cu).
-HW_LIST="${HW_LIST:-64}"
-ITERS="${ITERS:-20}"
+# --- Prueba de humo ----------------------------------------------------------
+# SMOKE_TEST=1 recorta el barrido al punto mas chico y a 3 iteraciones: sirve
+# para confirmar que el binario compila, corre y emite CSV_SUMMARY/CSV_DRIFT
+# bien formados ANTES de comprometer horas de cola. No es un punto de campana.
+SMOKE_TEST="${SMOKE_TEST:-0}"
+
+# --- Barrido: tamano espacial, iteraciones, formato, compensacion ------------
+# HW debe hacer que hw*hw sea multiplo de 64 (dimension N del GEMM subyacente
+# via im2col) -- 64, 128, 192, 256... funcionan (ver validacion en parse_args
+# de conv_chained.cu).
+#
+# PRESUPUESTO DE MEMORIA (A100-PCIE-40GB, 39.49 GiB) -- CALCULO CORREGIDO.
+# conv_chained.cu NO usa cuDNN ni CUTLASS (eso es Fase 2): reescribe la
+# convolucion como GEMM con un im2col propio y la resuelve con el mismo kernel
+# WMMA y las mismas llamadas cublasDgemm que GEMM. Es decir, todos los buffers
+# son cudaMalloc de tamano conocido, sin el workspace impredecible de una
+# libreria -- se calcula con la misma precision que el de GEMM.
+#
+# El estado escala como kChannels*hw^2 = 64*hw^2 (64 canales FIJOS, ver "Por
+# que 64 canales" en el README), y el buffer im2col como kCRS*hw^2 = 576*hw^2,
+# que es el termino DOMINANTE. Por elemento de campo (64*hw^2), con --tc both,
+# --comp on y ancla activa:
+#     referencia FP64 (d_x64_in/out)                    16 B
+#     im2col en double (d_col64, 576/64 = 9x el campo)  72 B   <-- domina
+#     ruta sin comp (2xT + d_col + t_raw)               26 B
+#     ruta con comp (+2xcomp + comp_col + comp_raw)     56 B
+#     ancla FP64 (4 buffers double)                     32 B
+#                                                      -------
+#                                                      202 B/elemento de campo
+#   = 202 * 64 = 12.9 KB por celda espacial (hw^2)
+#   hw=256  -> 0.85 GB    hw=512  -> 3.39 GB  (12x de margen)
+#   hw=1024 -> 13.6 GB (2.9x de margen: es el TECHO bajo el criterio de 2x)
+#   hw=2048 -> 54.2 GB (imposible)
+#
+# Referencia cruzada pedida por la auditoria: a hw=256 el campo tiene
+# 64*256^2 = 4.19M elementos, el mismo orden que GEMM a N=2048 (4.19M). Pero
+# conv gasta 202 B/elemento contra los 90 B/elemento de GEMM (2.2x, por el
+# im2col en double), asi que el equivalente de N=8192 (67.1M elementos, 6.0 GB)
+# es hw=1024 (67.1M elementos, 13.6 GB).
+#
+# Se fija el limite en 512 y no en 1024: 512 da cuatro puntos de tamano (los
+# mismos cuatro que GEMM) con 12x de margen, y el salto a 1024 no agrega un
+# regimen nuevo -- solo consume el margen. Si hiciera falta el punto grande,
+# 1024 esta calculado arriba y cumple el criterio de 2x; 2048 no.
+#
+# ITERS_LIST reemplaza al antiguo escalar ITERS. La variable ITERS SIGUE
+# funcionando y GANA si se exporta: `ITERS=20 bash run_conv_chained.sbatch`
+# corre una sola pasada a 20 iteraciones, igual que antes de este cambio.
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    HW_LIST="${HW_LIST:-64}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-3}}"
+    RUN_NCU="${RUN_NCU:-0}"
+else
+    HW_LIST="${HW_LIST:-64 128 256 512}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-20 40 80}}"
+fi
 TC_FORMAT="${TC_FORMAT:-both}"          # fp16 | bf16 | both
 COMP_LIST="${COMP_LIST:-off on}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
@@ -106,7 +160,7 @@ echo "GIT_COMMIT=${GIT_COMMIT}"
 echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=HW_LIST=${HW_LIST} ITERS=${ITERS} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED}"
+echo "RUN_PARAMS=HW_LIST=${HW_LIST} ITERS_LIST=${ITERS_LIST} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED} SMOKE_TEST=${SMOKE_TEST}"
 
 _nvcc_dir="$(dirname "${NVCC}")"
 if [[ -z "${CUOBJDUMP:-}" ]]; then
@@ -140,8 +194,15 @@ done
 
 echo "Ejecutando conv_chained (Fase 3: encadenamiento genuino, sin ancla)..."
 
+# El perfilado NCU se restringe a la PRIMERA pasada de ITERS_LIST: ncu mide
+# wmma_gemm_kernel en un solo lanzamiento y ese kernel es identico para
+# cualquier --iters, asi que repetirlo por cada valor de la lista
+# multiplicaria el tiempo de cola sin producir un dato nuevo.
+read -r _iters_first _ <<< "${ITERS_LIST}"
+
 {
 for HW in ${HW_LIST}; do
+  for ITERS in ${ITERS_LIST}; do
     for COMP in ${COMP_LIST}; do
         echo
         echo "============================================================"
@@ -149,6 +210,10 @@ for HW in ${HW_LIST}; do
         echo "============================================================"
         ./conv_chained --hw "${HW}" --iters "${ITERS}" --tc "${TC_FORMAT}" \
             --comp "${COMP}" --checkpoint-every "${CHECKPOINT_EVERY}" --seed "${SEED}"
+
+        if [[ "${ITERS}" != "${_iters_first}" ]]; then
+            continue
+        fi
 
         if [[ "${RUN_NCU}" == "1" ]]; then
             if [[ "${NCU_MODE}" == "full" ]]; then
@@ -164,6 +229,7 @@ for HW in ${HW_LIST}; do
                 ./conv_chained --hw "${HW}" --iters 1 --tc "${TC_FORMAT}" --comp "${COMP}"
         fi
     done
+  done
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 

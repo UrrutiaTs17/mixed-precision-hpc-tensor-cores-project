@@ -56,12 +56,54 @@ A diferencia de GEMM (donde el estado y la corrección pasan por el mismo `wmma_
 
 ## Salida
 
-Mismo esquema `CSV_DRIFT`/`CSV_SUMMARY` que `Fase_3/GEMM/gemm_chained.cu` (ver ese README) — incluye `window_reliable`/`gpu_segments` desde el diseño, con la misma exclusión de las pausas de checkpoint de la ventana de energía/tiempo.
+Mismo esquema `CSV_DRIFT`/`CSV_SUMMARY` que `Fase_3/GEMM/gemm_chained.cu` (ver ese README), con `hw` en la columna de tamaño y `anchor_every` como última columna — que en este binario vale siempre `0`, porque Fase 3 no tiene ancla. Incluye `window_reliable`/`gpu_segments` desde el diseño, con la misma exclusión de las pausas de checkpoint de la ventana de energía/tiempo.
+
+## Campaña por defecto
+
+`run_conv_chained.sbatch` corre, si no se le exporta nada, el barrido completo:
+
+| Variable | Default | Nota |
+|---|---|---|
+| `HW_LIST` | `64 128 256 512` | `hw²` debe ser múltiplo de 64. Techo por memoria — ver abajo. |
+| `ITERS_LIST` | `20 40 80` | **Nueva**: reemplaza al escalar `ITERS`, que sigue funcionando y gana si se exporta. |
+| `COMP_LIST` | `off on` | |
+| `TC_FORMAT` | `both` | |
+| `SMOKE_TEST` | `0` | `1` recorta a `hw=64`, 3 iteraciones y `RUN_NCU=0`. |
+
+### Presupuesto de memoria — el cálculo corregido
+
+Una versión anterior de la auditoría trataba el presupuesto de este kernel como "menos predecible" que el de GEMM, asumiendo que pasaba por cuDNN/CUTLASS. **Eso es cierto para Fase 2** (`Fase_2/Convolution/conv_tensor_activation.cu` sí tiene rutas cuDNN y CUTLASS), pero **no** para este archivo: `conv_chained.cu` no incluye `cudnn.h` ni CUTLASS en absoluto — reescribe la convolución como GEMM con un `im2col` propio y la resuelve con el mismo kernel WMMA y las mismas llamadas `cublasDgemm` que GEMM. Todos los buffers son `cudaMalloc` de tamaño conocido, así que el presupuesto se calcula con la misma precisión que el de GEMM.
+
+El factor que hay que no olvidar es el de **canales**: el estado escala como `kChannels·hw² = 64·hw²`, y el buffer `im2col` como `kCRS·hw² = 576·hw²`, que es el término dominante. Por elemento de campo, con `--tc both`, `--comp on` y ancla activa:
+
+| Concepto | B/elemento de campo |
+|---|---|
+| referencia FP64 (`d_x64_in/out`) | 16 |
+| `im2col` en `double` (`d_col64`, 9× el campo) | **72** |
+| ruta sin comp (`2×T` + `d_col` + `t_raw`) | 26 |
+| ruta con comp (`+2×comp` + `comp_col` + `comp_raw`) | 56 |
+| ancla FP64 (4 buffers `double`) | 32 |
+| **total** | **202** |
+
+= **12.9 KB por celda espacial**. De ahí:
+
+| `hw` | Memoria | Veredicto |
+|---|---|---|
+| 256 | 0.85 GB | |
+| 512 | 3.39 GB | margen 12× — **techo de la campaña** |
+| 1024 | 13.6 GB | margen 2.9×: techo real bajo el criterio de 2× |
+| 2048 | 54.2 GB | imposible |
+
+**Referencia cruzada con GEMM** (la que pedía la auditoría): a `hw=256` el campo tiene `64·256² = 4.19M` elementos, el mismo orden que GEMM a `N=2048` (`4.19M`). Pero Convolución gasta 202 B/elemento contra los 90 B/elemento de GEMM — 2.2×, por el `im2col` en `double` —, así que el equivalente de `N=8192` (67.1M elementos, 6.0 GB) es `hw=1024` (67.1M elementos, 13.6 GB).
+
+**Por qué el límite queda en 512 y no en 1024**: 512 da cuatro puntos de tamaño (los mismos cuatro que GEMM) con 12× de margen, y el salto a 1024 no agrega un régimen nuevo — solo consume el margen. Si hiciera falta el punto grande, 1024 está calculado y cumple el criterio de 2×; 2048 no.
 
 ## Qué falta
 
-- **`Fase_4/Convolution/`**: ✅ hecho — extensión con el ancla FP64 (`Fase_4/Convolution/conv_chained.cu`).
-- **`run_conv_chained.sbatch`**: ✅ hecho — lanzador parametrizado, ver el propio `.sbatch` de esta carpeta.
-- **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py` (`Fase_3/tools/README.md`), ya integrado al final del `.sbatch`.
-- **Scripts de gate** (comparar K=0/K=1 contra la referencia FP64 antes de confiar en una campaña con ancla): todavía no migrados/escritos — ver `Fase_3/tools/README.md`, sección "Qué falta".
-- **Campaña real en PACCA**: compilado y verificado con `--hw` chico en GPU Ampere+; falta correr el barrido de tamaños que promete el plan.
+- **`Fase_4/Convolution/`**: ✅ hecho — extensión con el ancla FP64.
+- **`run_conv_chained.sbatch`**: ✅ hecho — ahora con `HW_LIST` ampliado, `ITERS_LIST` y `SMOKE_TEST`.
+- **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py`.
+- **Verificación del orden de operandos, `im2col`, padding y filtro**: ✅ hecha y **pasada en GPU real** — ver arriba.
+- **Scripts de gate** K=0/K=1: ✅ hechos — `Fase_4/tools/gate3_ancla.py` y `Fase_4/Convolution/gate3_ancla.sbatch`.
+- **`t_iter_ms`/`gflops`/`energy_gpu_j` no distinguen `_none` de `_comp`**: mismo hallazgo (y misma causa) que documenta `Fase_3/GEMM/README.md` en su sección "Qué falta". Sin corregir.
+- **Campaña real en PACCA**: compilado y verificado con `--hw` chico; falta el barrido completo.

@@ -54,13 +54,17 @@ mixed-precision-hpc-tensor-cores-project/
 │   ├── Convolution/
 │   ├── Stencil/
 │   └── tools/
-├── tools/                # Utilidades de perfilamiento (Nsight Compute) compartidas.
+├── tools/                # Utilidades compartidas: perfilamiento (Nsight Compute),
+│                          # detección de toolchain, validación preliminar y
+│                          # post-proceso sin GPU.
 ├── docs/
 │   └── MANUAL.md         # Manual del estudiante: qué es cada archivo, cómo correrlo,
 │                          # qué datos produce, cómo se analizan.
 ├── old/                  # Snapshot completo del código anterior a esta reconstrucción,
 │                          # conservado como referencia (ver old/README.md).
 ├── REQUIREMENTS.md       # Software y entorno necesarios para compilar y correr.
+├── run_full_pipeline.sh        # Orquestador para una máquina propia con GPU.
+├── run_full_pipeline_pacca.sh  # Orquestador para un clúster con SLURM (jobs + dependencias).
 ├── Documento Plan Proyecto de Grado.docx.pdf   # Plan de tesis oficial.
 └── README.md             # Este archivo.
 ```
@@ -90,8 +94,11 @@ FP64 (referencia), FP32, FP16 (Tensor Cores), BF16 (Tensor Cores). FP8/INT8 qued
 
 1. Lee `REQUIREMENTS.md` para el entorno necesario — `conda env create -f environment.yml` deja todo listo (toolchain CUDA + análisis en Python) en cualquier máquina con GPU Ampere+.
 2. Lee `docs/MANUAL.md` — es la guía completa, pensada para quien se une al proyecto sin haber visto el código antes: qué es cada archivo, qué ejecuta, qué datos obtiene, cómo se analizan, y cómo lanzar tanto una corrida individual como una campaña completa.
-3. `bash run_full_pipeline.sh` corre las cuatro fases de principio a fin (los tres kernels en cada una) y termina con la estadística inferencial y el Frente de Pareto 3D — ver su comentario de cabecera para parametrizarlo o saltar fases.
-4. Si vas a modificar el mecanismo de ancla o compensación, lee primero el documento **Plan de Precisión Mixta** (comparte el link con tu director/compañeros si no lo tienes) — es la especificación normativa; el código debe seguirla, no al revés.
+3. **Antes de cualquier campaña**, corre la validación preliminar: `bash tools/validacion_preliminar.sbatch`. Es un job corto que verifica el orden de operandos de `cublasDgemm` en GEMM y Convolución, hace una prueba de humo de los tres kernels y corre los gates K=0/K=1 del ancla FP64. Sale con `0` solo si todo pasa.
+4. Para lanzar la campaña:
+   - En un clúster con SLURM: `bash run_full_pipeline_pacca.sh` — envía cada fase como un job independiente encadenado con `--dependency=afterok` (`DRY_RUN=1` imprime el grafo sin enviar nada). Es el camino recomendado: no exige tener la GPU reservada durante decenas de horas seguidas.
+   - En una máquina propia: `bash run_full_pipeline.sh` corre las cuatro fases en secuencia y termina con la estadística y el Frente de Pareto 3D. **Su default es la campaña completa**; para una prueba rápida, `PIPELINE_MODE=smoke`.
+5. Si vas a modificar el mecanismo de ancla o compensación, lee primero el documento **Plan de Precisión Mixta** (comparte el link con tu director/compañeros si no lo tienes) — es la especificación normativa; el código debe seguirla, no al revés.
 
 ## Equipo
 

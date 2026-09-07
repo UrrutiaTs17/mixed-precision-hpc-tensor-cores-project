@@ -11,8 +11,32 @@
 # corre exactamente igual si lo lanzas tu mismo con `sbatch` en PACCA -- ver
 # la nota de cada .sbatch).
 #
-# Uso basico (defaults razonables, campana chica de humo):
+# AVISO -- el default NO es una prueba de humo:
 #   bash run_full_pipeline.sh
+# corre la CAMPANA COMPLETA de las cuatro fases. Cada .sbatch usa su propio
+# default (SMOKE_TEST=0), que es el barrido entero de tamanos, iteraciones y
+# valores de K, con RUN_NCU=1 en Fase 2 y en Fase 3/4 de Stencil. Son decenas
+# de horas de GPU sumadas.
+#
+# (Este comentario decia "campana chica de humo". Era falso: SMOKE_TEST nunca
+# se exportaba desde aqui, asi que cada .sbatch caia en su propio default de
+# campana completa. Se corrigieron LOS DOS lados -- el texto, que ahora
+# describe lo que pasa de verdad, y el comportamiento, que ahora SI tiene una
+# via de humo explicita. El default sigue siendo `full` para no cambiarle el
+# significado a nadie que ya lo estuviera usando en serio.)
+#
+# Prueba de humo real (minutos, no horas -- exporta SMOKE_TEST=1 y RUN_NCU=0 a
+# las cuatro fases):
+#   PIPELINE_MODE=smoke bash run_full_pipeline.sh
+#
+# Antes de una campana de verdad, la puerta previa de la Tarea 8 corre las
+# verificaciones baratas (orden de operandos, humo, gates K=0/K=1):
+#   bash tools/validacion_preliminar.sbatch
+#
+# En un cluster con SLURM, este script NO es el camino recomendado: exige la
+# GPU reservada de principio a fin en una sola sesion. Use
+# run_full_pipeline_pacca.sh, que envia cada fase como un job con
+# dependencias.
 #
 # Saltar fases (por si ya corriste algunas, o para iterar rapido):
 #   RUN_FASE1=0 RUN_FASE2=0 bash run_full_pipeline.sh
@@ -43,6 +67,39 @@ RUN_FASE3="${RUN_FASE3:-1}"
 RUN_FASE4="${RUN_FASE4:-1}"
 RUN_STATS="${RUN_STATS:-1}"
 RUN_PARETO="${RUN_PARETO:-1}"
+
+# PIPELINE_MODE=smoke|full (default full).
+#
+#   full  -> no se toca nada: cada .sbatch usa sus propios defaults, que son la
+#            campana completa. Es el comportamiento historico de este script,
+#            y sigue siendo el default para no cambiarle el significado a quien
+#            ya lo estuviera usando en serio.
+#   smoke -> exporta SMOKE_TEST=1 y RUN_NCU=0 a TODAS las fases. Los ocho
+#            .sbatch que participan lo entienden (Fase 1 y 2 desde siempre;
+#            los encadenados de GEMM/Convolucion de Fase 3/4 lo aceptan desde
+#            la auditoria que agrego esta bandera, que hasta entonces era la
+#            unica asimetria: Stencil si lo tenia y ellos no).
+#
+# Las variables se exportan solo si el usuario NO las fijo ya: `SMOKE_TEST=0
+# PIPELINE_MODE=smoke ...` deja ganar al valor explicito, no al modo.
+PIPELINE_MODE="${PIPELINE_MODE:-full}"
+case "${PIPELINE_MODE}" in
+    smoke)
+        export SMOKE_TEST="${SMOKE_TEST:-1}"
+        export RUN_NCU="${RUN_NCU:-0}"
+        echo "PIPELINE_MODE=smoke -- SMOKE_TEST=${SMOKE_TEST}, RUN_NCU=${RUN_NCU}." \
+             "Campana chica de verificacion, NO datos reportables."
+        ;;
+    full)
+        echo "PIPELINE_MODE=full -- campana COMPLETA (cada .sbatch con sus propios" \
+             "defaults). Para una prueba rapida: PIPELINE_MODE=smoke."
+        ;;
+    *)
+        echo "ERROR: PIPELINE_MODE debe ser 'smoke' o 'full' (recibido:" \
+             "'${PIPELINE_MODE}')." >&2
+        exit 2
+        ;;
+esac
 STATS_OUTDIR="${STATS_OUTDIR:-${REPO_ROOT}/stats_out}"
 PARETO_OUTDIR="${PARETO_OUTDIR:-${REPO_ROOT}/pareto_out}"
 

@@ -2,7 +2,15 @@
 
 Guía completa para alguien que se une al proyecto sin haber visto el código antes: qué es cada archivo, qué ejecuta, qué datos produce, cómo se analizan, y cómo correr tanto una prueba individual como una campaña completa.
 
-**Estado de este manual**: el proyecto se está reconstruyendo siguiendo el documento *Plan de Precisión Mixta*. Fase 1, Fase 2, Fase 3 y Fase 4 tienen código para los tres kernels (GEMM, Convolución, Stencil), incluyendo la estadística inferencial y el Frente de Pareto 3D (`Fase_4/tools/run_statistics.py`, `Fase_4/tools/pareto_front.py`) y un orquestador de principio a fin (`run_full_pipeline.sh`, raíz del repo) — nada de esto se ha compilado/corrido contra una GPU o campaña real todavía (este entorno de desarrollo no tiene GPU ni `nvcc`); los scripts de Python sí se probaron contra datos sintéticos (ver `Fase_4/tools/README.md`). Lo que sigue sin existir son los scripts de gate de validación (ver `Fase_3/tools/README.md` y `Fase_4/tools/README.md`, "Qué falta") — donde una pieza todavía no existe, este manual lo dice explícitamente en vez de describir algo que no vas a encontrar en el repositorio. Si encuentras una sección desactualizada, es más confiable el `README.md` de la carpeta específica que este manual — actualízalo si notas la diferencia.
+**Estado de este manual**: el proyecto se está reconstruyendo siguiendo el documento *Plan de Precisión Mixta*. Fase 1, Fase 2, Fase 3 y Fase 4 tienen código para los tres kernels (GEMM, Convolución, Stencil), incluyendo la estadística inferencial y el Frente de Pareto 3D (`Fase_4/tools/run_statistics.py`, `Fase_4/tools/pareto_front.py`) y dos orquestadores de principio a fin (`run_full_pipeline.sh` para una máquina propia, `run_full_pipeline_pacca.sh` para un clúster con SLURM). **Ninguna campaña real se ha corrido todavía.**
+
+Lo que **sí** está verificado contra hardware real (GPU Ampere `sm_86`, 2026-09-06), y que hasta la auditoría de esa fecha no existía:
+
+- La **verificación del orden de operandos** de `cublasDgemm` en GEMM y Convolución (`Fase_3/tools/verificar_orden_operandos_*.py`) — el "punto de mayor riesgo de error silencioso" que los propios `.cu` señalaban. **Pasa en los dos kernels.** En Convolución cubre además la indexación del `im2col`, el padding "SAME" y la estructura bloque-diagonal del filtro.
+- Los **gates K=0/K=1 del ancla FP64** (`Fase_4/tools/gate3_ancla.py` + un `gate3_ancla.sbatch` por kernel). Probados positiva y negativamente para GEMM y Convolución; Stencil se probará en PACCA (su `.cu` rechaza Windows a propósito por un `static_assert` de 64 bits).
+- La columna **`anchor_every`** ya es una columna real del CSV en los seis binarios, no algo reconstruido desde una línea de texto.
+
+Los scripts de Python de análisis siguen probados solo contra datos sintéticos (ver `Fase_4/tools/README.md`). Donde una pieza todavía no existe, este manual lo dice explícitamente en vez de describir algo que no vas a encontrar en el repositorio. Si encuentras una sección desactualizada, es más confiable el `README.md` de la carpeta específica que este manual — actualízalo si notas la diferencia.
 
 ---
 
@@ -175,17 +183,54 @@ t-test/ANOVA factorial sobre los datos de variabilidad (réplicas por celda del 
 
 Una "campaña" es un barrido sistemático (todos los tamaños × todos los formatos × todos los tratamientos × réplicas) pensado para producir el dataset final, no una prueba de humo. El flujo general:
 
-1. **Compilar y validar primero con un caso chico** (`SMOKE_TEST=1` si el `.sbatch` lo soporta, o un tamaño pequeño manual) antes de lanzar la campaña completa — un error de compilación o de argumentos descubierto después de 200 jobs en la cola es un desperdicio de cupo de clúster.
-2. **Correr los gates de validación relevantes** antes de confiar en cualquier resultado de un mecanismo nuevo — para el ancla FP64, eso es `--export=ALL,ANCHOR_LIST="0 1"` (o `SPATIAL_COMP=on,ANCHOR_LIST="0 1"` en Stencil) en el `.sbatch` del kernel correspondiente, ver la sección "Validación" de cada `README.md` de `Fase_4/`. Los scripts que automatizan esta comparación (`comparar_gate1.py`, `validar_gate2.py`) todavía no están migrados/escritos — ver `Fase_3/tools/README.md` y `Fase_4/tools/README.md`, sección "Qué falta".
-3. **Lanzar el barrido completo** vía el `.sbatch` de la fase/kernel correspondiente, con las variables de entorno documentadas en su propio README (`N_LIST`/`HW_LIST`/`NX`/`NY`, `TC_FORMAT`, `COMP_LIST`, `ANCHOR_LIST` en Fase 4, etc.) — nada queda hardcodeado, un `sbatch archivo.sbatch` sin argumentos ya corre algo razonable por defecto.
-4. **Extraer los CSV** con el script de post-proceso correspondiente: `tools/extract_csv.py`/`extract_csv.py` para Stencil, `extract_csv_chained.py` para GEMM/Convolución (esquema de columnas distinto — ver `Fase_3/tools/README.md`). Los `.sbatch` ya lo invocan automáticamente al terminar la corrida.
-5. **Correr el análisis**: `python3 Fase_4/tools/run_statistics.py --results-dir results/` (ANOVA + Tukey HSD, Etapa 7) y `python3 Fase_4/tools/pareto_front.py --results-dir results/` (Frente de Pareto 3D, Etapa 9) — ver `REQUIREMENTS.md`/`environment.yml` para el entorno de Python necesario y `Fase_4/tools/README.md` para el detalle de cada script. `run_full_pipeline.sh` (raíz del repo) hace los cinco pasos de esta lista de un tirón.
+1. **Correr la validación preliminar**, un job corto y barato que hace todo lo que hay que confirmar antes de comprometer horas de cola:
+
+   ```bash
+   sbatch tools/validacion_preliminar.sbatch     # o: bash tools/validacion_preliminar.sbatch
+   ```
+
+   Verifica, de lo más barato a lo más caro: (a) el **orden de operandos** de `cublasDgemm` en GEMM y Convolución —y de paso, en Convolución, la indexación del `im2col`, el padding "SAME" y el filtro bloque-diagonal—; (b) una **prueba de humo** de los tres kernels, que confirma que compilan, corren y emiten los CSV con `anchor_every` variando por ruta; (c) los **gates K=0/K=1** del ancla en los tres kernels. Sale con código `0` solo si todo pasa, y corre todos los pasos aunque uno falle, para que un solo job diga todo lo que hay que arreglar.
+
+2. **Lanzar el barrido completo**. En un clúster con SLURM, lo recomendado es:
+
+   ```bash
+   bash run_full_pipeline_pacca.sh          # DRY_RUN=1 imprime el grafo sin enviar
+   ```
+
+   Envía cada fase como un job independiente con `sbatch --parsable` y las encadena con `--dependency=afterok`: la validación preliminar primero, las campañas colgando de ella, Fase 4 de cada kernel dependiendo solo de su propia Fase 3 (los tres kernels en paralelo), y el post-proceso dependiendo de los seis a la vez. Ver la sección 6.1.
+
+   Fuera de un clúster, `run_full_pipeline.sh` corre las mismas fases con `bash` en secuencia. **Su default es la campaña completa, no una prueba de humo** — para eso está `PIPELINE_MODE=smoke`. También se puede lanzar cada `.sbatch` por separado, con las variables documentadas en su README (`N_LIST`/`HW_LIST`/`NX_LIST`/`NY_LIST`, `ITERS_LIST`, `TC_FORMAT`, `COMP_LIST`, `ANCHOR_LIST`); todas aceptan `SMOKE_TEST=1`.
+
+3. **Extraer los CSV**: `extract_csv.py` para Stencil, `extract_csv_chained.py` para GEMM/Convolución (esquema de columnas distinto — ver `Fase_3/tools/README.md`). Los `.sbatch` ya lo invocan automáticamente al terminar.
+
+4. **Correr el análisis**: `python3 Fase_4/tools/run_statistics.py --results-dir results/` (ANOVA + Tukey HSD, Etapa 7) y `python3 Fase_4/tools/pareto_front.py --results-dir results/` (Frente de Pareto 3D, Etapa 9). En el flujo de PACCA esto es el job final `tools/postproceso.sbatch`, que **no pide GPU** a propósito: no hay una sola línea de CUDA en el post-proceso, y ocupar una GPU compartida durante la hora larga que puede tardar el Pareto sería desperdiciarla.
+
+**Antes de reportar tiempo o energía de GEMM/Convolución, lee la advertencia de la sección 7** sobre `t_iter_ms` y `energy_gpu_j` en esos dos kernels.
+
+### 6.1 El grafo de dependencias de `run_full_pipeline_pacca.sh`
+
+```
+                      +--> Fase 1 / Fase 2 (opcionales, sin dependientes)
+  validación          |
+  preliminar ---------+--> F3 GEMM    --> F4 GEMM    --+
+  (los tres           +--> F3 Conv    --> F4 Conv    --+--> post-proceso
+   kernels)           +--> F3 Stencil --> F4 Stencil --+     (sin GPU)
+```
+
+Por qué así, y no un solo proceso largo: `run_full_pipeline.sh` invoca cada `.sbatch` con `bash` en secuencia dentro de **un** proceso, lo que exige tener la GPU reservada de principio a fin. Con las campañas ampliadas (cuatro tamaños × tres barridos de iteraciones × cuatro valores de `K`, en tres kernels) eso son fácilmente decenas de horas seguidas: en un clúster compartido no hay forma de pedir esa reserva, y si el job se cae en la hora 30 se pierde todo.
+
+Dos detalles del grafo que no son arbitrarios:
+
+- **Fase 1 y Fase 2 no están en la cadena de Fase 3/4.** No producen `CSV_*` que el post-proceso consuma, así que meterlas en la cadena solo lograría que un fallo suyo —por ejemplo, CUTLASS sin clonar, que es *opcional*— bloqueara una campaña que no las necesita.
+- **El post-proceso usa `afterok`, no `afterany`.** Si cualquiera de los seis jobs de campaña falla, el ANOVA no arranca. Un análisis estadístico sobre una campaña incompleta es peor que no tenerlo, porque parece un resultado.
 
 ---
 
 ## 7. Cómo analizar los resultados
 
 - **Columnas de CSV**: cada `README.md` de fase documenta el esquema exacto de columnas que produce esa fase (`CSV_DRIFT`, `CSV_SUMMARY`, `CSV_ENERGY`, `CSV_HORIZON`, según la fase).
+- **⚠️ `t_iter_ms`, `gflops` y `energy_gpu_j` de GEMM y Convolución NO distinguen la ruta `_none` de la `_comp`.** Un solo cronómetro envuelve las tres trayectorias de cada iteración (referencia FP64 + WMMA sin compensación + WMMA con compensación) y se imprime idéntico en las dos filas; los dos `PowerBuffer` se abren y cierran en los mismos instantes sobre un contador NVML que es **de todo el dispositivo**, así que las dos columnas de energía son literalmente el mismo número. Consecuencia práctica: los ejes tiempo y energía del Frente de Pareto 3D de esos dos kernels no pueden separar `comp=off` de `comp=on`, y ambos incluyen el costo de la referencia FP64 —que en A100 domina—. **El eje de error (`rel_l2`/`rel_linf`) sí es correcto y sí distingue las rutas.** Stencil no tiene este problema: cronometra y mide energía por ruta. Hallazgo de la auditoría de 2026-09-06, sin corregir; arreglarlo exige reescribir el bucle de medición de los cuatro `.cu` encadenados.
+- **`anchor_every` significa dos cosas distintas según el kernel.** En GEMM/Convolución varía **por fila** dentro de la misma corrida (`_none` = `0`, `_comp` = `K`); en Stencil es una constante de **toda la invocación**, que comparten hasta las filas de `GPU_FP64`/`CPU_FP64` que nunca ejecutan el ancla. Al agrupar o filtrar por esta columna, no asumas la semántica del otro kernel — ver `Fase_4/tools/README.md`.
 - **`energy_gpu_j_per_iter`** es la cantidad comparable entre corridas con distinto número de iteraciones (útil para comparar entre configuraciones de la campaña de ancla, donde el error y la energía a veces necesitan regímenes de `ITERS` distintos — ver la sección 5 y la nota de `tools/README.md` de Fase 3).
 - **`energy_window_reliable`**: descarta (no promedies) filas donde valga `0` — la ventana de medición fue demasiado corta para que el contador NVML sea confiable (ver `common/power_sampling.h`).
 - **Horizonte "medido" vs. "predicho"**: nunca reportes el predicho si el medido está disponible para el mismo punto — el predicho es una extrapolación para casos donde no se puede correr suficientes iteraciones, no una alternativa igual de buena.

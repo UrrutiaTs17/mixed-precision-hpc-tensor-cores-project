@@ -64,17 +64,44 @@ El trabajo de checkpoint (copia D2H + comparación en host) queda **excluido** d
 ## Salida (CSV_DRIFT / CSV_SUMMARY)
 
 ```
-CSV_DRIFT,<formato>_<none|comp>,n,iter,rel_l2,rel_linf,solution_finite
-CSV_SUMMARY,<formato>_<none|comp>,n,iters,t_iter_ms,t_total_ms,gflops,energy_gpu_j,window_reliable,gpu_segments
+CSV_DRIFT,<formato>_<none|comp>,n,iter,rel_l2,rel_linf,solution_finite,anchor_every
+CSV_SUMMARY,<formato>_<none|comp>,n,iters,t_iter_ms,t_total_ms,gflops,energy_gpu_j,window_reliable,gpu_segments,anchor_every
 ```
 
-**No coincide con el esquema de `Fase_3/Stencil/tools/extract_csv.py`** (esa herramienta es específica de Stencil — columnas `nx`/`ny` en vez de `n`, distinta semántica de rutas). Post-procesar estos CSV es trabajo pendiente — ver "Qué falta" abajo.
+`anchor_every` es la última columna y en **este** binario vale siempre `0`: Fase 3 no tiene ancla. La columna existe igual para que el esquema sea idéntico al de `Fase_4/GEMM` — `run_full_pipeline.sh` concatena los `results/` de las dos fases en el mismo análisis, y dos esquemas distintos obligarían a `Fase_4/tools/common_analysis.py` a ramificar por fase.
+
+**No coincide con el esquema de `Fase_3/Stencil`** (columnas `nx`/`ny` en vez de `n`, distinta semántica de rutas). El post-proceso es `../tools/extract_csv_chained.py`, ya integrado al final del `.sbatch`.
+
+## Campaña por defecto
+
+`run_gemm_chained.sbatch` corre, si no se le exporta nada, el barrido completo:
+
+| Variable | Default | Nota |
+|---|---|---|
+| `N_LIST` | `1024 2048 4096 8192` | Potencias de 2. Techo por presupuesto de memoria — ver abajo. |
+| `ITERS_LIST` | `20 40 80` | **Nueva**: reemplaza al escalar `ITERS`, que sigue funcionando y gana si se exporta (`ITERS=20 bash …` = una sola pasada, igual que antes). |
+| `COMP_LIST` | `off on` | |
+| `TC_FORMAT` | `both` | |
+| `SMOKE_TEST` | `0` | `1` recorta a `N=1024`, 3 iteraciones y `RUN_NCU=0`. |
+
+**Presupuesto de memoria (A100-PCIE-40GB, 39.49 GiB)** — no subir `N_LIST` sin rehacer esta cuenta, que está detallada en el propio `.sbatch`. Con `--tc both`, `--comp on` y ancla activa son **90 B por elemento** de la matriz `N×N`:
+
+| `N` | Memoria | Veredicto |
+|---|---|---|
+| 4096 | 1.51 GB | |
+| 8192 | 6.04 GB | 15 % de la tarjeta, margen 6.5× — **techo de la campaña** |
+| 16384 | 24.2 GB | 61 %, sin margen de seguridad — **descartado** |
+| 32768 | 96.6 GB | imposible |
+
+El perfilado NCU se restringe a la primera pasada de `ITERS_LIST`: `wmma_gemm_kernel` es el mismo para cualquier `--iters`, así que repetirlo no produce un dato nuevo.
 
 ## Qué falta
 
 - **`Fase_4/GEMM/`**: ✅ hecho — extensión con el ancla FP64 (`Fase_4/GEMM/gemm_chained.cu`).
 - **`Fase_3/Convolution/`**: ✅ hecho.
-- **`run_gemm_chained.sbatch`**: ✅ hecho — lanzador parametrizado (`N_LIST`, `COMP_LIST`, `TC_FORMAT`, etc. vía `--export`), ver el propio `.sbatch` de esta carpeta.
-- **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py` (`Fase_3/tools/README.md`), ya integrado al final del `.sbatch`.
-- **Scripts de gate** (comparar K=0/K=1 contra la referencia FP64 antes de confiar en una campaña con ancla): todavía no migrados/escritos — ver `Fase_3/tools/README.md`, sección "Qué falta".
-- **Campaña real en PACCA**: compilado y verificado con `N` chico en GPU Ampere+; falta correr el barrido de tamaños que promete el plan (512–4096).
+- **`run_gemm_chained.sbatch`**: ✅ hecho — lanzador parametrizado, ahora con `ITERS_LIST` y `SMOKE_TEST`.
+- **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py`.
+- **Verificación del orden de operandos**: ✅ hecho y **pasado en GPU real** — ver arriba.
+- **Scripts de gate** K=0/K=1: ✅ hechos — `Fase_4/tools/gate3_ancla.py` y `Fase_4/GEMM/gate3_ancla.sbatch`.
+- **`t_iter_ms`/`gflops`/`energy_gpu_j` no distinguen `_none` de `_comp`**: un solo cronómetro envuelve las tres trayectorias de cada iteración (referencia FP64 + WMMA sin comp + WMMA con comp) y se imprime idéntico en las dos filas; los dos `PowerBuffer` se abren y cierran en los mismos instantes sobre un contador NVML **de todo el dispositivo**, así que las dos columnas de energía son literalmente el mismo número. Los ejes tiempo y energía del Frente de Pareto de este kernel no pueden separar `comp=off` de `comp=on`, y ambos incluyen el costo de la referencia FP64. Hallazgo de la auditoría de 2026-09-06, **sin corregir**: arreglarlo exige reescribir el bucle de medición.
+- **Campaña real en PACCA**: compilado y verificado con `N` chico en GPU Ampere+; falta el barrido completo.

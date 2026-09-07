@@ -61,9 +61,33 @@ El ancla agrega 4 buffers `double` de tamaño `N²` (`d_comp64_in`, `d_comp64_ou
 
 (El resto de flags — `--n`, `--iters`, `--tc`, `--comp`, `--checkpoint-every`, `--csv`, `--seed`, `--target-lambda` — son idénticos a `Fase_3/GEMM/gemm_chained.cu`, ver su README.)
 
+## Campaña por defecto
+
+`run_gemm_chained.sbatch` corre el barrido completo si no se le exporta nada:
+
+| Variable | Default | Nota |
+|---|---|---|
+| `N_LIST` | `1024 2048 4096 8192` | Techo por memoria: 90 B/elemento con `--tc both`, `--comp on` y ancla → 6.04 GB a `N=8192`. `N=16384` (24.2 GB, 61 % de la tarjeta) queda **descartado** por falta de margen. El cálculo completo está en el `.sbatch`. |
+| `ITERS_LIST` | `20 40 80` | **Nueva**: reemplaza al escalar `ITERS`, que sigue funcionando y gana si se exporta. |
+| `ANCHOR_LIST` | `0 1 5 20` | `0` control, `1` gate de exactitud, `5` y `20` los intermedios que responden la pregunta real. |
+| `COMP_LIST` | `off on` | `ANCHOR_LIST` solo se recorre con `COMP=on`. |
+| `SMOKE_TEST` | `0` | `1` recorta a `N=1024`, 3 iteraciones, `ANCHOR_LIST="0 1"` y `RUN_NCU=0`. |
+
+## `anchor_every` en el CSV: columna real, **por fila**
+
+`CSV_DRIFT` y `CSV_SUMMARY` la traen como última columna. Varía **dentro de la misma invocación**: la ruta `_none` reporta `0` siempre y la `_comp` el valor real de `K`, porque las dos rutas corren en la misma pasada del binario y el ancla solo aplica a la compensada (`parse_args` exige `--comp on` para `K>0`).
+
+Eso **no** es lo mismo que en Stencil, donde `anchor_every` es una constante de la invocación completa que comparten hasta las filas de `GPU_FP64`/`CPU_FP64`. Ver `Fase_4/tools/README.md`. Comprobado en GPU real:
+
+```
+CSV_SUMMARY,FP16_none,64,4,20.8294,83.3177,14.4982,NA,0,3,0
+CSV_SUMMARY,FP16_comp,64,4,20.8294,83.3177,14.4982,NA,0,3,2
+```
+
 ## Qué falta
 
-- **`run_gemm_chained.sbatch`**: ✅ hecho — con barrido de `ANCHOR_LIST`, ver el propio `.sbatch` de esta carpeta.
-- **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py` reconstruye `anchor_every` por fila leyendo la línea de configuración que el binario imprime al arrancar cada corrida (el CSV en sí no trae esa columna todavía — ver `Fase_4/tools/README.md`).
-- **Scripts de gate** (K=0/K=1, automatizados): todavía no existen para GEMM — ver `Fase_4/tools/README.md`, sección "Qué falta". Mientras tanto, correr las dos puertas de la sección "Validación" arriba a mano, con `--export=ALL,ANCHOR_LIST="0 1"`.
-- **Campaña real en PACCA**: compilado y verificado con `--n` chico en GPU Ampere+; falta correr el barrido de tamaños y valores de K que promete el plan.
+- **`run_gemm_chained.sbatch`**: ✅ hecho — con `ANCHOR_LIST`, `ITERS_LIST` y `SMOKE_TEST`.
+- **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py` lee `anchor_every` **directo de la fila** (conserva la reconstrucción desde la línea de cabecera solo como respaldo para logs viejos).
+- **Scripts de gate** (K=0/K=1, automatizados): ✅ hechos — `gate3_ancla.sbatch` de esta carpeta y `../tools/gate3_ancla.py`.
+- **`t_iter_ms`/`gflops`/`energy_gpu_j` no distinguen `_none` de `_comp`**: un solo cronómetro envuelve las tres trayectorias de cada iteración (referencia FP64 + WMMA sin comp + WMMA con comp) y se imprime idéntico en las dos filas; los dos `PowerBuffer` se abren y cierran en los mismos instantes sobre un contador NVML **de todo el dispositivo**, así que las dos columnas de energía son el mismo número. Los ejes tiempo y energía del Frente de Pareto de este kernel no pueden separar `comp=off` de `comp=on`, y ambos incluyen el costo de la referencia FP64 — que en A100 domina. Hallazgo de la auditoría de 2026-09-06, **sin corregir**: exige reescribir el bucle de medición de los cuatro `.cu` encadenados. Se ve en el ejemplo de arriba (`20.8294` en las dos filas).
+- **Campaña real en PACCA**: compilado y verificado con `--n` chico; falta el barrido completo. Antes de lanzarlo, `tools/validacion_preliminar.sbatch`.

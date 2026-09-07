@@ -364,6 +364,17 @@ consistentes en todas las familias de token.
 
 ## Hallazgos de la auditoría (para tener en cuenta al usar este kernel)
 
+0. **`NX_LIST`/`NY_LIST`** (nuevo). `run_stencil_tc.sbatch` ya no corre un solo
+   tamaño: barre `4096 8192 16384` por defecto, los mismos tres de la campaña
+   de drift ya publicada. Las dos listas se recorren **emparejadas**, no como
+   producto cartesiano — todo el análisis aguas abajo asume mallas cuadradas
+   (`Fase_4/tools/common_analysis.py` colapsa `(nx, ny)` a una sola columna
+   `size` usando solo `nx`), así que un producto 3×3 generaría 6 corridas
+   rectangulares mal etiquetadas sin avisar. Listas de distinta longitud dan
+   error explícito. `NX`/`NY` siguen funcionando y **ganan** si se exportan:
+   `NX=8192 NY=8192 bash run_stencil_tc.sbatch` corre un solo tamaño, igual
+   que antes de este cambio.
+
 1. **Rango de `NX`/`NY` nunca ejercitado por debajo de 4096²**. Los flags
    `--nx`/`--ny` no tienen ningún límite superior a lo que el hardware
    soporte, y los dos `.sbatch` de esta carpeta ya los exponen como variables

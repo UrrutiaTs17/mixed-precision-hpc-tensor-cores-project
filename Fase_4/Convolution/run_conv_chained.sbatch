@@ -17,9 +17,14 @@
 # Fase_4/GEMM/run_gemm_chained.sbatch para el razonamiento completo sobre
 # como se combina ANCHOR_LIST con COMP_LIST (identico aqui).
 #
-#   sbatch run_conv_chained.sbatch                                     # ANCHOR_LIST=0 (sin ancla)
+#   sbatch run_conv_chained.sbatch                                     # CAMPANA COMPLETA
+#   sbatch --export=ALL,SMOKE_TEST=1 run_conv_chained.sbatch           # prueba de humo
 #   sbatch --export=ALL,ANCHOR_LIST="0 1" run_conv_chained.sbatch      # gates K=0 / K=1
 #   sbatch --export=ALL,ANCHOR_LIST="2 5 10 20" run_conv_chained.sbatch  # barrido
+#
+# OJO: el default de HW_LIST/ITERS_LIST/ANCHOR_LIST es la CAMPANA COMPLETA, no
+# una prueba rapida. Para eso esta SMOKE_TEST=1. Los gates K=0/K=1 se lanzan
+# con gate3_ancla.sbatch de esta misma carpeta.
 
 set -euo pipefail
 
@@ -68,16 +73,55 @@ else
     echo "NVML no disponible para el enlace; se usara el stub de telemetria GPU."
 fi
 
-# --- Barrido: tamano espacial, formato, compensacion --------------------------
-HW_LIST="${HW_LIST:-64}"
-ITERS="${ITERS:-20}"
+# --- Prueba de humo ----------------------------------------------------------
+# SMOKE_TEST=1 recorta el barrido al punto mas chico y a 3 iteraciones: sirve
+# para confirmar que el binario compila, corre y emite CSV_SUMMARY/CSV_DRIFT
+# bien formados (con la columna anchor_every) ANTES de comprometer horas de
+# cola. No es un punto de campana.
+SMOKE_TEST="${SMOKE_TEST:-0}"
+
+# --- Barrido: tamano espacial, iteraciones, formato, compensacion ------------
+# PRESUPUESTO DE MEMORIA (A100-PCIE-40GB, 39.49 GiB) -- CALCULO CORREGIDO.
+# conv_chained.cu NO usa cuDNN ni CUTLASS (eso es Fase 2): reescribe la
+# convolucion como GEMM con un im2col propio y la resuelve con el mismo kernel
+# WMMA y las mismas llamadas cublasDgemm que GEMM, asi que todos los buffers
+# son cudaMalloc de tamano conocido -- se calcula con la misma precision que el
+# de GEMM, sin el workspace impredecible de una libreria.
+#
+# Por elemento de campo (kChannels*hw^2 = 64*hw^2), con --tc both, --comp on y
+# ancla activa; el im2col en double (kCRS*hw^2 = 576*hw^2, 9x el campo) domina:
+#     referencia FP64 16 B | im2col double 72 B | ruta sin comp 26 B
+#     ruta con comp   56 B | ancla FP64    32 B   -> 202 B/elemento de campo
+#   = 12.9 KB por celda espacial
+#   hw=256  -> 0.85 GB    hw=512  -> 3.39 GB (12x de margen)
+#   hw=1024 -> 13.6 GB (2.9x: techo bajo el criterio de 2x)
+#   hw=2048 -> 54.2 GB (imposible)
+# Ver el comentario extenso equivalente en Fase_3/Convolution/run_conv_chained.sbatch
+# para la referencia cruzada con GEMM y por que el limite queda en 512.
+#
+# ITERS_LIST reemplaza al antiguo escalar ITERS, que SIGUE funcionando y GANA
+# si se exporta (`ITERS=20 bash run_conv_chained.sbatch` = una sola pasada).
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    HW_LIST="${HW_LIST:-64}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-3}}"
+    RUN_NCU="${RUN_NCU:-0}"
+else
+    HW_LIST="${HW_LIST:-64 128 256 512}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-20 40 80}}"
+fi
 TC_FORMAT="${TC_FORMAT:-both}"
 COMP_LIST="${COMP_LIST:-off on}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 SEED="${SEED:-42}"
 
 # --- ANCLA FP64 (Fase 4) -----------------------------------------------------
-ANCHOR_LIST="${ANCHOR_LIST:-0}"
+# Misma escala de K que GEMM (0 control, 1 gate, 5 y 20 intermedios). En
+# SMOKE_TEST solo K=0 y K=1.
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    ANCHOR_LIST="${ANCHOR_LIST:-0 1}"
+else
+    ANCHOR_LIST="${ANCHOR_LIST:-0 1 5 20}"
+fi
 _comp_has_on=0
 for _c in ${COMP_LIST}; do [[ "${_c}" == "on" ]] && _comp_has_on=1; done
 if [[ "${_comp_has_on}" == "0" ]]; then
@@ -121,7 +165,7 @@ echo "GIT_COMMIT=${GIT_COMMIT}"
 echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=HW_LIST=${HW_LIST} ITERS=${ITERS} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED} ANCHOR_LIST=${ANCHOR_LIST}"
+echo "RUN_PARAMS=HW_LIST=${HW_LIST} ITERS_LIST=${ITERS_LIST} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED} ANCHOR_LIST=${ANCHOR_LIST} SMOKE_TEST=${SMOKE_TEST}"
 
 _nvcc_dir="$(dirname "${NVCC}")"
 if [[ -z "${CUOBJDUMP:-}" ]]; then
@@ -155,8 +199,16 @@ done
 
 echo "Ejecutando conv_chained (Fase 4: encadenamiento + ancla FP64)..."
 
+# El perfilado NCU se restringe a la PRIMERA pasada de ITERS_LIST y de
+# ANCHOR_LIST: ncu mide wmma_gemm_kernel en un solo lanzamiento y ese kernel es
+# identico para cualquier --iters y cualquier K (el ancla sustituye el paso, no
+# cambia el kernel), asi que repetirlo multiplicaria el tiempo de cola sin
+# producir un dato nuevo.
+read -r _iters_first _ <<< "${ITERS_LIST}"
+
 {
 for HW in ${HW_LIST}; do
+  for ITERS in ${ITERS_LIST}; do
     for COMP in ${COMP_LIST}; do
         if [[ "${COMP}" == "on" ]]; then
             _anchor_values="${ANCHOR_LIST}"
@@ -173,7 +225,7 @@ for HW in ${HW_LIST}; do
                 --seed "${SEED}" --anchor-every "${ANCHOR}"
 
             read -r _anchor_first _ <<< "${_anchor_values}"
-            if [[ "${ANCHOR}" != "${_anchor_first}" ]]; then
+            if [[ "${ANCHOR}" != "${_anchor_first}" || "${ITERS}" != "${_iters_first}" ]]; then
                 continue
             fi
 
@@ -192,6 +244,7 @@ for HW in ${HW_LIST}; do
             fi
         done
     done
+  done
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 

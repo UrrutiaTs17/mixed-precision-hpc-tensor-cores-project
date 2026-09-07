@@ -110,8 +110,33 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 # campana real en el rango 512^2-2048^2 pese a que el flag siempre lo permitio;
 # antes de generar datos en ese rango conviene revalidar al menos el horizonte
 # de overflow medido alli.
-NX="${NX:-16384}"
-NY="${NY:-16384}"
+# NX_LIST/NY_LIST reemplazan a los escalares NX/NY. Las variables NX y NY
+# SIGUEN funcionando y GANAN si se exportan: `NX=8192 NY=8192 bash
+# run_stencil_tc.sbatch` corre un solo tamano, exactamente como antes de este
+# cambio. Solo cuando NO se exportan se usa el barrido de campana.
+#
+# Los tres tamanos por defecto son los MISMOS de la campana de drift ya
+# publicada (seccion 3.3.2 del documento de resultados) -- no valores nuevos
+# sin correr.
+#
+# PRESUPUESTO DE MEMORIA (A100-PCIE-40GB, 39.49 GiB). Por celda de la malla, en
+# la ruta WMMA con compensacion espacial y ancla activa (el caso mas caro; los
+# buffers se liberan entre formatos, asi que el pico es por ruta):
+#     d_in_fp32 + d_out_fp32          8 B
+#     d_in_tc   + d_out_tc            4 B
+#     d_comp    + d_comp_prev         8 B   (ping-pong de Spatial)
+#     ancla FP64 (4 buffers double)  32 B
+#                                   ------
+#                                    52 B/celda
+#   4096^2  ->  0.87 GB    8192^2  ->  3.5 GB    16384^2 -> 14.0 GB (35 %)
+#   20480^2 -> 21.8 GB (justo en el limite del criterio de 2x: DESCARTADO)
+#   32768^2 -> 55.8 GB (excede la memoria fisica)
+# OJO con la memoria de HOST, que a 16384 es el recurso mas ajustado: los
+# checkpoints FP64 viven en RAM (nx*ny*8 B cada uno) y con CHECKPOINT_EVERY=5 e
+# ITERS=120 son 24 checkpoints = 51.5 GB. Cabe en --mem=128G, pero subir ITERS
+# o bajar CHECKPOINT_EVERY a este tamano no.
+NX_LIST="${NX_LIST:-${NX:-4096 8192 16384}}"
+NY_LIST="${NY_LIST:-${NY:-4096 8192 16384}}"
 # Formato(s) Tensor Core de las corridas de MEDICION (--tc del binario).
 TC_FORMAT="${TC_FORMAT:-both}"
 # Barrido de ITERACIONES: 10..120 caen dentro del horizonte de FP32/BF16/FP16
@@ -340,7 +365,7 @@ echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "NVCC_FLAGS=${NVCC_FLAGS}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=NX=${NX} NY=${NY} TC_FORMAT=${TC_FORMAT} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP64_GPU=${FP64_GPU} CPU_FP64=${CPU_FP64}"
+echo "RUN_PARAMS=NX_LIST=${NX_LIST} NY_LIST=${NY_LIST} TC_FORMAT=${TC_FORMAT} ITERS_LIST=${ITERS_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} KAHAN_LIST=${KAHAN_LIST} SPATIAL_COMP=${SPATIAL_COMP} FP64_GPU=${FP64_GPU} CPU_FP64=${CPU_FP64} SMOKE_TEST=${SMOKE_TEST}"
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no
@@ -383,15 +408,53 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
     declare -a RUNS=(
         "512 512 3 ${TC_FORMAT}"
     )
+    # Se declaran igual para que el aviso temprano de NCU (mas abajo) pueda
+    # recorrerlas sin disparar `set -u` si alguien combina SMOKE_TEST=1 con
+    # RUN_NCU=1 a mano.
+    declare -a _nx_arr=(512)
+    declare -a _ny_arr=(512)
 else
-    # NX/NY son configurables via variables de entorno; ver el bloque
-    # "Tamano de malla y barrido de iteraciones" mas arriba (incluye el
-    # hallazgo de auditoria sobre el rango 512^2-2048^2 nunca ejercitado).
+    # NX_LIST/NY_LIST/ITERS_LIST son configurables via variables de entorno;
+    # ver el bloque "Tamano de malla y barrido de iteraciones" mas arriba
+    # (incluye el presupuesto de memoria y el hallazgo de auditoria sobre el
+    # rango 512^2-2048^2 nunca ejercitado).
+    #
+    # NX_LIST y NY_LIST se recorren EMPAREJADAS elemento a elemento, NO como
+    # producto cartesiano. Motivo concreto, no estilistico: todo el analisis
+    # aguas abajo asume mallas CUADRADAS -- Fase_4/tools/common_analysis.py
+    # colapsa (nx, ny) a una sola columna `size` usando solo nx, y lo dice
+    # explicitamente ("nx==ny en todas las campanas de este proyecto"). Un
+    # producto cartesiano de 3x3 generaria 6 corridas rectangulares que ese
+    # modulo etiquetaria con un `size` que no las describe, sin avisar.
+    declare -a _nx_arr=(${NX_LIST})
+    declare -a _ny_arr=(${NY_LIST})
+    if [[ "${#_nx_arr[@]}" -ne "${#_ny_arr[@]}" ]]; then
+        echo "ERROR: NX_LIST ('${NX_LIST}', ${#_nx_arr[@]} valores) y NY_LIST" \
+             "('${NY_LIST}', ${#_ny_arr[@]} valores) deben tener la MISMA" \
+             "cantidad de elementos: se recorren emparejadas, no como producto" \
+             "cartesiano (ver el comentario aqui arriba)." >&2
+        exit 2
+    fi
     declare -a RUNS=()
-    for ITERS_VAL in ${ITERS_LIST}; do
-        RUNS+=("${NX} ${NY} ${ITERS_VAL} ${TC_FORMAT}")
+    for _i in "${!_nx_arr[@]}"; do
+        for ITERS_VAL in ${ITERS_LIST}; do
+            RUNS+=("${_nx_arr[$_i]} ${_ny_arr[$_i]} ${ITERS_VAL} ${TC_FORMAT}")
+        done
     done
 fi
+
+# Perfilado NCU: se restringe a UN SOLO tamano de malla (el primero de
+# NX_LIST/NY_LIST por defecto), ademas de a un solo ITERS y una sola politica.
+# Es deliberado: ncu mide stencil2d_wmma_kernel, y ese kernel es el mismo a
+# cualquier tamano de malla -- perfilarlo a 4096, 8192 y 16384 no dice nada
+# nuevo sobre el uso de Tensor Cores, solo sobre escala de memoria, que ya se
+# mide con t_iter_ms y las columnas de energia de la propia campana. A cambio,
+# triplicaria el tiempo del bloque de perfilado, que con --set full es la parte
+# mas cara del job. NCU_NX/NCU_NY permiten elegir otro tamano si hace falta.
+# Se toma de _nx_arr/_ny_arr y no de NX_LIST/NY_LIST para que en SMOKE_TEST=1
+# apunte a la malla chica de la prueba de humo (512x512) y no a la de campana.
+NCU_NX="${NCU_NX:-${_nx_arr[0]}}"
+NCU_NY="${NCU_NY:-${_ny_arr[0]}}"
 
 # Perfila UN solo kernel (regex + tc_type que lo activa) con --profile-only en
 # el binario: evita recalcular la referencia CPU FP32 y la FP64 encadenada
@@ -442,6 +505,21 @@ if [[ "${RUN_NCU}" == "1" ]]; then
              "ITERS_LIST='${ITERS_LIST}': esta corrida NO generara ningun reporte NCU." \
              "Alinee ITERS_NCU con algun valor de ITERS_LIST para perfilar." >&2
     fi
+    # Mismo aviso temprano para la malla: el perfilado tambien se restringe a
+    # NCU_NX/NCU_NY (ver el bloque donde se definen). Si no estan en las listas,
+    # la corrida entera termina sin un solo .ncu-rep, y descubrirlo despues de
+    # horas de cola es exactamente lo que este aviso evita.
+    NCU_MALLA_MATCH=0
+    for _i in "${!_nx_arr[@]}"; do
+        if [[ "${_nx_arr[$_i]}" == "${NCU_NX}" && "${_ny_arr[$_i]}" == "${NCU_NY}" ]]; then
+            NCU_MALLA_MATCH=1
+        fi
+    done
+    if [[ "${NCU_MALLA_MATCH}" == "0" ]]; then
+        echo "AVISO: RUN_NCU=1 pero la malla de perfilado NCU_NX x NCU_NY =" \
+             "${NCU_NX}x${NCU_NY} no es ninguna de las de NX_LIST='${NX_LIST}' /" \
+             "NY_LIST='${NY_LIST}': esta corrida NO generara ningun reporte NCU." >&2
+    fi
 fi
 
 # Una sola invocacion de tee envuelve TODO el bucle (todas las combinaciones
@@ -462,7 +540,8 @@ for run in "${RUNS[@]}"; do
             --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}" \
             --cpu-fp64 "${CPU_FP64}" "${OP_ARGS[@]}"
 
-        if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" ]]; then
+        if [[ "${RUN_NCU}" == "1" && "${ITERS}" == "${ITERS_NCU}" \
+              && "${NX}" == "${NCU_NX}" && "${NY}" == "${NCU_NY}" ]]; then
             # Con --tc both el binario lanza primero todos los kernels FP16 y luego
             # los BF16; como --launch-skip cuenta lanzamientos que matchean el regex
             # de forma global, un solo pase de ncu con skip=3 solo capturaria la
@@ -525,10 +604,11 @@ for run in "${RUNS[@]}"; do
             fi
         elif [[ "${RUN_NCU}" == "1" ]]; then
             echo
-            echo "AVISO: NCU omitido en esta corrida: ITERS=${ITERS} no coincide con" \
-                 "ITERS_NCU=${ITERS_NCU}. El perfilado solo se dispara en el valor de" \
-                 "ITERS_LIST igual a ITERS_NCU (ITERS_LIST='${ITERS_LIST}'); si ninguno" \
-                 "coincide, esta corrida no generara ningun .ncu-rep." >&2
+            echo "AVISO: NCU omitido en esta corrida (ITERS=${ITERS}, NX=${NX}, NY=${NY})." \
+                 "El perfilado solo se dispara cuando ITERS==ITERS_NCU (${ITERS_NCU}) Y" \
+                 "la malla es la de NCU_NX/NCU_NY (${NCU_NX}x${NCU_NY}). Si ningun valor" \
+                 "de ITERS_LIST='${ITERS_LIST}' coincide con ITERS_NCU, o NCU_NX/NCU_NY" \
+                 "no estan en NX_LIST/NY_LIST, esta corrida no generara ningun .ncu-rep." >&2
         fi
     done
 done

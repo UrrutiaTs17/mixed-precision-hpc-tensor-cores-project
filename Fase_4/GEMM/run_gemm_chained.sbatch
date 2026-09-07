@@ -14,9 +14,15 @@
 # barrer --anchor-every (ancla FP64). Con ANCHOR_LIST="0" (el default) el
 # comportamiento es identico al de Fase 3.
 #
-#   sbatch run_gemm_chained.sbatch                                     # ANCHOR_LIST=0 (sin ancla)
+#   sbatch run_gemm_chained.sbatch                                     # CAMPANA COMPLETA
+#   sbatch --export=ALL,SMOKE_TEST=1 run_gemm_chained.sbatch           # prueba de humo
 #   sbatch --export=ALL,ANCHOR_LIST="0 1" run_gemm_chained.sbatch      # gates K=0 / K=1
 #   sbatch --export=ALL,ANCHOR_LIST="2 5 10 20" run_gemm_chained.sbatch  # barrido
+#
+# OJO: el default de N_LIST/ITERS_LIST/ANCHOR_LIST es la CAMPANA COMPLETA (ver
+# las secciones de barrido mas abajo), no una prueba rapida. Para eso esta
+# SMOKE_TEST=1. Los gates K=0/K=1 se lanzan con gate3_ancla.sbatch de esta
+# misma carpeta, que no necesita el barrido completo.
 #
 # El ancla solo aplica a la ruta CON compensacion (el binario rechaza
 # --anchor-every>0 sin --comp on) -- este script, a diferencia de
@@ -72,9 +78,44 @@ else
     echo "NVML no disponible para el enlace; se usara el stub de telemetria GPU."
 fi
 
-# --- Barrido: tamanos, formato, compensacion ---------------------------------
-N_LIST="${N_LIST:-1024}"
-ITERS="${ITERS:-20}"
+# --- Prueba de humo ----------------------------------------------------------
+# SMOKE_TEST=1 recorta el barrido al punto mas chico de cada lista y a 3
+# iteraciones: confirma que el binario compila, corre y emite CSV_SUMMARY/
+# CSV_DRIFT bien formados (con la columna anchor_every) ANTES de comprometer
+# horas de cola. NO es un punto de la campana; sus numeros no se reportan.
+SMOKE_TEST="${SMOKE_TEST:-0}"
+
+# --- Barrido: tamanos, iteraciones, formato, compensacion --------------------
+# N_LIST: cada valor debe ser potencia de 2 (Sylvester-Hadamard).
+#
+# PRESUPUESTO DE MEMORIA (A100-PCIE-40GB, 39.49 GiB) -- no subir N_LIST sin
+# rehacer esta cuenta. Por elemento de la matriz NxN, con --tc both, --comp on
+# y el ancla activa (el caso mas caro):
+#     referencia FP64 (d_x64_in/out)          16 B
+#     operador A en fp64 + fp16 + bf16        12 B
+#     ruta sin comp  (2xT + t_raw)             8 B
+#     ruta con comp  (2xT + t_raw + 2xcomp
+#                     + comp_tc_raw + comp_as_tc)  22 B
+#     ancla FP64 (4 buffers double)           32 B
+#                                            -------
+#                                             90 B/elemento
+#   N=4096 ->  1.51 GB     N=8192  ->  6.04 GB   (15 % de la tarjeta)
+#   N=16384 -> 24.2 GB (61 %: DESCARTADO, sin margen de seguridad)
+#   N=32768 -> 96.6 GB (imposible)
+# El limite superior 8192 deja un margen de 6.5x sobre la memoria fisica.
+#
+# ITERS_LIST reemplaza al antiguo escalar ITERS. La variable ITERS SIGUE
+# funcionando y GANA si se exporta: `ITERS=20 bash run_gemm_chained.sbatch`
+# corre una sola pasada a 20 iteraciones, exactamente como antes de este
+# cambio. Solo cuando NO se exporta se usa el barrido de campana.
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    N_LIST="${N_LIST:-1024}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-3}}"
+    RUN_NCU="${RUN_NCU:-0}"
+else
+    N_LIST="${N_LIST:-1024 2048 4096 8192}"
+    ITERS_LIST="${ITERS_LIST:-${ITERS:-20 40 80}}"
+fi
 TC_FORMAT="${TC_FORMAT:-both}"
 COMP_LIST="${COMP_LIST:-off on}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
@@ -85,7 +126,15 @@ TARGET_LAMBDA="${TARGET_LAMBDA:-1.1}"
 # Ver el comentario de cabecera del archivo. Aviso temprano si se pide un K>0
 # sin que COMP_LIST incluya "on" en absoluto (si lo incluye, el bucle
 # principal ya se encarga de nunca combinar COMP=off con ANCHOR>0).
-ANCHOR_LIST="${ANCHOR_LIST:-0}"
+# Escala de K de la campana (Tarea 5 del prompt de auditoria): 0 (control, sin
+# ancla), 1 (gate de exactitud), 5 y 20 (los dos K intermedios que responden la
+# pregunta real: cuanto se recupera y a que costo). En SMOKE_TEST solo K=0 y
+# K=1, que son los dos que hay que validar antes de cualquier campana.
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    ANCHOR_LIST="${ANCHOR_LIST:-0 1}"
+else
+    ANCHOR_LIST="${ANCHOR_LIST:-0 1 5 20}"
+fi
 _comp_has_on=0
 for _c in ${COMP_LIST}; do [[ "${_c}" == "on" ]] && _comp_has_on=1; done
 if [[ "${_comp_has_on}" == "0" ]]; then
@@ -129,7 +178,7 @@ echo "GIT_COMMIT=${GIT_COMMIT}"
 echo "GIT_STATUS=${GIT_STATUS}"
 echo "BUILD_DATE=${BUILD_DATE}"
 echo "BIN_SHA256=${BIN_SHA256}"
-echo "RUN_PARAMS=N_LIST=${N_LIST} ITERS=${ITERS} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED} TARGET_LAMBDA=${TARGET_LAMBDA} ANCHOR_LIST=${ANCHOR_LIST}"
+echo "RUN_PARAMS=N_LIST=${N_LIST} ITERS_LIST=${ITERS_LIST} TC_FORMAT=${TC_FORMAT} COMP_LIST=${COMP_LIST} CHECKPOINT_EVERY=${CHECKPOINT_EVERY} SEED=${SEED} TARGET_LAMBDA=${TARGET_LAMBDA} ANCHOR_LIST=${ANCHOR_LIST} SMOKE_TEST=${SMOKE_TEST}"
 
 _nvcc_dir="$(dirname "${NVCC}")"
 if [[ -z "${CUOBJDUMP:-}" ]]; then
@@ -163,8 +212,16 @@ done
 
 echo "Ejecutando gemm_chained (Fase 4: encadenamiento + ancla FP64)..."
 
+# El perfilado NCU se restringe a la PRIMERA pasada de ITERS_LIST (ademas de
+# la primera de ANCHOR_LIST, ver abajo): ncu mide wmma_gemm_kernel en un solo
+# lanzamiento y ese kernel es identico para cualquier --iters, asi que
+# repetirlo por cada valor de la lista multiplicaria el tiempo de cola sin
+# producir un dato nuevo.
+read -r _iters_first _ <<< "${ITERS_LIST}"
+
 {
 for N in ${N_LIST}; do
+  for ITERS in ${ITERS_LIST}; do
     for COMP in ${COMP_LIST}; do
         # ANCLA FP64 (Fase 4): solo se barre ANCHOR_LIST cuando COMP=on -- con
         # COMP=off la unica pasada valida es K=0 (ver el aviso temprano arriba
@@ -184,12 +241,12 @@ for N in ${N_LIST}; do
                 --seed "${SEED}" --target-lambda "${TARGET_LAMBDA}" \
                 --anchor-every "${ANCHOR}"
 
-            # El perfilado NCU no depende de ANCHOR: mide wmma_gemm_kernel en
-            # un paso normal, que el ancla no modifica (ver Fase_4/GEMM/README.md
-            # -- el ancla sustituye el paso, no cambia el kernel). Se restringe
-            # a la primera pasada de _anchor_values.
+            # El perfilado NCU no depende de ANCHOR ni de ITERS: mide
+            # wmma_gemm_kernel en un paso normal, que el ancla no modifica (ver
+            # Fase_4/GEMM/README.md -- el ancla sustituye el paso, no cambia el
+            # kernel). Se restringe a la primera pasada de ambas listas.
             read -r _anchor_first _ <<< "${_anchor_values}"
-            if [[ "${ANCHOR}" != "${_anchor_first}" ]]; then
+            if [[ "${ANCHOR}" != "${_anchor_first}" || "${ITERS}" != "${_iters_first}" ]]; then
                 continue
             fi
 
@@ -208,6 +265,7 @@ for N in ${N_LIST}; do
             fi
         done
     done
+  done
 done
 } 2>&1 | tee -a "${RESULTS_LOG}"
 

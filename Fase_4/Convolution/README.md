@@ -53,9 +53,31 @@ El ancla agrega 4 buffers `double` de tamaño `kChannels·hw²` (`d_comp64_in`, 
 
 (El resto de flags — `--hw`, `--iters`, `--tc`, `--comp`, `--checkpoint-every`, `--seed` — son idénticos a `Fase_3/Convolution/conv_chained.cu`, ver su README.)
 
+## Campaña por defecto
+
+`run_conv_chained.sbatch` corre el barrido completo si no se le exporta nada:
+
+| Variable | Default | Nota |
+|---|---|---|
+| `HW_LIST` | `64 128 256 512` | Techo por memoria: 202 B/elemento de campo (12.9 KB por celda espacial) → 3.39 GB a `hw=512`, margen 12×. `hw=1024` (13.6 GB) es el techo real bajo el criterio de 2×; `hw=2048` (54.2 GB) es imposible. El cálculo completo, y por qué **no** es un workspace de cuDNN, están en `Fase_3/Convolution/README.md` y en el propio `.sbatch`. |
+| `ITERS_LIST` | `20 40 80` | **Nueva**: reemplaza al escalar `ITERS`, que sigue funcionando y gana si se exporta. |
+| `ANCHOR_LIST` | `0 1 5 20` | Misma escala que GEMM. |
+| `COMP_LIST` | `off on` | `ANCHOR_LIST` solo se recorre con `COMP=on`. |
+| `SMOKE_TEST` | `0` | `1` recorta a `hw=64`, 3 iteraciones, `ANCHOR_LIST="0 1"` y `RUN_NCU=0`. |
+
+## `anchor_every` en el CSV: columna real, **por fila**
+
+Última columna de `CSV_DRIFT` y `CSV_SUMMARY`. Varía dentro de la misma invocación (`_none` = `0`, `_comp` = `K`), igual que en GEMM y a diferencia de Stencil. Comprobado en GPU real:
+
+```
+CSV_DRIFT,FP16_none,64,2,0.000322504,0.000595989,1,0
+CSV_DRIFT,FP16_comp,64,2,0.000205673,0.000300221,1,2
+```
+
 ## Qué falta
 
-- **`run_conv_chained.sbatch`**: ✅ hecho — con barrido de `ANCHOR_LIST`, ver el propio `.sbatch` de esta carpeta.
-- **Post-proceso de CSV**: ✅ hecho — mismo `../tools/extract_csv_chained.py` que GEMM (ver `Fase_4/tools/README.md`), reconstruye `anchor_every` por fila desde la línea de configuración del binario.
-- **Scripts de gate** (K=0/K=1, automatizados): todavía no existen para Convolución — ver `Fase_4/tools/README.md`, sección "Qué falta". Mientras tanto, correr las dos puertas de la sección "Validación" arriba a mano, con `--export=ALL,ANCHOR_LIST="0 1"`.
-- **Campaña real en PACCA**: compilado y verificado con `--hw` chico en GPU Ampere+; falta correr el barrido de tamaños y valores de K que promete el plan.
+- **`run_conv_chained.sbatch`**: ✅ hecho — con `ANCHOR_LIST`, `ITERS_LIST` y `SMOKE_TEST`.
+- **Post-proceso de CSV**: ✅ hecho — mismo `../tools/extract_csv_chained.py` que GEMM, que ahora lee `anchor_every` **directo de la fila**.
+- **Scripts de gate** (K=0/K=1, automatizados): ✅ hechos — `gate3_ancla.sbatch` de esta carpeta y `../tools/gate3_ancla.py`. Las dos puertas **pasan** en GPU Ampere real.
+- **`t_iter_ms`/`gflops`/`energy_gpu_j` no distinguen `_none` de `_comp`**: mismo hallazgo (y misma causa) que documenta `Fase_4/GEMM/README.md` en su "Qué falta". Sin corregir.
+- **Campaña real en PACCA**: compilado y verificado con `--hw` chico; falta el barrido completo. Antes de lanzarlo, `tools/validacion_preliminar.sbatch`.
