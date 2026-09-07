@@ -35,6 +35,11 @@
 #           (_none=0, _comp=K) dentro de la misma corrida.
 #   PASO 3  Gate K=0 y K=1 de los tres kernels (gate3_ancla.sbatch de cada
 #           carpeta de Fase 4).
+#   PASO 4  Gate de MEDICION en GEMM y Convolucion: que t_iter_ms y
+#           energy_gpu_j distingan una ruta de otra y que la referencia FP64
+#           se reporte aparte (Fase_4/tools/gate4_medicion.py). Reutiliza los
+#           logs del paso 3, asi que no cuesta ninguna corrida extra. Stencil
+#           no se evalua: su medicion siempre fue por ruta.
 #
 # Solo cuando este job termina con codigo 0 tiene sentido enviar las campanas
 # completas (run_full_pipeline_pacca.sh ya lo encadena asi: las campanas
@@ -163,6 +168,30 @@ else
     paso "PASO 3a - gate K=0/K=1 GEMM"        gate Fase_4/GEMM
     paso "PASO 3b - gate K=0/K=1 Convolucion" gate Fase_4/Convolution
     paso "PASO 3c - gate K=0/K=1 Stencil"     gate Fase_4/Stencil
+
+    # --- PASO 4: la medicion distingue una ruta de otra (GATE 4) ------------
+    # Reutiliza los logs que gate3_ancla.sbatch acaba de generar (f4_k0.log y
+    # f4_k1.log en results/gate3_<job>/): son exactamente el par K=0 / K=1 de
+    # la misma configuracion que este gate necesita, asi que no hace falta
+    # volver a correr nada.
+    #
+    # Stencil NO se evalua: su medicion siempre fue por ruta, el bug era de
+    # GEMM y Convolucion.
+    gate4() {
+        local dir="$1" kernel="$2"
+        local gdir
+        gdir="$(ls -d "${REPO_ROOT}/${dir}/results/gate3_"* 2>/dev/null | tail -1)"
+        if [[ -z "${gdir}" || ! -f "${gdir}/f4_k0.log" || ! -f "${gdir}/f4_k1.log" ]]; then
+            echo "NO EVALUABLE: no se encontraron los logs de gate3 en" \
+                 "${dir}/results/gate3_*. El PASO 3 tiene que haber corrido antes." >&2
+            return 2
+        fi
+        python3 "${REPO_ROOT}/Fase_4/tools/gate4_medicion.py" --kernel "${kernel}" \
+            --etiqueta "validacion preliminar" \
+            --k0 "${gdir}/f4_k0.log" --k1 "${gdir}/f4_k1.log"
+    }
+    paso "PASO 4a - medicion por ruta GEMM"        gate4 Fase_4/GEMM        gemm
+    paso "PASO 4b - medicion por ruta Convolucion" gate4 Fase_4/Convolution conv
 fi
 
 # --- Resumen ----------------------------------------------------------------

@@ -12,14 +12,20 @@
 // unica adicion es --anchor-every K: cada K iteraciones de la ruta CON
 // compensacion (--comp on), en vez del paso WMMA normal, el codigo
 // (a) reconstruye el estado exacto T+comp en DOUBLE, (b) avanza UN paso con
-// la referencia FP64 -- reutilizando gpu_fp64_conv_step() TAL CUAL, la misma
-// funcion que ya usa la ruta de referencia de este archivo, incluso
-// reciclando su mismo buffer scratch de im2col en double (d_col64: la
-// llamada de referencia y la del ancla ocurren una despues de la otra dentro
-// de la MISMA iteracion, en el mismo stream por defecto, asi que reusar el
-// scratch es seguro -- no hace falta un segundo buffer de tamano col_sz) --
-// y (c) re-siembra T (cuantizado) y el residuo de compensacion, ahora en
-// DOUBLE. Mismo patron exacto que Fase_4/GEMM/gemm_chained.cu (que a su vez
+// gpu_fp64_conv_step() -- la MISMA funcion que usa la trayectoria de
+// referencia de este archivo, sin codigo cuBLAS nuevo -- y (c) re-siembra T
+// (cuantizado) y el residuo de compensacion, ahora en DOUBLE.
+//
+// (El ancla usaba antes el MISMO buffer scratch de im2col que la referencia,
+// porque las dos llamadas ocurrian dentro de la misma iteracion del mismo
+// bucle. Desde que la medicion se separo por fases -- ver "MEDICION POR RUTA"
+// mas abajo -- la referencia corre en una fase propia y libera su scratch
+// antes de que empiecen las rutas WMMA, asi que el ancla reserva el suyo.
+// Con eso desaparece la unica diferencia estructural del mecanismo de ancla
+// frente a GEMM, y con ella la pregunta sobre carreras de datos que obligaba
+// a plantearse cada vez que alguien tocaba el bucle.)
+//
+// Mismo patron exacto que Fase_4/GEMM/gemm_chained.cu (que a su vez
 // sigue a Fase_4/Stencil/stencil_tensor_activation.cu) -- ver el comentario
 // de cabecera de ese archivo para el razonamiento completo (por que DOUBLE y
 // no float para el residuo del ancla, por que --anchor-every requiere
@@ -72,6 +78,7 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <cublas_v2.h>
@@ -356,12 +363,12 @@ __global__ static void reseed_double_from_fp64_kernel(const double* __restrict__
 // VERIFICAR EN PACCA con --hw chico antes de confiar en cualquier resultado.
 //
 // ANCLA FP64 (Fase 4): esta funcion se usa TANTO para la trayectoria de
-// referencia (siempre FP64, comparacion en cada checkpoint) COMO para el
-// paso puntual que el ancla inyecta en la ruta de baja precision -- misma
-// funcion, sin cuBLAS nuevo. d_col_scratch puede ser el mismo buffer
-// (d_col64) en ambos usos dentro de la misma iteracion: las dos llamadas son
-// secuenciales en el stream por defecto, asi que no hay una carrera de
-// datos por reusar el scratch.
+// referencia (fase 1, comparacion en cada checkpoint) COMO para el paso
+// puntual que el ancla inyecta en la ruta de baja precision (fase 3) --
+// misma funcion, sin cuBLAS nuevo. Cada uno pasa SU PROPIO d_col_scratch:
+// desde que la medicion se separo por fases, la referencia libera el suyo
+// antes de que empiecen las rutas WMMA, asi que no hay buffer compartido ni
+// pregunta sobre carreras de datos que responder.
 static void gpu_fp64_conv_step(cublasHandle_t handle, const double* d_x_in, const double* d_w,
                                double* d_col_scratch, double* d_x_out, int hw) {
   const int Ncol = hw * hw;
@@ -546,211 +553,346 @@ static Options parse_args(int argc, char** argv) {
 }
 
 // =========================================================================
-// Bucle principal de una ruta (un formato T).
+// MEDICION POR RUTA -- leer antes de tocar la estructura de esta seccion.
+//
+// Las trayectorias se miden en FASES SEPARADAS, cada una con su propio
+// cronometro y su propia ventana de PowerBuffer.
+//
+// Antes corrian entrelazadas dentro de un mismo bucle, envueltas por UN solo
+// cronometro y por dos PowerBuffer abiertos y cerrados en los MISMOS
+// instantes. Resultado: t_iter_ms, t_total_ms, gflops y energy_gpu_j salian
+// IDENTICOS en las dos filas CSV_SUMMARY, y ademas incluian el costo de la
+// referencia FP64. Dos de los tres ejes del Frente de Pareto 3D quedaban
+// inutilizables para este kernel (el de ERROR siempre estuvo bien: rel_l2 y
+// rel_linf nunca dependieron del cronometro). Stencil nunca tuvo el problema,
+// ya media por ruta; esto alinea Convolucion con esa forma.
+//
+// POR QUE FASES SEPARADAS Y NO VARIOS CRONOMETROS EN UN BUCLE UNICO. El
+// tiempo si se podia separar con eventos CUDA dentro del bucle. La ENERGIA
+// no: nvmlDeviceGetTotalEnergyConsumption es un contador de TODO el
+// dispositivo y su cuantizacion (~20-25 ms de GPU cargada, ver "REGIMEN DE
+// VALIDEZ" en common/power_sampling.h) es mayor que el tramo de una
+// trayectoria en una iteracion. Sumar cientos de tramos cuantizados no da una
+// energia utilizable. Atribuir energia a una ruta exige darle una ventana
+// CONTIGUA propia, y eso exige separar los bucles.
+//
+// SEGUNDO DEFECTO, CORREGIDO A LA VEZ: la pausa de checkpoint se abria ANTES
+// de sincronizar. Los lanzamientos de kernel son asincronos, asi que el
+// cudaMemcpy D2H del checkpoint bloqueaba esperando toda la cola pendiente,
+// esa espera caia dentro de la pausa, y se restaba de total_s -- el computo
+// que se queria medir se descontaba del tiempo medido. Ahora se sincroniza
+// antes de abrir la pausa (Stencil ya lo hacia bien via
+// CudaEventTimer::stop_and_elapsed_ms(), que sincroniza).
+//
+// LO QUE CUESTA: la referencia FP64 se corre UNA vez (no una por formato) y
+// sus estados en los checkpoints se guardan en RAM del host. Mismo patron que
+// ya usa Stencil (ckpt.fp64_checkpoints). El costo se imprime al arrancar.
+//
+// LO QUE NO ARREGLA: las fases corren una detras de otra, asi que la ultima
+// ve una GPU mas caliente que la primera. Es la misma limitacion de
+// aislamiento termico que el plan ya documenta (Etapa 5).
 // =========================================================================
 
-template <typename T>
-static void run_chained_route(const Options& opt, const T* d_w_tc, const double* d_w_fp64,
-                               const std::vector<float>& x0, const char* format_label) {
+static bool es_checkpoint(const Options& opt, int iter) {
+  return (opt.checkpoint_every > 0 && iter % opt.checkpoint_every == 0) || iter == opt.iters;
+}
+
+static int contar_checkpoints(const Options& opt) {
+  int n = 0;
+  for (int iter = 1; iter <= opt.iters; ++iter) {
+    if (es_checkpoint(opt, iter)) ++n;
+  }
+  return n;
+}
+
+// Emite la fila CSV_SUMMARY de una fase ya medida.
+//
+// gflops usa SIEMPRE los FLOPs UTILES (una conv(X,W) por iteracion, contada
+// sobre el GEMM subyacente del im2col), tambien en la ruta compensada, que
+// hace un segundo producto para la correccion: esa ruta entrega el mismo
+// resultado util por iteracion a mayor costo, asi que su gflops mas bajo es
+// exactamente lo que hay que reportar, no un artefacto de contabilidad.
+static void emit_csv_summary(const char* route, int hw, int iters, double total_s,
+                             int gpu_segments, PowerBuffer* pb, int anchor_every_col) {
+  const double flops_per_iter = 2.0 * kChannels * static_cast<double>(hw) * hw * kCRS;
+  const double gflops = (flops_per_iter * iters / 1e9) / total_s;
+  // Mismo criterio de confiabilidad que Stencil (power_sampling.h,
+  // kEnergyWindowReliableSeconds): con muchos tramos cortos el error de
+  // cuantizacion del contador NVML por tramo domina y la energia deja de ser
+  // comparable entre rutas. window_reliable=0 no invalida t_iter_ms/gflops
+  // (vienen del reloj de pared, no de NVML), solo la columna de energia.
+  const bool reliable = total_s >= kEnergyWindowReliableSeconds * gpu_segments;
+  std::cout << "CSV_SUMMARY," << route << "," << hw << "," << iters << ","
+            << (total_s * 1000.0 / iters) << "," << (total_s * 1000.0) << "," << gflops
+            << "," << energy_field(power_buffer_capture_valid(pb),
+                                   power_buffer_energy_joules(pb))
+            << "," << (reliable ? 1 : 0) << "," << gpu_segments << ","
+            << anchor_every_col << "\n";
+}
+
+// =========================================================================
+// FASE 1 -- trayectoria de referencia FP64, en su propia ventana.
+//
+// Se publica como ruta GPU_FP64: es el punto de Pareto "todo en FP64" que a
+// este kernel le faltaba (Stencil ya lo tenia como ruta propia) y, a la vez,
+// deja constancia auditable de que su costo NO esta dentro del de las rutas
+// de baja precision.
+//
+// Corre UNA sola vez para toda la invocacion, no una por formato: la
+// trayectoria FP64 no depende de T. Devuelve un snapshot del estado por cada
+// iteracion de checkpoint, contra el que se compararan despues las rutas WMMA
+// sin recalcular nada dentro de sus ventanas medidas.
+// =========================================================================
+static std::vector<std::vector<double>> run_fp64_reference(const Options& opt,
+                                                            cublasHandle_t handle,
+                                                            const double* d_w_fp64,
+                                                            const double* d_x0_64) {
   const int hw = opt.hw;
   const size_t field = static_cast<size_t>(kChannels) * hw * hw;
   const size_t col_sz = static_cast<size_t>(kCRS) * hw * hw;
+  const int num_ckpt = contar_checkpoints(opt);
 
-  double* d_x64_in = nullptr;
-  double* d_x64_out = nullptr;
+  const double snap_mib = static_cast<double>(field) * sizeof(double) / (1024.0 * 1024.0);
+  std::cout << "Snapshots FP64 de referencia: " << num_ckpt << " x " << snap_mib
+            << " MiB = " << (num_ckpt * snap_mib / 1024.0) << " GiB de RAM del host\n";
+
+  double* d_in = nullptr;
+  double* d_out = nullptr;
   double* d_col64 = nullptr;
-  CHECK_CUDA(cudaMalloc(&d_x64_in, field * sizeof(double)));
-  CHECK_CUDA(cudaMalloc(&d_x64_out, field * sizeof(double)));
+  CHECK_CUDA(cudaMalloc(&d_in, field * sizeof(double)));
+  CHECK_CUDA(cudaMalloc(&d_out, field * sizeof(double)));
   CHECK_CUDA(cudaMalloc(&d_col64, col_sz * sizeof(double)));
-  {
-    std::vector<double> x0_d(field);
-    for (size_t i = 0; i < field; ++i) x0_d[i] = static_cast<double>(x0[i]);
-    CHECK_CUDA(cudaMemcpy(d_x64_in, x0_d.data(), field * sizeof(double), cudaMemcpyHostToDevice));
+  auto reset = [&]() {
+    CHECK_CUDA(cudaMemcpy(d_in, d_x0_64, field * sizeof(double), cudaMemcpyDeviceToDevice));
+  };
+  reset();
+
+  for (int w = 0; w < kWarmupIters; ++w) {
+    gpu_fp64_conv_step(handle, d_in, d_w_fp64, d_col64, d_out, hw);
+    std::swap(d_in, d_out);
   }
-  cublasHandle_t cublas_handle;
-  CHECK_CUBLAS(cublasCreate(&cublas_handle));
+  CHECK_CUDA(cudaDeviceSynchronize());
+  reset();
+
+  std::vector<std::vector<double>> snapshots;
+  snapshots.reserve(num_ckpt);
+
+  PowerBuffer* pb = power_buffer_create(0);
+  power_buffer_start_sampling(pb);
+  const auto t0 = std::chrono::steady_clock::now();
+  // Tiempo perdido en pausas de checkpoint (D2H + guardado), a restar del
+  // total para que gflops/energia reflejen solo computo GPU.
+  double pause_s = 0.0;
+  int gpu_segments = 1;
+
+  for (int iter = 1; iter <= opt.iters; ++iter) {
+    gpu_fp64_conv_step(handle, d_in, d_w_fp64, d_col64, d_out, hw);
+    std::swap(d_in, d_out);
+    if (es_checkpoint(opt, iter)) {
+      // Sincroniza ANTES de abrir la pausa -- ver la nota extensa de cabecera
+      // de esta seccion: sin esto el D2H de abajo espera a la cola asincrona
+      // dentro de la pausa y ese tiempo de GPU se resta del medido.
+      CHECK_CUDA(cudaDeviceSynchronize());
+      const auto pause_t0 = std::chrono::steady_clock::now();
+      power_buffer_stop_sampling(pb);
+      snapshots.emplace_back(field);
+      CHECK_CUDA(cudaMemcpy(snapshots.back().data(), d_in, field * sizeof(double),
+                            cudaMemcpyDeviceToHost));
+      power_buffer_start_sampling(pb);
+      pause_s +=
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - pause_t0).count();
+      ++gpu_segments;
+    }
+  }
+  CHECK_CUDA(cudaDeviceSynchronize());
+  const double total_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - pause_s;
+  power_buffer_stop_sampling(pb);
+  emit_csv_summary("GPU_FP64", hw, opt.iters, total_s, gpu_segments, pb,
+                   /*anchor_every_col=*/0);
+  power_buffer_destroy(pb);
+
+  cudaFree(d_in);
+  cudaFree(d_out);
+  cudaFree(d_col64);
+  return snapshots;
+}
+
+// =========================================================================
+// FASES 2 y 3 -- las rutas WMMA de un formato T, cada una en su ventana.
+//
+// EL SCRATCH DE im2col YA NO SE COMPARTE ENTRE LA REFERENCIA Y EL ANCLA.
+// Antes las dos llamadas a gpu_fp64_conv_step() ocurrian dentro de la misma
+// iteracion del mismo bucle y reusaban el mismo d_col64; era seguro (mismo
+// stream, secuenciales) pero era la UNICA diferencia estructural del
+// mecanismo de ancla frente a GEMM, y obligaba a razonar sobre carreras de
+// datos cada vez que alguien tocaba el bucle. Con las fases separadas, la
+// referencia libera su scratch al terminar y el ancla reserva el suyo: la
+// pregunta desaparece. El pico de memoria no sube (baja un poco), porque los
+// dos buffers ya no coexisten -- ver el presupuesto en el .sbatch.
+// =========================================================================
+
+template <typename T>
+static void run_chained_route(const Options& opt, cublasHandle_t cublas_handle,
+                               const T* d_w_tc, const double* d_w_fp64, const double* d_x0_64,
+                               const std::vector<float>& x0,
+                               const std::vector<std::vector<double>>& ref_snapshots,
+                               const char* format_label) {
+  const int hw = opt.hw;
+  const size_t field = static_cast<size_t>(kChannels) * hw * hw;
+  const size_t col_sz = static_cast<size_t>(kCRS) * hw * hw;
+  const bool anchor_enabled = opt.anchor_every > 0;
 
   ChainedConvState<T> s_off, s_on;
   chained_conv_alloc(s_off, hw, false);
   if (opt.comp) chained_conv_alloc(s_on, hw, true);
 
   // ANCLA FP64 (Fase 4): residuo de compensacion en DOUBLE (sombra del
-  // residuo en float de s_on) mas dos buffers scratch de tamano "field"
-  // (estado exacto reconstruido, salida del paso FP64 de referencia). El
-  // scratch de im2col en double se reutiliza de d_col64 (declarado arriba)
-  // -- ver el comentario de gpu_fp64_conv_step(). Solo existen si
+  // residuo en float de s_on), dos buffers scratch de tamano "field" (estado
+  // exacto reconstruido, salida del paso FP64) y el scratch de im2col en
+  // double que necesita gpu_fp64_conv_step(). Solo existen si
   // --anchor-every > 0 (que ya exige --comp on en parse_args).
   double* d_comp64_in = nullptr;
   double* d_comp64_out = nullptr;
   double* d_exact64 = nullptr;
   double* d_out64 = nullptr;
-  const bool anchor_enabled = opt.anchor_every > 0;
+  double* d_col64_anchor = nullptr;
   if (anchor_enabled) {
     CHECK_CUDA(cudaMalloc(&d_comp64_in, field * sizeof(double)));
     CHECK_CUDA(cudaMalloc(&d_comp64_out, field * sizeof(double)));
     CHECK_CUDA(cudaMalloc(&d_exact64, field * sizeof(double)));
     CHECK_CUDA(cudaMalloc(&d_out64, field * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_col64_anchor, col_sz * sizeof(double)));
   }
 
-  // seed_state() se llama dos veces (siembra inicial y reset post-warm-up) y
-  // en AMBAS d_x64_in todavia guarda x0 en double intacto (el warm-up de
-  // arriba solo avanza s_off/s_on, nunca d_x64_in) -- por eso la siembra del
-  // residuo puede vivir aqui adentro una sola vez.
-  auto seed_state = [&]() {
-    std::vector<T> x0_t(field);
-    for (size_t i = 0; i < field; ++i) x0_t[i] = T(x0[i]);  // ver nota en gemm_chained.cu
-    CHECK_CUDA(cudaMemcpy(s_off.d_x_in, x0_t.data(), field * sizeof(T), cudaMemcpyHostToDevice));
-    if (opt.comp) {
-      CHECK_CUDA(cudaMemcpy(s_on.d_x_in, x0_t.data(), field * sizeof(T), cudaMemcpyHostToDevice));
-      // Siembra el residuo desde el redondeo REAL de x0->T (no desde 0) --
-      // ver el comentario de seed_comp_from_double_kernel.
+  std::vector<T> x0_t(field);
+  for (size_t i = 0; i < field; ++i) x0_t[i] = T(x0[i]);  // ver nota en gemm_chained.cu
+
+  // Deja una ruta lista para arrancar desde x0. Se llama antes del warm-up y
+  // otra vez despues, para que el bucle medido arranque del mismo estado que
+  // arrancaria sin warm-up (incluido el residuo en double del ancla, asi que
+  // el bucle medido arranca identico con o sin ancla).
+  auto reset_ruta = [&](ChainedConvState<T>& s, bool comp_on) {
+    CHECK_CUDA(cudaMemcpy(s.d_x_in, x0_t.data(), field * sizeof(T), cudaMemcpyHostToDevice));
+    if (comp_on) {
+      // Siembra el residuo desde el redondeo REAL de x0->T (no desde 0) -- ver
+      // el comentario de seed_comp_from_double_kernel. d_x0_64 guarda x0 en
+      // double y nunca se avanza, asi que da igual en que fase estemos.
       seed_comp_from_double_kernel<T><<<grid1d(static_cast<int>(field)), kConversionThreads>>>(
-          d_x64_in, s_on.d_x_in, s_on.d_comp_in, static_cast<int>(field));
+          d_x0_64, s.d_x_in, s.d_comp_in, static_cast<int>(field));
       CHECK_CUDA(cudaGetLastError());
       if (anchor_enabled) {
-        seed_comp64_from_double_kernel<T><<<grid1d(static_cast<int>(field)), kConversionThreads>>>(
-            d_x64_in, s_on.d_x_in, d_comp64_in, static_cast<int>(field));
+        seed_comp64_from_double_kernel<T><<<grid1d(static_cast<int>(field)),
+                                            kConversionThreads>>>(
+            d_x0_64, s.d_x_in, d_comp64_in, static_cast<int>(field));
         CHECK_CUDA(cudaGetLastError());
       }
     }
   };
-  seed_state();
 
-  PowerBuffer* power_buffer_off = power_buffer_create(0);
-  PowerBuffer* power_buffer_on = opt.comp ? power_buffer_create(0) : nullptr;
+  std::vector<float> host_route(field);
+  std::vector<T> tmp_tc(field);
 
-  // Warm-up (descartable) -- NO ejecuta el camino de ancla (usa
-  // chained_conv_step normal); seed_state() de abajo re-sincroniza tambien
-  // d_comp64_in, asi que el bucle medido arranca identico con o sin ancla.
-  for (int w = 0; w < kWarmupIters; ++w) {
-    chained_conv_step(s_off, d_w_tc, hw, false);
-    std::swap(s_off.d_x_in, s_off.d_x_out);
-    if (opt.comp) {
-      chained_conv_step(s_on, d_w_tc, hw, true);
-      std::swap(s_on.d_x_in, s_on.d_x_out);
-      std::swap(s_on.d_comp_in, s_on.d_comp_out);
+  auto medir_ruta = [&](ChainedConvState<T>& s, bool comp_on, const char* sufijo,
+                        int anchor_col) {
+    reset_ruta(s, comp_on);
+    // El warm-up NO ejecuta el camino de ancla (usa el paso WMMA normal);
+    // el reset de abajo re-sincroniza tambien el residuo en double.
+    for (int w = 0; w < kWarmupIters; ++w) {
+      chained_conv_step(s, d_w_tc, hw, comp_on);
+      std::swap(s.d_x_in, s.d_x_out);
+      if (comp_on) std::swap(s.d_comp_in, s.d_comp_out);
     }
-  }
-  CHECK_CUDA(cudaDeviceSynchronize());
-  seed_state();  // reinicia tras el warm-up, igual que GEMM/Stencil
+    CHECK_CUDA(cudaDeviceSynchronize());
+    reset_ruta(s, comp_on);
 
-  power_buffer_start_sampling(power_buffer_off);
-  if (opt.comp) power_buffer_start_sampling(power_buffer_on);
-  const auto t0 = std::chrono::steady_clock::now();
-  double checkpoint_pause_s = 0.0;
-  int gpu_segments = 1;
+    // El ancla solo actua sobre la ruta compensada.
+    const bool anclar = comp_on && anchor_enabled;
 
-  std::vector<double> ref_host(field);
-  std::vector<float> off_host(field), on_host(field);
+    PowerBuffer* pb = power_buffer_create(0);
+    power_buffer_start_sampling(pb);
+    const auto t0 = std::chrono::steady_clock::now();
+    double pause_s = 0.0;
+    int gpu_segments = 1;
+    size_t ckpt_idx = 0;
 
-  for (int iter = 1; iter <= opt.iters; ++iter) {
-    gpu_fp64_conv_step(cublas_handle, d_x64_in, d_w_fp64, d_col64, d_x64_out, hw);
-    std::swap(d_x64_in, d_x64_out);
-
-    chained_conv_step(s_off, d_w_tc, hw, false);
-    std::swap(s_off.d_x_in, s_off.d_x_out);
-
-    if (opt.comp) {
-      const bool is_anchor_iter = anchor_enabled && (iter % opt.anchor_every == 0);
+    for (int iter = 1; iter <= opt.iters; ++iter) {
+      const bool is_anchor_iter = anclar && (iter % opt.anchor_every == 0);
       if (is_anchor_iter) {
-        // ANCLA FP64 (Fase 4): reconstruye el estado exacto T+comp en
-        // double, avanza UN paso con la referencia FP64
-        // (gpu_fp64_conv_step, la MISMA funcion de arriba, reusando
-        // d_col64 como scratch) y re-siembra T + el residuo double.
-        reconstruct_exact_double_kernel<T><<<grid1d(static_cast<int>(field)), kConversionThreads>>>(
-            s_on.d_x_in, d_comp64_in, d_exact64, static_cast<int>(field));
+        // ANCLA FP64 (Fase 4): reconstruye el estado exacto T+comp en double,
+        // avanza UN paso con gpu_fp64_conv_step (la MISMA funcion que usa la
+        // trayectoria de referencia, sobre su propio scratch) y re-siembra T +
+        // el residuo double.
+        //
+        // Este paso FP64 SI cuenta dentro del tiempo y la energia de esta
+        // ruta: es su costo, y medirlo es el objetivo del barrido de K.
+        reconstruct_exact_double_kernel<T><<<grid1d(static_cast<int>(field)),
+                                             kConversionThreads>>>(
+            s.d_x_in, d_comp64_in, d_exact64, static_cast<int>(field));
         CHECK_CUDA(cudaGetLastError());
-        gpu_fp64_conv_step(cublas_handle, d_exact64, d_w_fp64, d_col64, d_out64, hw);
-        reseed_double_from_fp64_kernel<T><<<grid1d(static_cast<int>(field)), kConversionThreads>>>(
-            d_out64, s_on.d_x_out, d_comp64_out, static_cast<int>(field));
+        gpu_fp64_conv_step(cublas_handle, d_exact64, d_w_fp64, d_col64_anchor, d_out64, hw);
+        reseed_double_from_fp64_kernel<T><<<grid1d(static_cast<int>(field)),
+                                            kConversionThreads>>>(
+            d_out64, s.d_x_out, d_comp64_out, static_cast<int>(field));
         CHECK_CUDA(cudaGetLastError());
         narrow_double_to_float_kernel<<<grid1d(static_cast<int>(field)), kConversionThreads>>>(
-            d_comp64_out, s_on.d_comp_out, static_cast<int>(field));
+            d_comp64_out, s.d_comp_out, static_cast<int>(field));
         CHECK_CUDA(cudaGetLastError());
       } else {
-        chained_conv_step(s_on, d_w_tc, hw, true);
-        if (anchor_enabled) {
+        chained_conv_step(s, d_w_tc, hw, comp_on);
+        if (anclar) {
+          // Mantiene el residuo double sincronizado por si la SIGUIENTE
+          // iteracion es de ancla.
           widen_comp_to_double_kernel<<<grid1d(static_cast<int>(field)), kConversionThreads>>>(
-              s_on.d_comp_out, d_comp64_out, static_cast<int>(field));
+              s.d_comp_out, d_comp64_out, static_cast<int>(field));
           CHECK_CUDA(cudaGetLastError());
         }
       }
-      std::swap(s_on.d_x_in, s_on.d_x_out);
-      std::swap(s_on.d_comp_in, s_on.d_comp_out);
-      if (anchor_enabled) std::swap(d_comp64_in, d_comp64_out);
-    }
+      std::swap(s.d_x_in, s.d_x_out);
+      if (comp_on) std::swap(s.d_comp_in, s.d_comp_out);
+      if (anclar) std::swap(d_comp64_in, d_comp64_out);
 
-    const bool is_checkpoint =
-        (opt.checkpoint_every > 0 && iter % opt.checkpoint_every == 0) || iter == opt.iters;
-    if (is_checkpoint) {
-      const auto pause_t0 = std::chrono::steady_clock::now();
-      power_buffer_stop_sampling(power_buffer_off);
-      if (opt.comp) power_buffer_stop_sampling(power_buffer_on);
+      if (es_checkpoint(opt, iter)) {
+        // Sincroniza ANTES de abrir la pausa -- ver la nota de cabecera de
+        // esta seccion sobre por que, sin esto, el computo se descuenta del
+        // tiempo medido.
+        CHECK_CUDA(cudaDeviceSynchronize());
+        const auto pause_t0 = std::chrono::steady_clock::now();
+        power_buffer_stop_sampling(pb);
 
-      CHECK_CUDA(cudaMemcpy(ref_host.data(), d_x64_in, field * sizeof(double),
-                            cudaMemcpyDeviceToHost));
-      {
-        std::vector<T> tmp(field);
-        CHECK_CUDA(cudaMemcpy(tmp.data(), s_off.d_x_in, field * sizeof(T),
+        CHECK_CUDA(cudaMemcpy(tmp_tc.data(), s.d_x_in, field * sizeof(T),
                               cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < field; ++i) off_host[i] = static_cast<float>(tmp[i]);
-        const ErrorMetrics err = compare_fp64_ref_vs_fp32(ref_host, off_host);
-        // anchor_every al FINAL de la fila, y 0 en la ruta "_none" SIEMPRE:
-        // el ancla solo se aplica a la ruta con compensacion (parse_args exige
-        // --comp on para K>0). Es una columna POR FILA, no de la corrida --
-        // misma convencion que Fase_4/GEMM/gemm_chained.cu, distinta de la de
-        // Stencil (ver Fase_4/tools/README.md).
-        std::cout << "CSV_DRIFT," << format_label << "_none," << hw << "," << iter << ","
+        for (size_t i = 0; i < field; ++i) host_route[i] = static_cast<float>(tmp_tc[i]);
+        const ErrorMetrics err =
+            compare_fp64_ref_vs_fp32(ref_snapshots[ckpt_idx], host_route);
+        // anchor_every va al FINAL de la fila. Vale 0 en la ruta "_none"
+        // SIEMPRE, incluso si esta corrida se lanzo con --anchor-every K>0: el
+        // ancla solo se aplica a la ruta con compensacion. Es una columna POR
+        // FILA, no de la corrida -- ver Fase_4/tools/README.md.
+        std::cout << "CSV_DRIFT," << format_label << sufijo << "," << hw << "," << iter << ","
                   << err.rel_l2 << "," << err.rel_linf << "," << (err.solution_finite ? 1 : 0)
-                  << ",0\n";
-      }
-      if (opt.comp) {
-        std::vector<T> tmp(field);
-        CHECK_CUDA(cudaMemcpy(tmp.data(), s_on.d_x_in, field * sizeof(T),
-                              cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < field; ++i) on_host[i] = static_cast<float>(tmp[i]);
-        const ErrorMetrics err = compare_fp64_ref_vs_fp32(ref_host, on_host);
-        std::cout << "CSV_DRIFT," << format_label << "_comp," << hw << "," << iter << ","
-                  << err.rel_l2 << "," << err.rel_linf << "," << (err.solution_finite ? 1 : 0)
-                  << "," << opt.anchor_every << "\n";
-      }
+                  << "," << anchor_col << "\n";
+        ++ckpt_idx;
 
-      power_buffer_start_sampling(power_buffer_off);
-      if (opt.comp) power_buffer_start_sampling(power_buffer_on);
-      checkpoint_pause_s +=
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - pause_t0).count();
-      ++gpu_segments;
+        power_buffer_start_sampling(pb);
+        pause_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - pause_t0).count();
+        ++gpu_segments;
+      }
     }
-  }
+    CHECK_CUDA(cudaDeviceSynchronize());
+    const double total_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - pause_s;
+    power_buffer_stop_sampling(pb);
 
-  CHECK_CUDA(cudaDeviceSynchronize());
-  const auto t1 = std::chrono::steady_clock::now();
-  const double total_s = std::chrono::duration<double>(t1 - t0).count() - checkpoint_pause_s;
-  power_buffer_stop_sampling(power_buffer_off);
-  if (opt.comp) power_buffer_stop_sampling(power_buffer_on);
+    const std::string route = std::string(format_label) + sufijo;
+    emit_csv_summary(route.c_str(), hw, opt.iters, total_s, gpu_segments, pb, anchor_col);
+    power_buffer_destroy(pb);
+  };
 
-  // FLOPs por iteracion: K*Ncol*CRS*2 (el GEMM subyacente del im2col).
-  const double flops_per_iter =
-      2.0 * kChannels * static_cast<double>(hw) * hw * kCRS;
-  const double gflops = (flops_per_iter * opt.iters / 1e9) / total_s;
+  medir_ruta(s_off, /*comp_on=*/false, "_none", /*anchor_col=*/0);
+  if (opt.comp) medir_ruta(s_on, /*comp_on=*/true, "_comp", opt.anchor_every);
 
-  const bool window_reliable = total_s >= kEnergyWindowReliableSeconds * gpu_segments;
-  const double energy_off_j = power_buffer_energy_joules(power_buffer_off);
-  std::cout << "CSV_SUMMARY," << format_label << "_none," << hw << "," << opt.iters << ","
-            << (total_s * 1000.0 / opt.iters) << "," << (total_s * 1000.0) << "," << gflops << ","
-            << energy_field(power_buffer_capture_valid(power_buffer_off), energy_off_j) << ","
-            << (window_reliable ? 1 : 0) << "," << gpu_segments << ",0\n";
-  if (opt.comp) {
-    const double energy_on_j = power_buffer_energy_joules(power_buffer_on);
-    std::cout << "CSV_SUMMARY," << format_label << "_comp," << hw << "," << opt.iters << ","
-              << (total_s * 1000.0 / opt.iters) << "," << (total_s * 1000.0) << "," << gflops
-              << "," << energy_field(power_buffer_capture_valid(power_buffer_on), energy_on_j)
-              << "," << (window_reliable ? 1 : 0) << "," << gpu_segments << ","
-              << opt.anchor_every << "\n";
-  }
-
-  power_buffer_destroy(power_buffer_off);
-  if (power_buffer_on) power_buffer_destroy(power_buffer_on);
   chained_conv_free(s_off);
   if (opt.comp) chained_conv_free(s_on);
   if (anchor_enabled) {
@@ -758,11 +900,8 @@ static void run_chained_route(const Options& opt, const T* d_w_tc, const double*
     cudaFree(d_comp64_out);
     cudaFree(d_exact64);
     cudaFree(d_out64);
+    cudaFree(d_col64_anchor);
   }
-  cudaFree(d_x64_in);
-  cudaFree(d_x64_out);
-  cudaFree(d_col64);
-  cublasDestroy(cublas_handle);
 }
 
 }  // namespace
@@ -782,7 +921,8 @@ int main(int argc, char** argv) {
   const bool need_fp16 = (opt.tc_format == TcFormat::FP16 || opt.tc_format == TcFormat::Both);
   const bool need_bf16 = (opt.tc_format == TcFormat::BF16 || opt.tc_format == TcFormat::Both);
 
-  std::vector<float> x0(static_cast<size_t>(kChannels) * opt.hw * opt.hw);
+  const size_t field = static_cast<size_t>(kChannels) * opt.hw * opt.hw;
+  std::vector<float> x0(field);
   {
     std::mt19937 gen(opt.seed);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -794,6 +934,29 @@ int main(int argc, char** argv) {
   CHECK_CUDA(cudaMemcpy(d_w_fp64, W_fp64.data(), W_fp64.size() * sizeof(double),
                         cudaMemcpyHostToDevice));
 
+  // x0 en double, INMUTABLE durante toda la corrida: lo usan la referencia
+  // FP64 (como estado inicial) y la siembra del residuo de compensacion de
+  // cada ruta. Vive aqui, y no dentro de una fase, precisamente para que
+  // ninguna fase pueda avanzarlo y dejar a la siguiente sembrando desde un
+  // estado que ya no es x0.
+  double* d_x0_64 = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_x0_64, field * sizeof(double)));
+  {
+    std::vector<double> x0_d(field);
+    for (size_t i = 0; i < field; ++i) x0_d[i] = static_cast<double>(x0[i]);
+    CHECK_CUDA(cudaMemcpy(d_x0_64, x0_d.data(), field * sizeof(double), cudaMemcpyHostToDevice));
+  }
+
+  cublasHandle_t cublas_handle;
+  CHECK_CUBLAS(cublasCreate(&cublas_handle));
+
+  // FASE 1, una sola vez para toda la invocacion (la trayectoria FP64 de
+  // referencia no depende del formato T). Sus buffers -- incluido el scratch
+  // de im2col en double -- se liberan al volver, antes de que las rutas WMMA
+  // reserven los suyos.
+  const std::vector<std::vector<double>> ref_snapshots =
+      run_fp64_reference(opt, cublas_handle, d_w_fp64, d_x0_64);
+
   if (need_fp16) {
     std::vector<__half> W_tc(W_fp64.size());
     for (size_t i = 0; i < W_fp64.size(); ++i) W_tc[i] = __half(static_cast<float>(W_fp64[i]));
@@ -801,7 +964,8 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_w_tc, W_tc.size() * sizeof(__half)));
     CHECK_CUDA(cudaMemcpy(d_w_tc, W_tc.data(), W_tc.size() * sizeof(__half),
                           cudaMemcpyHostToDevice));
-    run_chained_route<__half>(opt, d_w_tc, d_w_fp64, x0, "FP16");
+    run_chained_route<__half>(opt, cublas_handle, d_w_tc, d_w_fp64, d_x0_64, x0,
+                              ref_snapshots, "FP16");
     cudaFree(d_w_tc);
   }
   if (need_bf16) {
@@ -813,10 +977,13 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_w_tc, W_tc.size() * sizeof(__nv_bfloat16)));
     CHECK_CUDA(cudaMemcpy(d_w_tc, W_tc.data(), W_tc.size() * sizeof(__nv_bfloat16),
                           cudaMemcpyHostToDevice));
-    run_chained_route<__nv_bfloat16>(opt, d_w_tc, d_w_fp64, x0, "BF16");
+    run_chained_route<__nv_bfloat16>(opt, cublas_handle, d_w_tc, d_w_fp64, d_x0_64, x0,
+                                     ref_snapshots, "BF16");
     cudaFree(d_w_tc);
   }
 
+  cublasDestroy(cublas_handle);
   cudaFree(d_w_fp64);
+  cudaFree(d_x0_64);
   return 0;
 }

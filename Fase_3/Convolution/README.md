@@ -56,7 +56,15 @@ A diferencia de GEMM (donde el estado y la corrección pasan por el mismo `wmma_
 
 ## Salida
 
-Mismo esquema `CSV_DRIFT`/`CSV_SUMMARY` que `Fase_3/GEMM/gemm_chained.cu` (ver ese README), con `hw` en la columna de tamaño y `anchor_every` como última columna — que en este binario vale siempre `0`, porque Fase 3 no tiene ancla. Incluye `window_reliable`/`gpu_segments` desde el diseño, con la misma exclusión de las pausas de checkpoint de la ventana de energía/tiempo.
+Mismo esquema `CSV_DRIFT`/`CSV_SUMMARY` que `Fase_3/GEMM/gemm_chained.cu` (ver ese README), con `hw` en la columna de tamaño y `anchor_every` como última columna — que en este binario vale siempre `0`, porque Fase 3 no tiene ancla. La ruta `GPU_FP64` se publica también como fila propia.
+
+## ⚠️ Los números de tiempo/energía anteriores a 2026-09-06 no son utilizables
+
+Exactamente el mismo problema, y la misma corrección, que documenta `Fase_3/GEMM/README.md` en su sección homónima — **léela ahí**, con la tabla de antes/después medida en GPU real. En resumen: `t_iter_ms`, `t_total_ms`, `gflops` y `energy_gpu_j` (a) no distinguían `_none` de `_comp` ni excluían el costo de la referencia FP64, y (b) descontaban del tiempo medido el cómputo que el `cudaMemcpy` del checkpoint absorbía al esperar la cola asíncrona. Los números de **error** (`rel_l2`, `rel_linf`) nunca estuvieron afectados.
+
+Ahora se mide en tres fases separadas (referencia FP64 → ruta `_none` → ruta `_comp`), cada una con su cronómetro y su ventana de `PowerBuffer`. Verificado en GPU real a `--hw 128 --iters 20`: `FP16_comp` = 2.07× `FP16_none`, y `GPU_FP64` aparte a 17.09 ms/iter. Lo vigila `Fase_4/tools/gate4_medicion.py`.
+
+**Costo de memoria del host**: los snapshots FP64 de referencia, `num_checkpoints × kChannels·hw² × 8 B` (el binario lo imprime al arrancar). A `hw=512` con `CHECKPOINT_EVERY=5` e `ITERS=80` son 16 × 128 MiB = 2.1 GiB.
 
 ## Campaña por defecto
 
@@ -105,5 +113,5 @@ El factor que hay que no olvidar es el de **canales**: el estado escala como `kC
 - **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py`.
 - **Verificación del orden de operandos, `im2col`, padding y filtro**: ✅ hecha y **pasada en GPU real** — ver arriba.
 - **Scripts de gate** K=0/K=1: ✅ hechos — `Fase_4/tools/gate3_ancla.py` y `Fase_4/Convolution/gate3_ancla.sbatch`.
-- **`t_iter_ms`/`gflops`/`energy_gpu_j` no distinguen `_none` de `_comp`**: mismo hallazgo (y misma causa) que documenta `Fase_3/GEMM/README.md` en su sección "Qué falta". Sin corregir.
+- **Medición por ruta**: ✅ corregida — ver la advertencia de arriba, y `Fase_4/tools/gate4_medicion.py`.
 - **Campaña real en PACCA**: compilado y verificado con `--hw` chico; falta el barrido completo.

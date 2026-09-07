@@ -12,9 +12,13 @@ Idéntico mecanismo que `Fase_4/GEMM/gemm_chained.cu` (ver ese README para el ra
 2. **Avanza un paso con la referencia FP64** — reutilizando `gpu_fp64_conv_step()` tal cual, la misma función que ya calcula la trayectoria de referencia de este archivo.
 3. **Re-siembra** `T` y el residuo, ahora en `double`, sin pasar por `float` en el camino.
 
-## Un detalle propio de Convolución: el scratch de `im2col` se comparte
+## Un detalle propio de Convolución: el scratch de `im2col` (ya no compartido)
 
-A diferencia de GEMM (donde el paso FP64 no necesita ningún buffer intermedio más allá de `X` y `A`), el paso FP64 de Convolución pasa primero por `im2col_double_kernel` hacia un buffer scratch (`d_col_scratch`, forma `[CRS, Ncol]`) antes de la llamada a `cublasDgemm`. La trayectoria de referencia (siempre FP64) y el paso del ancla usan la **misma función** `gpu_fp64_conv_step()`, y ambas llamadas ocurren dentro de la misma iteración, en el *stream* por defecto — es decir, secuenciales, sin ninguna carrera de datos. Por eso el ancla reutiliza el mismo buffer `d_col64` que ya usa la referencia, en vez de reservar un segundo buffer del mismo tamaño: no hay ninguna ganancia en duplicarlo, solo memoria desperdiciada.
+A diferencia de GEMM (donde el paso FP64 no necesita ningún buffer intermedio más allá de `X` y `A`), el paso FP64 de Convolución pasa primero por `im2col_double_kernel` hacia un buffer scratch (`d_col_scratch`, forma `[CRS, Ncol]`) antes de la llamada a `cublasDgemm`.
+
+**Esto era, hasta 2026-09-06, la única diferencia estructural del mecanismo de ancla frente a GEMM**: la trayectoria de referencia y el paso del ancla usaban la misma función `gpu_fp64_conv_step()` dentro de la misma iteración del mismo bucle, y compartían el buffer `d_col64`. Era seguro (mismo *stream*, llamadas secuenciales), pero obligaba a plantearse la pregunta sobre carreras de datos cada vez que alguien tocaba el bucle.
+
+Desde que la medición se separó por fases (ver más abajo), **el buffer ya no se comparte**: la fase de referencia libera su scratch antes de que empiecen las rutas WMMA, y el ancla reserva el suyo. La pregunta desaparece, y con ella la asimetría respecto a GEMM. El pico de memoria no sube — de hecho baja un poco, porque los dos buffers ya no coexisten.
 
 ## La siembra inicial de `comp`
 
@@ -35,11 +39,47 @@ Compila los **dos** binarios (Fase 3 y este), corre las tres pasadas (`Fase_3` s
 
 **Ojo con el criterio ingenuo**: "con K=1 el error debe caer a `1e-16`" es imposible aquí, y no por un bug — `CSV_DRIFT` compara la referencia FP64 contra `T` **tal cual se guarda**, nunca contra `T+comp`, así que el piso está acotado por la precisión de `T` sin importar qué tan exacta sea la reconstrucción interna. Es la misma limitación que ya documenta `Fase_4/GEMM/README.md`.
 
-**Si este gate falla y el de GEMM pasa con parámetros equivalentes**, el primer sospechoso es el buffer scratch de `im2col` compartido (ver la sección siguiente), que es la única diferencia estructural del mecanismo de ancla entre los dos kernels — antes que cualquier error de lógica del ancla en sí.
+**Si este gate falla y el de GEMM pasa con parámetros equivalentes**, el sospechoso histórico era el buffer scratch de `im2col` compartido entre la referencia y el ancla. Desde la separación de fases ese buffer ya no se comparte (ver arriba), así que esa hipótesis está descartada por construcción: hoy los dos mecanismos de ancla son estructuralmente idénticos y una divergencia entre kernels apunta al `im2col` o al filtro, no al ancla.
+
+## Medicion por ruta: el costo del ancla ahora SI se ve
+
+Hasta 2026-09-06, `t_iter_ms`/`gflops`/`energy_gpu_j` de este binario no
+distinguian la ruta `_none` de la `_comp` (un solo cronometro envolvia las tres
+trayectorias) y ademas descontaban del tiempo medido el computo que el
+`cudaMemcpy` del checkpoint absorbia al esperar la cola asincrona. Ver
+`Fase_3/GEMM/README.md`, seccion "Los numeros de tiempo/energia anteriores a
+2026-09-06 no son utilizables", para el detalle completo y la tabla de
+antes/despues.
+
+**En Fase 4 el dano era mayor que en Fase 3**: el costo del ancla -- que es
+justo lo que el barrido de `K` existe para medir -- tampoco era visible, porque
+el tiempo de la ruta compensada no era suyo. Con la medicion por fases, el
+efecto aparece de inmediato (GPU Ampere real, `--hw 128 --iters 20 --tc fp16`):
+
+| | `t_iter_ms` de `FP16_comp` |
+|---|---|
+| `--anchor-every 0` | 5.74 |
+| `--anchor-every 1` | 19.33 (**3.37x**) |
+
+Ese 3.37x es lo esperado en una tarjeta con FP64 a 1/64 del ritmo: anclar en
+cada iteracion agrega un `cublasDgemm` completo por paso. En A100 el factor
+sera muy distinto (FP64 a 1/2), y medirlo es exactamente el objetivo del
+barrido de `K`.
+
+**Los dos costos FP64 ahora estan separados**, que antes no lo estaban:
+- La trayectoria de REFERENCIA (con la que se mide el error) queda fuera de las
+  rutas de baja precision, publicada como ruta propia `GPU_FP64`.
+- Los pasos FP64 que el ANCLA inyecta quedan DENTRO de la ruta compensada, que
+  es donde corresponde.
+
+Lo vigila `../tools/gate4_medicion.py`, que corre en
+`tools/validacion_preliminar.sbatch`.
 
 ## Costo de memoria
 
-El ancla agrega 4 buffers `double` de tamaño `kChannels·hw²` (`d_comp64_in`, `d_comp64_out`, `d_exact64`, `d_out64`) — el buffer de `im2col` en `double` (`d_col64`, tamaño `kCRS·hw²`) se reutiliza del que ya existía para la referencia, no se duplica (ver arriba). Solo se reserva cuando `--anchor-every > 0`.
+El ancla agrega 4 buffers `double` de tamaño `kChannels·hw²` (`d_comp64_in`, `d_comp64_out`, `d_exact64`, `d_out64`) más su propio buffer de `im2col` en `double` (`kCRS·hw²`, que es 9× el campo y por tanto el término dominante). Todo eso solo se reserva cuando `--anchor-every > 0`.
+
+Aunque el ancla ya no reutilice el scratch de la referencia, **el pico de memoria baja**: la fase de referencia libera sus buffers (`d_x64_in/out` + su `d_col64`) antes de que las rutas WMMA reserven los suyos, así que los dos scratch de `im2col` nunca coexisten. Del cálculo del `.sbatch`, 202 B por elemento de campo pasan a ~194 B; los límites de `HW_LIST` no cambian.
 
 ## Uso
 

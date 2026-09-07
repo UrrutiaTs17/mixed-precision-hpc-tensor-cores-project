@@ -1,6 +1,6 @@
 # Fase 4 — tools
 
-Tres cosas: post-proceso de CSV, el **gate del ancla FP64** (`gate3_ancla.py`, nuevo) y el análisis final (estadística + Pareto).
+Tres cosas: post-proceso de CSV, los **gates de validación** (`gate3_ancla.py` y `gate4_medicion.py`) y el análisis final (estadística + Pareto).
 
 Los dos extractores son ahora **idénticos** a los de `Fase_3/tools/` (antes `extract_csv.py` divergía). Los seis binarios emiten el mismo esquema de columnas, y mantener dos variantes solo invitaba a que una se quedara atrás.
 
@@ -8,7 +8,8 @@ Los dos extractores son ahora **idénticos** a los de `Fase_3/tools/` (antes `ex
 |---|---|
 | `extract_csv.py` | `stencil_tensor_activation.cu` (Fase 3 y Fase 4) |
 | `extract_csv_chained.py` | `gemm_chained.cu` y `conv_chained.cu` (Fase 3 y Fase 4) |
-| `gate3_ancla.py` | Validación automatizada del ancla, **los tres kernels** |
+| `gate3_ancla.py` | Validación automatizada del ancla (K=0/K=1), **los tres kernels** |
+| `gate4_medicion.py` | Que `t_iter_ms` y `energy_gpu_j` distingan una ruta de otra — **solo GEMM y Convolución** |
 
 ```bash
 python3 extract_csv.py --input run_123.log --outdir results --job-id 123 --kernel stencil
@@ -40,6 +41,32 @@ Aplicar el criterio de un kernel al otro es el error fácil aquí, y es la razó
 **Un solo script para los tres kernels, no tres.** La lógica de las dos puertas es literalmente la misma; lo único que cambia es el esquema de columnas, aislado en una tabla de datos (`ESQUEMAS`). Tres copias habrían divergido a la primera corrección. Vive en `Fase_4/tools/` porque es donde ya está el resto de la herramienta transversal a kernels.
 
 **Probado en GPU real, positiva y negativamente** (`sm_86`, 2026-09-06): pasa con logs reales de GEMM (`n=256`) y Convolución (`hw=64`); falla con código `1` si se corrompe un `rel_l2` determinista del log K=0, falla con `1` si se infla un `rel_linf` por encima de la cota, y devuelve `2` (no evaluable) si se le pasa un log K=0 como si fuera K=1 o un log con varias corridas concatenadas. Stencil no se pudo ejercitar localmente: su `.cu` tiene un `static_assert(sizeof(long) >= 8)` que rechaza Windows a propósito.
+
+**Una fila no finita NO hace fallar el gate**, y decir que sí sería un error de especificación: el ancla acota el **error** de cada paso, no la **magnitud** del estado. Bajo un operador que amplifica (el Laplaciano de estrés lo hace, `g=-2` en Nyquist) el estado crece hasta salirse del rango del formato —FP16 llega a 65 504— y desborda por mucho que se ancle en cada iteración. Es el *horizonte de overflow* que el proyecto estudia como fenómeno. Esas filas se descartan con aviso; si no queda ninguna evaluable, el gate devuelve `2`. Se detectó al correrlo a `--hw 128 --iters 20`, donde `FP16_comp` desborda en la iteración 20 con `K=1` — comprobado bit a bit contra el binario anterior: es preexistente, no una regresión.
+
+## `gate4_medicion.py` — que el tiempo y la energía sean de la ruta que dicen
+
+Vigila un bug que estuvo vivo hasta 2026-09-06 en `gemm_chained.cu` y `conv_chained.cu`: `t_iter_ms`, `t_total_ms`, `gflops` y `energy_gpu_j` **no distinguían la ruta `_none` de la `_comp`** (un solo cronómetro envolvía las tres trayectorias de cada iteración, y los dos `PowerBuffer` cubrían el mismo intervalo sobre un contador NVML de todo el dispositivo), y además incluían el costo de la referencia FP64. Dos de los tres ejes del Frente de Pareto 3D eran inutilizables para esos dos kernels; el eje de error nunca estuvo afectado.
+
+```bash
+python3 gate4_medicion.py --kernel gemm --k0 k0.log --k1 k1.log
+```
+
+No comprueba "el tiempo es correcto" — no hay contra qué contrastarlo sin un segundo instrumento. Comprueba la propiedad que el bug rompía y que el Pareto necesita: **que cada número responda a la carga de su propia ruta y solo a ella**. Cinco comprobaciones, todas falsables:
+
+| | Qué exige |
+|---|---|
+| **A** | `t_iter_ms(_comp) > t_iter_ms(_none)`. La ruta compensada hace el doble de productos WMMA. La *igualdad exacta* era la firma del bug. |
+| **B** | `energy_gpu_j(_none) ≠ energy_gpu_j(_comp)`. Si NVML no está disponible se omite con aviso: no se puede fallar por telemetría ausente. |
+| **C** | `t_iter_ms(_comp)` sube al pasar de `K=0` a `K=1`. Es la más fuerte: no compara dos rutas entre sí, sino la *misma* ruta contra sí misma bajo dos cargas distintas. |
+| **D** | `t_iter_ms(_none)` es insensible a `K` — esa ruta nunca ancla. Si se mueve con `K`, sigue contaminada por el trabajo de la otra. |
+| **E** | Existe la fila `GPU_FP64`. Tras el fix la referencia se publica aparte, y sin esa fila no hay forma de comprobar que su costo se excluyó en vez de desaparecer sin dejar rastro. |
+
+**Stencil no se evalúa** (`--kernel` solo acepta `gemm` y `conv`): su medición siempre fue por ruta.
+
+**Probado positiva y negativamente en GPU real** (`sm_86`): sobre el binario *anterior* al fix falla 4 de 5 comprobaciones —con `t_iter_ms` idéntico en las dos filas, exactamente el diagnóstico esperado—; sobre el binario corregido pasa las cinco. Las comprobaciones A, C y D necesitan una ventana de medición lo bastante larga para que el reloj sea estable: a `n=512` en una GPU de laptop, D dispara por ruido de 40 %; a `n=1024` o más baja a 2-4 %. `--tolerancia-ruido` la ajusta.
+
+Corre dentro de `tools/validacion_preliminar.sbatch` (paso 4), reutilizando los logs que el paso 3 ya generó.
 
 ## `anchor_every`: ahora es COLUMNA REAL, ya no reconstruida
 

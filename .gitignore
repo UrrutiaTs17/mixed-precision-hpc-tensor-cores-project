@@ -76,3 +76,8 @@ out/
 
 # CLion
 cmake-build-*/
+
+# Cache de bytecode de Python (lo genera importar Fase_4/tools/common_analysis.py
+# desde otro script; no es un artefacto del proyecto).
+__pycache__/
+*.pyc

@@ -88,9 +88,23 @@ def _derive_format_stencil(route: str) -> str:
     return "NA"
 
 
+# Rutas de REFERENCIA de GEMM/Convolucion. Desde que la medicion se separo
+# por fases, esos dos binarios publican la trayectoria FP64 como una fila
+# propia (misma convencion de nombre que Stencil), en vez de dejar su costo
+# escondido dentro del tiempo de las rutas de baja precision. Hay que
+# reconocerla explicitamente: sin esto, rpartition("_") la leeria como
+# formato "GPU" con tratamiento "none" -- es decir, la metaria en el factor
+# "tratamiento" como si fuera una ruta de baja precision, que es justo la
+# confusion que la correccion #1c del plan prohibe.
+CHAINED_REFERENCE_ROUTES = {"gpu_fp64"}
+
+
 def _derive_from_chained_route(route: str) -> "tuple[str, str]":
-    # route = "<FORMATO>_none" o "<FORMATO>_comp" (ver
-    # Fase_3/tools/extract_csv_chained.py, route_format()).
+    # route = "<FORMATO>_none" / "<FORMATO>_comp" (ver
+    # Fase_3/tools/extract_csv_chained.py, route_format()), o "GPU_FP64".
+    route_l = (route or "").strip().lower()
+    if route_l in CHAINED_REFERENCE_ROUTES:
+        return "FP64", TREATMENT_REFERENCE
     fmt, _, suffix = (route or "").rpartition("_")
     fmt = fmt or route or "NA"
     treatment = TREATMENT_COMP if suffix == "comp" else TREATMENT_NONE

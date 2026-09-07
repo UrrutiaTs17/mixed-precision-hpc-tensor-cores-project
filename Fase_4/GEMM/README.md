@@ -45,6 +45,40 @@ El gate está probado positiva y negativamente sobre logs reales (`sm_86`, 2026-
 
 Ninguna campaña real (`K` intermedios, ej. 5/10/20) tiene sentido reportar antes de verificar estas dos puertas con un `--n` chico (64 o 128).
 
+## Medicion por ruta: el costo del ancla ahora SI se ve
+
+Hasta 2026-09-06, `t_iter_ms`/`gflops`/`energy_gpu_j` de este binario no
+distinguian la ruta `_none` de la `_comp` (un solo cronometro envolvia las tres
+trayectorias) y ademas descontaban del tiempo medido el computo que el
+`cudaMemcpy` del checkpoint absorbia al esperar la cola asincrona. Ver
+`Fase_3/GEMM/README.md`, seccion "Los numeros de tiempo/energia anteriores a
+2026-09-06 no son utilizables", para el detalle completo y la tabla de
+antes/despues.
+
+**En Fase 4 el dano era mayor que en Fase 3**: el costo del ancla -- que es
+justo lo que el barrido de `K` existe para medir -- tampoco era visible, porque
+el tiempo de la ruta compensada no era suyo. Con la medicion por fases, el
+efecto aparece de inmediato (GPU Ampere real, `--n 1024 --iters 20 --tc fp16`):
+
+| | `t_iter_ms` de `FP16_comp` |
+|---|---|
+| `--anchor-every 0` | 3.32 |
+| `--anchor-every 1` | 24.05 (**7.25x**) |
+
+Ese 7.25x es lo esperado en una tarjeta con FP64 a 1/64 del ritmo: anclar en
+cada iteracion agrega un `cublasDgemm` completo por paso. En A100 el factor
+sera muy distinto (FP64 a 1/2), y medirlo es exactamente el objetivo del
+barrido de `K`.
+
+**Los dos costos FP64 ahora estan separados**, que antes no lo estaban:
+- La trayectoria de REFERENCIA (con la que se mide el error) queda fuera de las
+  rutas de baja precision, publicada como ruta propia `GPU_FP64`.
+- Los pasos FP64 que el ANCLA inyecta quedan DENTRO de la ruta compensada, que
+  es donde corresponde.
+
+Lo vigila `../tools/gate4_medicion.py`, que corre en
+`tools/validacion_preliminar.sbatch`.
+
 ## Costo de memoria
 
 El ancla agrega 4 buffers `double` de tamaño `N²` (`d_comp64_in`, `d_comp64_out`, `d_exact64`, `d_out64`) — 32 bytes/celda adicionales sobre lo que ya usa la ruta con compensación, solo cuando `--anchor-every > 0`. Con `--anchor-every 0` no se reserva nada de esto (`anchor_enabled = false`).

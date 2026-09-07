@@ -65,8 +65,47 @@ El trabajo de checkpoint (copia D2H + comparación en host) queda **excluido** d
 
 ```
 CSV_DRIFT,<formato>_<none|comp>,n,iter,rel_l2,rel_linf,solution_finite,anchor_every
-CSV_SUMMARY,<formato>_<none|comp>,n,iters,t_iter_ms,t_total_ms,gflops,energy_gpu_j,window_reliable,gpu_segments,anchor_every
+CSV_SUMMARY,<ruta>,n,iters,t_iter_ms,t_total_ms,gflops,energy_gpu_j,window_reliable,gpu_segments,anchor_every
 ```
+
+`<ruta>` es `<formato>_none`, `<formato>_comp` o **`GPU_FP64`** — la trayectoria de referencia, que ahora se publica como una fila propia (ver abajo). Es el punto de Pareto "todo en FP64" que a este kernel le faltaba; Stencil ya lo tenía.
+
+## ⚠️ Los números de tiempo/energía anteriores a 2026-09-06 no son utilizables
+
+Hasta esa fecha, `t_iter_ms`, `t_total_ms`, `gflops` y `energy_gpu_j` de este binario estaban mal **de dos formas independientes**. Cualquier campaña corrida antes hay que volver a correrla; los números de **error** (`rel_l2`, `rel_linf`) nunca estuvieron afectados y siguen siendo válidos.
+
+**1. No distinguían una ruta de otra.** Un solo cronómetro envolvía las tres trayectorias de cada iteración (referencia FP64 + WMMA sin compensación + WMMA con compensación) y el mismo número se imprimía en las dos filas. Los dos `PowerBuffer` se abrían y cerraban en los mismos instantes sobre `nvmlDeviceGetTotalEnergyConsumption`, que es un contador **de todo el dispositivo**, así que las dos columnas de energía eran literalmente el mismo valor. Además, ambos incluían el costo de la referencia FP64.
+
+**2. Descontaban el cómputo del tiempo medido.** La pausa de checkpoint se abría *antes* de sincronizar. Como los lanzamientos de kernel son asíncronos, el `cudaMemcpy` D2H del checkpoint bloqueaba esperando toda la cola pendiente, esa espera caía dentro de la pausa, y se restaba del total. El resultado eran tiempos absurdamente bajos.
+
+Medido en la misma GPU (RTX 3050, `sm_86`), `--n 2048 --iters 20 --tc both --comp on`:
+
+| | antes | después |
+|---|---|---|
+| `FP16_none` | 2.925 ms/iter → 5 873 GFLOPS | 16.91 ms/iter → 1 016 GFLOPS |
+| `FP16_comp` | 2.925 ms/iter (idéntico) | 35.68 ms/iter → 482 GFLOPS (2.11× de `_none`) |
+| `BF16_none` | 1.045 ms/iter → **16 440 GFLOPS** | 16.93 ms/iter → 1 015 GFLOPS |
+| `GPU_FP64` | no se reportaba | 167.6 ms/iter → 102.5 GFLOPS |
+
+16 440 GFLOPS en una RTX 3050 era la señal más visible de que algo estaba mal: es un orden de magnitud por encima de lo que ese kernel puede alcanzar en esa tarjeta.
+
+Lo verifica `Fase_4/tools/gate4_medicion.py`, que corre en `tools/validacion_preliminar.sbatch`.
+
+## Cómo se mide ahora
+
+Tres **fases separadas**, cada una con su propio cronómetro y su propia ventana de `PowerBuffer`:
+
+1. **Referencia FP64** — una sola vez por invocación (no una por formato: la trayectoria no depende de `T`). Publica la fila `GPU_FP64` y guarda en RAM del host un snapshot del estado por cada checkpoint.
+2. **Ruta `_none`** — su propia ventana; compara contra los snapshots guardados, sin recalcular nada dentro de la ventana medida.
+3. **Ruta `_comp`** — ídem.
+
+**Por qué fases y no tres cronómetros en un bucle único**: el *tiempo* sí se podía separar con eventos CUDA dentro del bucle. La *energía* no — el contador de NVML es de todo el dispositivo y su cuantización (~20-25 ms de GPU cargada) es mayor que el tramo de una trayectoria en una iteración, así que sumar cientos de tramos cuantizados no da nada utilizable. Atribuir energía a una ruta exige darle una ventana **contigua** propia.
+
+**Costo**: los snapshots FP64 en RAM del host (`num_checkpoints × N² × 8 B`; el binario lo imprime al arrancar). A `N=8192` con `CHECKPOINT_EVERY=5` e `ITERS=80` son 16 × 537 MiB = 8.6 GiB, dentro de `--mem=128G`. Es el mismo patrón que Stencil ya usaba (`ckpt.fp64_checkpoints`).
+
+**Lo que no arregla**: las fases corren una detrás de otra, así que la última ve una GPU más caliente que la primera — la misma limitación de aislamiento térmico que el plan ya documenta (Etapa 5).
+
+**`gflops` usa siempre los FLOPs útiles** (un `X·A` por iteración), también en `_comp`, que hace un segundo producto para la corrección: esa ruta entrega el mismo resultado útil a mayor costo, así que su `gflops` más bajo es lo que hay que reportar, no un artefacto.
 
 `anchor_every` es la última columna y en **este** binario vale siempre `0`: Fase 3 no tiene ancla. La columna existe igual para que el esquema sea idéntico al de `Fase_4/GEMM` — `run_full_pipeline.sh` concatena los `results/` de las dos fases en el mismo análisis, y dos esquemas distintos obligarían a `Fase_4/tools/common_analysis.py` a ramificar por fase.
 
@@ -103,5 +142,5 @@ El perfilado NCU se restringe a la primera pasada de `ITERS_LIST`: `wmma_gemm_ke
 - **Post-proceso de CSV**: ✅ hecho — `../tools/extract_csv_chained.py`.
 - **Verificación del orden de operandos**: ✅ hecho y **pasado en GPU real** — ver arriba.
 - **Scripts de gate** K=0/K=1: ✅ hechos — `Fase_4/tools/gate3_ancla.py` y `Fase_4/GEMM/gate3_ancla.sbatch`.
-- **`t_iter_ms`/`gflops`/`energy_gpu_j` no distinguen `_none` de `_comp`**: un solo cronómetro envuelve las tres trayectorias de cada iteración (referencia FP64 + WMMA sin comp + WMMA con comp) y se imprime idéntico en las dos filas; los dos `PowerBuffer` se abren y cierran en los mismos instantes sobre un contador NVML **de todo el dispositivo**, así que las dos columnas de energía son literalmente el mismo número. Los ejes tiempo y energía del Frente de Pareto de este kernel no pueden separar `comp=off` de `comp=on`, y ambos incluyen el costo de la referencia FP64. Hallazgo de la auditoría de 2026-09-06, **sin corregir**: arreglarlo exige reescribir el bucle de medición.
+- **Medición por ruta**: ✅ corregida — ver la advertencia de arriba. El gate que la vigila es `Fase_4/tools/gate4_medicion.py`.
 - **Campaña real en PACCA**: compilado y verificado con `N` chico en GPU Ampere+; falta el barrido completo.

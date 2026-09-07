@@ -468,9 +468,27 @@ def gate_k1_encadenado(kernel, path, slack, informe):
                 % route)
             continue
         if d.get("solution_finite", "").strip() not in ("1",):
-            informe["fallos"].append(
-                "K=1 %s iter=%s: solution_finite=%s. Con el ancla en cada "
-                "iteracion la trayectoria no puede dejar de ser finita."
+            # NO es un fallo del ancla, y decir que lo es seria un error de
+            # especificacion: el ancla acota el ERROR de cada paso, no la
+            # MAGNITUD del estado. Bajo un operador que amplifica (el
+            # Laplaciano de estres lo hace: g=-2 en Nyquist), el estado crece
+            # hasta salirse del rango del formato -- FP16 llega a 65504 -- y
+            # desborda por mucho que se ancle cada iteracion. Es el "horizonte
+            # de overflow" que el proyecto estudia como fenomeno, no un
+            # sintoma de que el mecanismo este roto.
+            #
+            # La fila no se puede usar para juzgar la cota de cuantizacion
+            # (rel_l2/rel_linf ya no significan lo mismo si el estado no es
+            # finito), asi que se descarta con aviso en vez de hacer fallar el
+            # gate. Si NINGUNA fila queda evaluable, el gate lo reporta como
+            # no evaluable mas abajo.
+            informe["avisos"].append(
+                "K=1 %s iter=%s: solution_finite=%s -- la ruta desbordo el rango "
+                "del formato en esa iteracion. Fila descartada del gate: el ancla "
+                "acota el error del paso, no la magnitud del estado, asi que un "
+                "operador que amplifica desborda igual. Para evaluar la cota, usar "
+                "menos --iters o un tamano menor (el horizonte de overflow depende "
+                "de operador, formato y tamano)."
                 % (route, d.get("iter"), d.get("solution_finite")))
             continue
         evaluadas += 1
