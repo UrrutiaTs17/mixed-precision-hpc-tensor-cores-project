@@ -20,14 +20,22 @@ A diferencia de GEMM (donde el paso FP64 no necesita ningún buffer intermedio m
 
 Mismo criterio que `Fase_4/GEMM/README.md`: `comp`/`comp64` arrancan sembrados con el redondeo *real* de `x0→T` (`seed_comp_from_double_kernel`/`seed_comp64_from_double_kernel`), no desde cero — de lo contrario la primera iteración reconstruiría `dequantize(T(x0))` en vez de `x0`, y esa diferencia se amplificaría en cada paso sin que nada la corrija.
 
-## Validación: dos puertas antes de confiar en cualquier número
+## Validación: dos puertas, ahora automatizadas
 
-Ver `Fase_4/GEMM/README.md`, sección de Validación, para el detalle completo: `CSV_DRIFT` compara la referencia FP64 contra `T` tal cual se guarda, nunca contra `T+comp`, así que el piso reportable de `rel_l2` está acotado por la precisión de `T` (~`1e-3` a `1e-4` en FP16), sin importar qué tan exacta sea la reconstrucción interna del ancla.
+```bash
+sbatch gate3_ancla.sbatch          # o: bash gate3_ancla.sbatch, sin SLURM
+```
 
-- **`--anchor-every 1`** (ancla en cada iteración): verificar que `rel_l2`/`rel_linf` sean medibles y estables (no crecientes) a lo largo de muchas iteraciones, y que difieran de la ruta K=0 (evidencia de que el ancla realmente se ejecuta, no un no-op silencioso).
-- **`--anchor-every 0`** debe ser bit-idéntico a correr `Fase_3/Convolution/conv_chained.cu` con los mismos flags.
+Compila los **dos** binarios (Fase 3 y este), corre las tres pasadas (`Fase_3` sin el flag, `Fase_4` con `--anchor-every 0` y con `--anchor-every 1`) a `--hw 64` y le pasa los logs a `../tools/gate3_ancla.py --kernel conv`.
 
-Verificar con `--hw 64` (el mínimo) antes de cualquier campaña con `--hw` mayor.
+- **`--anchor-every 0`** debe reproducir `Fase_3/Convolution/conv_chained.cu` columna por columna en lo determinista. Las columnas de tiempo/energía se reportan como desviación relativa pero **no deciden**: en la corrida real de validación variaron un 59 % entre dos pasadas del mismo código mientras lo determinista salía idéntico.
+- **`--anchor-every 1`** debe cumplir la **cota de cuantización** del formato: `rel_l2 ≤ 2^-p` y `rel_linf ≤ 2^-p`, con `p=11` en FP16 (`4.883e-04`) y `p=8` en BF16 (`3.906e-03`). No es un umbral inventado: con K=1 la reconstrucción interna es exacta, así que lo único que separa a `T` de la referencia es el redondeo al formato de 16 bits. Ver `Fase_4/tools/README.md` para la derivación.
+
+**Verificado en GPU Ampere real** (`sm_86`, `--hw 64 --iters 12 --tc both --comp on --anchor-every 1`): FP16 llegó a `rel_linf = 3.74e-04` y BF16 a `3.00e-03`, ambos al **0.77** de su cota — el mismo factor en los dos formatos. Las dos puertas pasan.
+
+**Ojo con el criterio ingenuo**: "con K=1 el error debe caer a `1e-16`" es imposible aquí, y no por un bug — `CSV_DRIFT` compara la referencia FP64 contra `T` **tal cual se guarda**, nunca contra `T+comp`, así que el piso está acotado por la precisión de `T` sin importar qué tan exacta sea la reconstrucción interna. Es la misma limitación que ya documenta `Fase_4/GEMM/README.md`.
+
+**Si este gate falla y el de GEMM pasa con parámetros equivalentes**, el primer sospechoso es el buffer scratch de `im2col` compartido (ver la sección siguiente), que es la única diferencia estructural del mecanismo de ancla entre los dos kernels — antes que cualquier error de lógica del ancla en sí.
 
 ## Costo de memoria
 

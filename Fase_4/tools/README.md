@@ -1,11 +1,14 @@
 # Fase 4 — tools
 
-**No son copias idénticas de `Fase_3/tools/`** — a diferencia de `extract_csv_chained.py` (idéntico en ambas fases, GEMM/Conv de Fase 3 no tiene ancla que reconstruir), `extract_csv.py` de esta carpeta SÍ tiene una extensión propia sobre la versión de `Fase_3/tools/`: reconstruye la columna `anchor_every`. Alimentan a los binarios de Fase 4:
+Tres cosas: post-proceso de CSV, el **gate del ancla FP64** (`gate3_ancla.py`, nuevo) y el análisis final (estadística + Pareto).
+
+Los dos extractores son ahora **idénticos** a los de `Fase_3/tools/` (antes `extract_csv.py` divergía). Los seis binarios emiten el mismo esquema de columnas, y mantener dos variantes solo invitaba a que una se quedara atrás.
 
 | Script | Para |
 |---|---|
-| `extract_csv.py` | `Fase_4/Stencil/stencil_tensor_activation.cu` — **extendido** respecto a `Fase_3/tools/extract_csv.py` (ver abajo) |
-| `extract_csv_chained.py` | `Fase_4/GEMM/gemm_chained.cu`, `Fase_4/Convolution/conv_chained.cu` — idéntico al de `Fase_3/tools/` |
+| `extract_csv.py` | `stencil_tensor_activation.cu` (Fase 3 y Fase 4) |
+| `extract_csv_chained.py` | `gemm_chained.cu` y `conv_chained.cu` (Fase 3 y Fase 4) |
+| `gate3_ancla.py` | Validación automatizada del ancla, **los tres kernels** |
 
 ```bash
 python3 extract_csv.py --input run_123.log --outdir results --job-id 123 --kernel stencil
@@ -13,16 +16,38 @@ python3 extract_csv_chained.py --input run_456.log --outdir results --job-id 456
 python3 extract_csv_chained.py --input run_789.log --outdir results --job-id 789 --kernel conv
 ```
 
-## `anchor_every`: ahora reconstruido en LOS TRES kernels
+## `gate3_ancla.py` — las dos puertas del ancla, automatizadas
 
-Ninguno de los tres binarios escribe `anchor_every` como columna real de `CSV_DRIFT`/`CSV_SUMMARY` — los tres extractores lo reconstruyen leyendo, en cambio, la línea de configuración que cada binario imprime **una vez por invocación**, antes de sus filas `CSV_*`:
+Es lo que `Fase_4/Stencil/README.md` nombraba como `gate3_ancla.sbatch` y lo que `Fase_4/GEMM/README.md` y `Fase_4/Convolution/README.md` pedían con idéntica redacción ("mientras tanto, correr las dos puertas de la sección Validación arriba a mano"). Sigue el estilo de `old/Fase_4/Stencil/tools/comparar_gate1.py`: separar columnas deterministas de columnas de medición, veredicto solo sobre las primeras, código de salida `0`/`1` (más `2` = no evaluable, que **no** es un "pasa").
 
-- GEMM/Convolución (`extract_csv_chained.py`): `N=1024 ... anchor_every=5 (activa)` / `HW=64 ... anchor_every=5 (activa)`.
-- Stencil (`extract_csv.py`, extensión de esta carpeta sobre `Fase_3/tools/extract_csv.py`): `Ancla FP64 (anchor-every)  : 5 (activa)` — nuevo regex `ANCHOR_RE`, nueva columna al final de `DRIFT_HEADER`/`SUMMARY_HEADER`/`ENERGY_HEADER` (al final, no junto a `kahan`, para no correr los índices posicionales que `SUMMARY_VALUE_FIELDS` ya usa sobre la línea `CSV_SUMMARY`).
+```bash
+python3 gate3_ancla.py --kernel gemm \
+    --gate0-base fase3_k0.log --gate0-nuevo fase4_k0.log --gate1 fase4_k1.log
+```
 
-En Stencil, `anchor_every` es contexto de **invocación completa** (una constante por proceso), no de ruta: si una corrida mezcla rutas de referencia (`gpu_fp64`, `cpu_fp64`) con la ruta WMMA bajo ancla, todas las filas de esa invocación comparten el mismo `anchor_every` — correcto, porque el ancla es un parámetro de la corrida, no de la ruta individual (a diferencia de GEMM/Conv, donde `anchor_every` sí varía por ruta dentro de la misma corrida: `_none` siempre reporta `0`, `_comp` reporta el valor real — ver el comentario de `extract_csv_chained.py`).
+En la práctica no se invoca a mano: cada `Fase_4/<kernel>/gate3_ancla.sbatch` compila los dos binarios, corre las tres pasadas y lo llama.
 
-`Fase_3/tools/extract_csv.py` (sin ancla, Fase 3 nunca imprime esa línea) se dejó **sin tocar** — no tiene sentido buscar una línea que su binario no emite.
+**Gate K=0** — `--anchor-every 0` debe reproducir Fase 3 columna por columna en lo determinista. Las columnas de tiempo/energía se reportan como desviación relativa pero **no deciden**: dos corridas del mismo binario ya difieren ahí por ruido. (Comprobado: en la primera corrida real las columnas deterministas salieron idénticas mientras `t_iter_ms` variaba un 59 % entre las dos pasadas.)
+
+**Gate K=1 — leer antes de tocar las tolerancias.** La formulación ingenua ("con K=1, `rel_l2` debe caer a nivel de ruido de punto flotante, ~`1e-16`") **no puede pasar** en GEMM ni en Convolución, y no por un bug:
+
+- Ahí `CSV_DRIFT` compara la referencia FP64 contra el buffer `T` **tal cual se guarda** (FP16/BF16), nunca contra `T+comp`. Con K=1 la reconstrucción interna es *exacta* — `comp64 = out64 − dequant(q)` es una resta exacta por Sterbenz, y por tanto `dequant(q) + comp64 == out64` bit a bit —, así que lo único que separa a `T` de la referencia es la **cuantización al formato de 16 bits**. De ahí sale una cota derivada, no un umbral inventado: para redondeo al más cercano con `p` bits de significando, `rel_l2 ≤ 2^-p` y `rel_linf ≤ 2^-p`, con `p=11` en FP16 (`4.883e-04`) y `p=8` en BF16 (`3.906e-03`).
+- **Verificado en GPU real** (`sm_86`, `conv_chained --hw 64 --iters 12 --tc both --comp on --anchor-every 1`): FP16 llegó a `rel_linf = 3.74e-04` y BF16 a `3.00e-03` — ambos al **0.77** de su cota, el *mismo* factor en los dos formatos, que es la confirmación empírica de que el modelo es el correcto.
+- **En Stencil el test no puede ser el mismo**, porque `CSV_DRIFT` mide otro objeto: compara contra `d_out_fp32`, el acumulador FP32 *sin* el redondeo de almacenamiento ("ancla de no-regresión"). El análogo real de `rel_l2` de GEMM/Conv es `rel_l2_prop`, que sí mide el estado propagado en 16 bits. Por eso el gate de Stencil tiene **dos criterios**: (a) `rel_l2`/`rel_linf` de la ruta anclada deben alcanzar el nivel de `GPU_FP64` de la misma corrida (con K=1 el paso se sustituye entero por `stencil2d_fp64_kernel`, así que la trayectoria anclada *es* la de `GPU_FP64`), y (b) `rel_l2_prop`/`rel_linf_prop` deben cumplir la misma cota `2^-p`.
+
+Aplicar el criterio de un kernel al otro es el error fácil aquí, y es la razón por la que el script no tiene un solo umbral global.
+
+**Un solo script para los tres kernels, no tres.** La lógica de las dos puertas es literalmente la misma; lo único que cambia es el esquema de columnas, aislado en una tabla de datos (`ESQUEMAS`). Tres copias habrían divergido a la primera corrección. Vive en `Fase_4/tools/` porque es donde ya está el resto de la herramienta transversal a kernels.
+
+**Probado en GPU real, positiva y negativamente** (`sm_86`, 2026-09-06): pasa con logs reales de GEMM (`n=256`) y Convolución (`hw=64`); falla con código `1` si se corrompe un `rel_l2` determinista del log K=0, falla con `1` si se infla un `rel_linf` por encima de la cota, y devuelve `2` (no evaluable) si se le pasa un log K=0 como si fuera K=1 o un log con varias corridas concatenadas. Stencil no se pudo ejercitar localmente: su `.cu` tiene un `static_assert(sizeof(long) >= 8)` que rechaza Windows a propósito.
+
+## `anchor_every`: ahora es COLUMNA REAL, ya no reconstruida
+
+Los seis binarios la escriben como **última** columna de `CSV_DRIFT` y `CSV_SUMMARY` (y de `CSV_ENERGY` en Stencil). Al final, no junto a `kahan`, para no correr los índices posicionales que `SUMMARY_VALUE_FIELDS`/`SUMMARY_FIELD_COUNT` ya usan.
+
+En Stencil es contexto de **invocación completa** (una constante por proceso), no de ruta: si una corrida mezcla rutas de referencia (`gpu_fp64`, `cpu_fp64`) con la ruta WMMA bajo ancla, todas comparten el mismo `anchor_every` — correcto, porque el ancla es un parámetro de la corrida. En GEMM/Convolución, en cambio, **varía por ruta** dentro de la misma corrida: `_none` siempre reporta `0`, `_comp` el valor real. La implementación codifica esa diferencia (variable de proceso en Stencil, valor en el punto de uso en GEMM/Conv) justamente para que no se pierda en una refactorización.
+
+Los extractores conservan el **respaldo** de reconstruirla desde la línea de configuración del binario, para logs anteriores al cambio. `Fase_3/tools/extract_csv.py` dejó de estar "sin tocar": ahora es el mismo archivo que este.
 
 ## Análisis: `common_analysis.py`, `run_statistics.py`, `pareto_front.py`
 

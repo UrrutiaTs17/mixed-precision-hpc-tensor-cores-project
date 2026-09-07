@@ -31,11 +31,23 @@ Ejemplo:
 
 ## Validación — correr esto ANTES de confiar en cualquier resultado
 
-Estos tres gates están descritos en detalle en la sección 01/02 del documento de plan. No están automatizados todavía en un script (`gate3_ancla.sbatch` queda como trabajo pendiente, ver "Qué falta" más abajo) — corrégelos a mano hasta que ese script exista:
+Estos tres gates están descritos en detalle en la sección 01/02 del documento de plan. Los dos primeros **ya están automatizados**:
 
-1. **`--anchor-every 1`** (ancla en cada iteración): la ruta debe converger a ser numéricamente indistinguible de `GPU_FP64` (comparar `rel_l2`/`rel_linf` contra esa ruta — deberían caer a nivel de ruido de punto flotante). Si no, hay un bug — probablemente el mismo tipo de error de truncamiento a `float` que ya se corrigió una vez en el diseño (ver el aviso "BUG YA ENCONTRADO" en la cabecera del `.cu`).
-2. **`--anchor-every 0`**: la ruta debe ser **bit-idéntica** a correr el mismo comando sin ese flag (o, equivalentemente, a `Fase_3/Stencil/stencil_tc` con los mismos parámetros). Compara los CSV byte a byte.
-3. **Barrido de `K` intermedios**: una vez 1 y 2 pasan, recién ahí tienen sentido los resultados de `K` intermedios (2, 4, 8, 16, ...) — son los que responden la pregunta real del objetivo 4.
+```bash
+sbatch gate3_ancla.sbatch          # o: bash gate3_ancla.sbatch, sin SLURM
+```
+
+`gate3_ancla.sbatch` compila los **dos** binarios (Fase 3 y este), corre las tres pasadas y le pasa los logs a `../tools/gate3_ancla.py --kernel stencil`.
+
+1. **`--anchor-every 1`** (ancla en cada iteración). Aquí el gate tiene **dos criterios**, cada uno sobre la columna que le corresponde, y la distinción no es un tecnicismo:
+   - **(a)** `rel_l2`/`rel_linf` deben alcanzar el nivel de la ruta `GPU_FP64` de la *misma* corrida. Con K=1 el paso se sustituye entero por `stencil2d_fp64_kernel`, así que la trayectoria anclada **es** la de `GPU_FP64`; el gate admite un factor de holgura (`--factor-gpu-fp64`, default 10) en vez de exigir identidad bit a bit, para no fallar por el *narrowing* a `float` del readout.
+   - **(b)** `rel_l2_prop`/`rel_linf_prop` deben quedar bajo la cota de cuantización del formato (`2^-11` en FP16, `2^-8` en BF16).
+
+   **Por qué dos y no uno**: en Stencil, `CSV_DRIFT.rel_l2` compara contra `d_out_fp32` — el acumulador FP32 *sin* el redondeo de almacenamiento, "ancla de no-regresión". **No es el mismo objeto** que mide `CSV_DRIFT` en GEMM/Convolución (allí es el buffer `T` cuantizado). El análogo real de aquella columna es `rel_l2_prop`, que sí mide el estado propagado en 16 bits. Aplicar el criterio de un kernel al otro es el error fácil de cometer, y es la razón por la que `gate3_ancla.py` no tiene un solo umbral global.
+2. **`--anchor-every 0`**: la ruta debe ser bit-idéntica a `Fase_3/Stencil/stencil_tc` con los mismos parámetros. El gate compara `CSV_DRIFT`, `CSV_SUMMARY`, `CSV_STORE`, `CSV_HORIZON` y `CSV_ONSET` campo a campo, separando las columnas de tiempo/energía (que se reportan como desviación relativa pero **no deciden**: dos corridas del mismo binario ya difieren ahí por ruido).
+3. **Barrido de `K` intermedios**: una vez 1 y 2 pasan, recién ahí tienen sentido los resultados de `K` intermedios — son los que responden la pregunta real del objetivo 4. `ANCHOR_LIST` por defecto ya los incluye (`0 1 8 32`).
+
+**Estado de la verificación**: `gate3_ancla.py` se ejercitó de punta a punta en GPU Ampere real (`sm_86`) para GEMM y Convolución, positiva y negativamente. Stencil **no** se pudo ejercitar localmente: su `.cu` tiene un `static_assert(sizeof(long) >= 8)` que rechaza Windows a propósito (`ReferenceSpill` necesita `fseek`/`ftell` de 64 bits). La primera corrida real de este gate será en PACCA.
 
 ## Costo de memoria — léelo antes de dimensionar una campaña
 

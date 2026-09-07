@@ -136,11 +136,25 @@ Los dos scripts **extraen** del `.cu` el texto de las funciones bajo prueba —n
 
 **Objetivo**: cerrar la brecha hacia FP64 con el mecanismo de ancla, ampliar la telemetría de energía a los tres kernels, y sintetizar todo en un Frente de Pareto 3D (Tiempo, Energía, Error) por kernel, con el respaldo estadístico (t-test/ANOVA) que exige el objetivo 3 del plan de tesis.
 
-**Estado: el ancla FP64 está construida en los tres kernels** (`Fase_4/Stencil/stencil_tensor_activation.cu`, `Fase_4/GEMM/gemm_chained.cu`, `Fase_4/Convolution/conv_chained.cu`), cada uno con su `.sbatch` y post-proceso de CSV, y la estadística (ANOVA + Tukey HSD) y el Frente de Pareto 3D también (`Fase_4/tools/run_statistics.py`, `Fase_4/tools/pareto_front.py` — Etapas 7 y 9 del plan). **Nada de esto se ha corrido contra GPU/campaña real todavía** — antes de cualquier campaña con `--anchor-every > 0`, corre los gates K=0/K=1 (ver más abajo); los dos scripts de análisis sí se ejecutaron de verdad contra datos sintéticos (ver `Fase_4/tools/README.md`), pero eso valida que el código corre, no que las conclusiones sobre datos reales tengan sentido.
+**Estado: el ancla FP64 está construida en los tres kernels** (`Fase_4/Stencil/stencil_tensor_activation.cu`, `Fase_4/GEMM/gemm_chained.cu`, `Fase_4/Convolution/conv_chained.cu`), cada uno con su `.sbatch` y post-proceso de CSV, y la estadística (ANOVA + Tukey HSD) y el Frente de Pareto 3D también (`Fase_4/tools/run_statistics.py`, `Fase_4/tools/pareto_front.py` — Etapas 7 y 9 del plan). **Ninguna campaña real se ha corrido todavía**; los dos scripts de análisis sí se ejecutaron contra datos sintéticos, pero eso valida que el código corre, no que las conclusiones tengan sentido.
+
+Los **gates K=0/K=1 sí están automatizados** y hay que correrlos antes de cualquier campaña con `--anchor-every > 0`:
+
+```bash
+cd Fase_4/GEMM && sbatch gate3_ancla.sbatch      # ídem Convolution/ y Stencil/
+```
+
+Cada uno compila los dos binarios (Fase 3 y Fase 4), corre las tres pasadas necesarias y le pasa los logs a `Fase_4/tools/gate3_ancla.py`, que decide y sale con `0`/`1`/`2` (`2` = no evaluable, que **no** es un "pasa"). `tools/validacion_preliminar.sbatch` los corre para los tres kernels de un tirón.
 
 ### El mecanismo de ancla, en corto
 
-Cada `K` iteraciones (parámetro `--anchor-every K`), el paso se recalcula completo en FP64 en vez de en baja precisión, y el resultado reemplaza al de la ruta rápida. Corrige el error de *ese* paso — no reconstruye el drift ya acumulado antes del ancla, porque eso costaría lo mismo que correr todo en FP64. El costo extra es proporcional a `1/K`. `K=1` (ancla en cada iteración) debe converger exactamente a la referencia FP64 — es el gate de validación más importante antes de confiar en cualquier resultado del ancla; `K=0` (deshabilitado) debe ser bit-idéntico al comportamiento de Fase 3.
+Cada `K` iteraciones (parámetro `--anchor-every K`), el paso se recalcula completo en FP64 en vez de en baja precisión, y el resultado reemplaza al de la ruta rápida. Corrige el error de *ese* paso — no reconstruye el drift ya acumulado antes del ancla, porque eso costaría lo mismo que correr todo en FP64. El costo extra es proporcional a `1/K`. `K=0` (deshabilitado) debe ser bit-idéntico al comportamiento de Fase 3.
+
+**`K=1` (ancla en cada iteración): cuidado con el criterio ingenuo.** El *estado interno* del mecanismo sí converge exactamente a la trayectoria FP64 — con K=1 se puede demostrar que `dequant(T) + comp64 == out64` bit a bit. Pero lo que `CSV_DRIFT` publica **no es ese estado**: en GEMM y Convolución compara contra el buffer `T` tal cual se guarda, ya cuantizado a 16 bits. Así que el piso que ese CSV puede reportar está acotado por la cuantización del formato, no por la exactitud del ancla, y pedir "`rel_l2` a nivel de ruido de punto flotante (~`1e-16`)" es imposible por construcción.
+
+El criterio correcto es una cota derivada: para redondeo al más cercano con `p` bits de significando, `rel_l2 ≤ 2^-p` y `rel_linf ≤ 2^-p`, con `p=11` en FP16 (`4.883e-04`) y `p=8` en BF16 (`3.906e-03`). Medido en GPU real, los dos formatos caen al **0.77** de su cota respectiva — el mismo factor en ambos, que es la confirmación de que el modelo es el correcto.
+
+En Stencil el gate es distinto porque `CSV_DRIFT` mide otro objeto (el acumulador FP32 *antes* del redondeo de almacenamiento, no el buffer de 16 bits): allí se comprueba (a) que la ruta anclada alcance el nivel de `GPU_FP64` de la misma corrida y (b) que `rel_l2_prop`/`rel_linf_prop` —que sí miden el estado propagado— cumplan la misma cota `2^-p`. Todo esto está implementado y explicado en `Fase_4/tools/gate3_ancla.py`.
 
 **No hay un motor compartido entre los tres kernels.** Se consideró escribirlo como plantilla genérica (`common/chained_precision.cuh`, todavía existe en el repo) pero terminó sin usarse: cada uno de los tres `.cu` de Fase 4 implementa sus propios kernels locales de reconstrucción/reseed (mismo nombre, misma lógica, repetidos tres veces) porque pasar los conversores `float↔T` como funtores de template entre traducciones agregaba complejidad de compilación sin ganancia real — la orquestación del bucle (qué buffers viven, en qué orden se hace swap) de todas formas es específica de cada kernel. Ver `common/README.md`, sección `chained_precision.cuh`, para el detalle de esta decisión.
 
@@ -184,7 +198,10 @@ Una "campaña" es un barrido sistemático (todos los tamaños × todos los forma
 Porque no existe una biblioteca de NVIDIA para "aplicar un stencil" — cuBLAS es para álgebra lineal, cuDNN para convolución. El Laplaciano de Stencil se implementa como kernel CUDA propio en todas sus rutas (FP32, FP64, y el WMMA con Tensor Cores), así que la comparación "con TC" vs. "sin TC" en Stencil es limpia desde el principio (mismo nivel de esfuerzo de optimización en ambos lados) — no hace falta la aclaración de "comparaciones justas" que sí aplica a GEMM/Convolución.
 
 **¿Por qué el ancla no corrige todo el drift si K=1 corre en FP64 completo?**
-Sí lo hace — con K=1, cada iteración se recalcula en FP64, así que el resultado converge a la referencia FP64 pura. La limitación real es con K>1: el ancla evita que la iteración de ancla introduzca *nuevo* error, pero no reconstruye el drift que ya se acumuló en las iteraciones anteriores al ancla. Es exactamente el punto intermedio entre "nunca anclar" (rápido, drift libre) y "anclar siempre" (K=1, exacto, tan lento como FP64) que el barrido de K está diseñado para caracterizar.
+Sí lo hace — con K=1, cada iteración se recalcula en FP64, así que el estado interno converge a la trayectoria FP64 pura. La limitación real es con K>1: el ancla evita que la iteración de ancla introduzca *nuevo* error, pero no reconstruye el drift que ya se acumuló en las iteraciones anteriores. Es exactamente el punto intermedio entre "nunca anclar" (rápido, drift libre) y "anclar siempre" (K=1, exacto, tan lento como FP64) que el barrido de K está diseñado para caracterizar.
+
+**Corrí K=1 y `rel_l2` se quedó en `2e-4`, no bajó a `1e-16`. ¿Está roto el ancla?**
+No. Es lo esperado, y hay una cota que lo predice. `CSV_DRIFT` de GEMM/Convolución compara la referencia FP64 contra el buffer `T` **ya cuantizado a 16 bits**, nunca contra `T+comp`, así que ese CSV no puede reportar nada mejor que la precisión del formato — por exacto que sea el mecanismo interno. Con FP16 la cota es `2^-11 = 4.9e-04` y con BF16 `2^-8 = 3.9e-03`; un `2e-4` en FP16 está justo donde debe estar. Lo que sí sería un bug es **superar** esa cota: eso es lo que verifica el gate K=1. Ver la sección 5.
 
 **Encontré algo en el código que no coincide con este manual o con un README de carpeta.**
 Confía primero en el `README.md` de la carpeta específica, después en el documento *Plan de Precisión Mixta*, y reporta la discrepancia — este manual es más propenso a quedar desactualizado que el código o su README inmediato.

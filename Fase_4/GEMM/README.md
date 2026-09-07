@@ -24,7 +24,19 @@ Si el residuo tras un paso de ancla se guardara en `float` (truncando el resulta
 
 El residuo de compensación se siembra desde el redondeo *real* de `x0→T` (`seed_comp_from_double_kernel`/`seed_comp64_from_double_kernel`, en `Fase_3/GEMM/gemm_chained.cu` y este archivo respectivamente) — **no desde cero**. Con `comp` en cero, la primera iteración reconstruiría un estado "exacto" que en realidad no es `x0` sino `dequantize(T(x0))`, y esa diferencia se amplificaría por `A` en cada paso sin que nada la corrija (ni la compensación ni el ancla evitan un error que ya se perdió antes de que `comp` empezara a rastrearlo) — mismo patrón que `Fase_4/Stencil`, ver el comentario de `seed_comp_from_double_kernel` en el `.cu`. **Esto no es lo mismo que el piso de `1e-16` que el gate K=1 nunca puede alcanzar** (ver la sección de Validación, abajo) — son dos limitaciones distintas: la siembra determina desde qué estado arranca la trayectoria; el piso de `rel_l2` es una limitación estructural de qué compara `CSV_DRIFT`.
 
-## Validación: dos puertas antes de confiar en cualquier número
+## Validación: dos puertas, ahora automatizadas
+
+```bash
+sbatch gate3_ancla.sbatch          # o: bash gate3_ancla.sbatch, sin SLURM
+```
+
+`gate3_ancla.sbatch` compila los **dos** binarios (Fase 3 y este), corre las tres pasadas que las puertas necesitan (`Fase_3` sin el flag, `Fase_4` con `--anchor-every 0` y con `--anchor-every 1`) y le pasa los logs a `../tools/gate3_ancla.py --kernel gemm`, que decide y sale con `0`/`1`/`2`. Es deliberadamente chico y corto (`N=256`, `--time 00:30:00`): un error de lógica del ancla se delata igual a `N=256` que a `N=8192`, y este job tiene que poder colarse en la cola antes de comprometer las horas de la campaña.
+
+**El gate K=1 no usa el criterio ingenuo, y no puede.** "Con K=1, `rel_l2` debe caer a nivel de ruido de punto flotante (~`1e-16`)" es imposible aquí por lo que `CSV_DRIFT` compara — ver la sección siguiente. El criterio real es una **cota derivada**: con K=1 la reconstrucción interna es exacta (`comp64 = out64 − dequant(q)` es una resta exacta por Sterbenz, luego `dequant(q) + comp64 == out64` bit a bit), así que lo único que separa a `T` de la referencia es la cuantización, y por tanto `rel_l2 ≤ 2^-p` y `rel_linf ≤ 2^-p` con `p=11` en FP16 (`4.883e-04`) y `p=8` en BF16 (`3.906e-03`). Medido en GPU real, ambos formatos caen al **0.77** de su cota respectiva — el mismo factor en los dos, que es la confirmación de que el modelo es correcto.
+
+El gate está probado positiva y negativamente sobre logs reales (`sm_86`, 2026-09-06): pasa con la corrida buena, falla con `1` si se corrompe un `rel_l2` determinista o si se infla un `rel_linf` por encima de la cota, y devuelve `2` (no evaluable, que no es un "pasa") si se le pasa el log equivocado.
+
+## Qué comparan realmente esas puertas
 
 `CSV_DRIFT` compara la referencia FP64 contra el buffer `T` (FP16/BF16) **tal cual se guarda**, nunca contra `T + comp` — así que el piso de `rel_l2` que puede reportar está acotado por la propia precisión de `T` (~`1e-3` a `1e-4` relativo en FP16), sin importar qué tan exacto sea el mecanismo interno de reconstrucción. Verificado empíricamente en GPU real: con `--n 256 --comp on`, K=0 y K=1 dan `rel_l2` casi idénticos (~`1.8e-4`) incluso a 60 iteraciones — la compensación por linealidad, sola, ya mantiene esa cota estable para este operador bien condicionado (`λ≈1.1`). No implica que el ancla no funcione: el metro que usa `CSV_DRIFT` no puede distinguir "`T+comp` exacto a `1e-16`" de "`T` exacto a `1e-4`" porque solo mira `T`.
 
