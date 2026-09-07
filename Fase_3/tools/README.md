@@ -45,11 +45,22 @@ python3 extract_csv_chained.py --input run_789.log --outdir results --job-id 789
 
 Los `.sbatch` de cada carpeta (`Fase_3/Stencil/`, `Fase_3/GEMM/`, `Fase_3/Convolution/`) los invocan automáticamente al terminar la corrida, buscándolos en `../tools/` — ver el bloque final de cualquiera de esos `.sbatch`.
 
-## Por qué `extract_csv_chained.py` reconstruye `anchor_every` desde una línea de cabecera
+## `anchor_every` ya es columna real del CSV
 
-`gemm_chained.cu` y `conv_chained.cu` no escriben `anchor_every` como columna del `CSV_SUMMARY`/`CSV_DRIFT` en sí (pendiente — ver "Qué falta" de `Fase_4/GEMM/README.md` y `Fase_4/Convolution/README.md`). Por eso el script lee la línea de configuración que ambos binarios imprimen al arrancar cada corrida (`N=... anchor_every=K ...` / `HW=... anchor_every=K ...`) y la propaga a las filas de la ruta `_comp` que le siguen — la ruta `_none` nunca usa el ancla, sin importar con qué `--anchor-every` se haya lanzado la corrida (el binario exige `--comp on` para `--anchor-every>0`).
+Los seis binarios (GEMM, Convolución y Stencil, en Fase 3 y Fase 4) escriben `anchor_every` como **última** columna de `CSV_DRIFT` y `CSV_SUMMARY` (y de `CSV_ENERGY` en Stencil). Va al final para no correr ningún índice posicional que las herramientas ya usaban. Los binarios de Fase 3, que no tienen ancla, emiten `0` literal: mismo esquema de columnas entre fases, contenido correcto en ambas — lo que importa porque `run_full_pipeline.sh` concatena los `results/` de las dos fases en el mismo análisis.
+
+**Dos semánticas distintas bajo el mismo nombre de columna** — no las confundas:
+
+| | GEMM / Convolución | Stencil |
+|---|---|---|
+| Alcance | **Por fila**: `_none` reporta `0` y `_comp` reporta `K`, dentro de la *misma* invocación (ambas rutas corren en la misma pasada del binario). | **Por invocación**: todas las filas comparten el valor, incluidas las rutas de referencia `GPU_FP64`/`CPU_FP64` que nunca ejecutan el ancla. |
+| Cómo está implementado | Se imprime en el punto de uso, desde `opt.anchor_every`, ruta por ruta. | Sale de `g_anchor_every_csv`, una variable de alcance de proceso que `main()` fija una sola vez. |
+
+Esa asimetría de implementación es deliberada: codifica la diferencia semántica en la estructura del código, para que no se pueda perder en una refactorización. Los gates de `Fase_4/tools/gate3_ancla.py` comparan *valores*, no significados — no atraparían un cruce entre las dos convenciones.
+
+Los extractores conservan el camino de **respaldo** (reconstruir `anchor_every` desde la línea de configuración que el binario imprime al arrancar) para logs generados antes de que la columna existiera. Borrarlo volvería inanalizable cualquier log anterior al cambio y no cuesta nada mantenerlo.
 
 ## Qué falta
 
-- Migrar los scripts de gate (`comparar_gate1.py`, `validar_gate2.py`, `gate1_regresion.sbatch` — hoy solo en `old/Fase_4/Stencil/`) y escribir sus equivalentes para el ancla de GEMM/Conv (los gates K=0/K=1 que las tres READMEs de ancla piden correr antes de confiar en cualquier resultado).
-- Agregar `anchor_every` como columna real del CSV en los tres binarios, para no depender de reconstruirla desde una línea de texto.
+- Migrar `validar_gate2.py`/`gate1_regresion.sbatch` (hoy solo en `old/Fase_4/Stencil/`), que validan **otras** dos cosas: regresión de la parametrización del operador y checkpoints/archivado. No son el gate del ancla — ese ya existe, ver `Fase_4/tools/gate3_ancla.py`.
+- **`t_iter_ms`/`energy_gpu_j` no distinguen la ruta `_none` de la `_comp`** en GEMM y Convolución: un único cronómetro envuelve las tres trayectorias de cada iteración (referencia FP64 + WMMA sin comp + WMMA con comp) y se imprime idéntico en las dos filas, y los dos `PowerBuffer` se abren y cierran en los mismos instantes sobre un contador NVML que es **de todo el dispositivo**. Consecuencia: los ejes tiempo y energía del Frente de Pareto 3D de esos dos kernels no distinguen `comp=off` de `comp=on`, y ambos están contaminados por el costo de la referencia FP64. Stencil no tiene este problema (cronometra y mide energía por ruta). Arreglarlo exige reescribir el bucle de medición de los cuatro `.cu` encadenados y está fuera del alcance de la auditoría que agregó esta nota.

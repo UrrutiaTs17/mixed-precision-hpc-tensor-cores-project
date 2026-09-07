@@ -576,9 +576,16 @@ static void run_chained_route(const Options& opt, const T* d_a_tc, const double*
                               cudaMemcpyDeviceToHost));
         for (size_t i = 0; i < count; ++i) off_host[i] = static_cast<float>(tmp[i]);
         const ErrorMetrics err = compare_fp64_ref_vs_fp32(ref_host, off_host);
+        // anchor_every va al FINAL de la fila y vale SIEMPRE 0 en Fase 3: este
+        // binario no tiene ancla (es una extension de Fase 4). La columna
+        // existe igual para que el esquema de CSV_DRIFT/CSV_SUMMARY sea
+        // IDENTICO entre Fase 3 y Fase 4 -- run_full_pipeline.sh concatena los
+        // results/ de ambas fases en el mismo analisis (ver
+        // Fase_4/tools/common_analysis.py), y dos esquemas distintos obligarian
+        // a ese modulo a ramificar por fase.
         std::cout << "CSV_DRIFT," << format_label << "_none," << n << "," << iter << ","
                   << err.rel_l2 << "," << err.rel_linf << "," << (err.solution_finite ? 1 : 0)
-                  << "\n";
+                  << ",0\n";
       }
       if (opt.comp) {
         std::vector<T> tmp(count);
@@ -588,7 +595,7 @@ static void run_chained_route(const Options& opt, const T* d_a_tc, const double*
         const ErrorMetrics err = compare_fp64_ref_vs_fp32(ref_host, on_host);
         std::cout << "CSV_DRIFT," << format_label << "_comp," << n << "," << iter << ","
                   << err.rel_l2 << "," << err.rel_linf << "," << (err.solution_finite ? 1 : 0)
-                  << "\n";
+                  << ",0\n";
       }
 
       // Reanuda energia/tiempo DESPUES del D2H y la comparacion en host.
@@ -622,14 +629,14 @@ static void run_chained_route(const Options& opt, const T* d_a_tc, const double*
   std::cout << "CSV_SUMMARY," << format_label << "_none," << n << "," << opt.iters << ","
             << (total_s * 1000.0 / opt.iters) << "," << (total_s * 1000.0) << "," << gflops
             << "," << energy_field(power_buffer_capture_valid(power_buffer_off), energy_off_j)
-            << "," << (window_reliable_off ? 1 : 0) << "," << gpu_segments << "\n";
+            << "," << (window_reliable_off ? 1 : 0) << "," << gpu_segments << ",0\n";
   if (opt.comp) {
     const bool window_reliable_on = total_s >= kEnergyWindowReliableSeconds * gpu_segments;
     const double energy_on_j = power_buffer_energy_joules(power_buffer_on);
     std::cout << "CSV_SUMMARY," << format_label << "_comp," << n << "," << opt.iters << ","
               << (total_s * 1000.0 / opt.iters) << "," << (total_s * 1000.0) << "," << gflops
               << "," << energy_field(power_buffer_capture_valid(power_buffer_on), energy_on_j)
-              << "," << (window_reliable_on ? 1 : 0) << "," << gpu_segments << "\n";
+              << "," << (window_reliable_on ? 1 : 0) << "," << gpu_segments << ",0\n";
   }
 
   power_buffer_destroy(power_buffer_off);

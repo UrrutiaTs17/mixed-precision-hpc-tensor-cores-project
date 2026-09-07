@@ -1994,24 +1994,33 @@ static bool archive_due(const CheckpointContext& ckpt, int iter_number) {
 // guardas de finitud de ErrorMetrics: si la referencia FP64 o la ruta divergen
 // en este checkpoint, imprime NONFINITE en los campos afectados en vez de un
 // numero, para nunca retener una norma finita obsoleta ante inf/NaN.
+// anchor_every: ULTIMA columna de CSV_DRIFT/CSV_SUMMARY/CSV_ENERGY, y en este
+// binario vale SIEMPRE 0 -- Fase 3 no tiene ancla FP64 (es una extension de
+// Fase 4, ver Fase_4/Stencil/stencil_tensor_activation.cu). La columna existe
+// igual para que el esquema de CSV sea IDENTICO entre las dos fases:
+// run_full_pipeline.sh concatena los results/ de Fase 3 y Fase 4 en el mismo
+// analisis (ver Fase_4/tools/common_analysis.py) y dos esquemas distintos
+// obligarian a ese modulo a ramificar por fase. 0 es ademas la lectura
+// correcta del dato: en esta fase no hubo ancla.
 static void emit_csv_drift_row(const char* route, int iter_number, const ErrorMetrics& e) {
     std::cout << "CSV_DRIFT," << route << "," << iter_number << ",";
     if (!e.reference_finite) {
-        std::cout << "NONFINITE,NONFINITE,NONFINITE,NONFINITE\n";
+        std::cout << "NONFINITE,NONFINITE,NONFINITE,NONFINITE,0\n";
         return;
     }
 
     std::cout << fmt_sci(e.ref_l2_norm) << ",";
     if (!e.solution_finite) {
-        std::cout << "NONFINITE,NONFINITE,NONFINITE\n";
+        std::cout << "NONFINITE,NONFINITE,NONFINITE,0\n";
     } else {
-        std::cout << fmt_sci(e.l2_abs) << "," << fmt_sci(e.rel_l2) << "," << fmt_sci(e.max_abs) << "\n";
+        std::cout << fmt_sci(e.l2_abs) << "," << fmt_sci(e.rel_l2) << "," << fmt_sci(e.max_abs)
+                  << ",0\n";
     }
 }
 
 static void emit_csv_drift_nonfinite_reference_row(const char* route, int iter_number) {
     std::cout << "CSV_DRIFT," << route << "," << iter_number
-              << ",NONFINITE,NONFINITE,NONFINITE,NONFINITE\n";
+              << ",NONFINITE,NONFINITE,NONFINITE,NONFINITE,0\n";
 }
 
 // Fila de la ruta por lista (--checkpoint-iters). Token PROPIO, distinto de
@@ -5101,7 +5110,10 @@ static void emit_csv_energy_row(const char* route,
               << energy_csv_field(std::isfinite(energy.time_total_s), energy.time_total_s) << ","
               << energy_csv_field(std::isfinite(flops_total), flops_total / 1e9) << ","
               << energy_csv_field(per_iter_valid, energy_gpu_j_per_iter) << ","
-              << (gpu_route ? (energy.window_reliable ? "1" : "0") : "NaN") << "\n";
+              << (gpu_route ? (energy.window_reliable ? "1" : "0") : "NaN")
+              // anchor_every -- ver la nota sobre por que es 0 fijo en Fase 3,
+              // junto a emit_csv_drift_row().
+              << ",0\n";
 }
 
 // opt entra entero (y no como cuatro escalares mas) porque las cuatro columnas
@@ -5169,6 +5181,9 @@ static void emit_csv_summary_row(const Options& opt,
               << "," << ((std::strncmp(route, "WMMA", 4) == 0)
                              ? execution_mode_label(opt.execution_mode)
                              : execution_mode_label(ExecutionMode::Normal))
+              // anchor_every -- ver la nota sobre por que es 0 fijo en Fase 3,
+              // junto a emit_csv_drift_row().
+              << ",0"
               << "\n";
 }
 

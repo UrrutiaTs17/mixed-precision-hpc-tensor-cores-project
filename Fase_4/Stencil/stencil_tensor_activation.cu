@@ -2049,28 +2049,48 @@ static bool archive_due(const CheckpointContext& ckpt, int iter_number) {
     return ckpt.archive != nullptr && ckpt.archive->due(iter_number);
 }
 
+// anchor_every de ESTA invocacion, como columna de CSV_DRIFT/CSV_SUMMARY/
+// CSV_ENERGY. Es una variable de alcance de PROCESO a proposito, no un campo
+// que se pase por ruta: en Stencil el ancla es un parametro de la CORRIDA
+// COMPLETA (--anchor-every se fija una vez en la linea de comandos y no cambia
+// entre rutas), asi que TODAS las filas de una invocacion comparten su valor,
+// incluidas las de las rutas de referencia GPU_FP64/CPU_FP64/GPU_FP32 que
+// nunca ejecutan el camino del ancla.
+//
+// ESTO NO ES LO MISMO QUE EN GEMM/CONVOLUCION, y la diferencia no es cosmetica:
+// alli anchor_every varia POR FILA dentro de la misma invocacion (la ruta
+// "_none" reporta 0 y la "_comp" reporta K, porque ambas corren en la misma
+// pasada del binario), y por eso alla el valor se imprime en el punto de uso
+// en vez de leerse de un estado global. Ver Fase_4/tools/README.md.
+//
+// Lo fija main() una sola vez, antes de cualquier fila CSV_*.
+static int g_anchor_every_csv = 0;
+
 // Emite una fila CSV_DRIFT parseable para (ruta, checkpoint). Reutiliza las
 // guardas de finitud de ErrorMetrics: si la referencia FP64 o la ruta divergen
 // en este checkpoint, imprime NONFINITE en los campos afectados en vez de un
 // numero, para nunca retener una norma finita obsoleta ante inf/NaN.
+// anchor_every va al FINAL, detras de max_abs, para no correr ningun indice
+// posicional que las herramientas de extraccion ya usan sobre esta linea.
 static void emit_csv_drift_row(const char* route, int iter_number, const ErrorMetrics& e) {
     std::cout << "CSV_DRIFT," << route << "," << iter_number << ",";
     if (!e.reference_finite) {
-        std::cout << "NONFINITE,NONFINITE,NONFINITE,NONFINITE\n";
+        std::cout << "NONFINITE,NONFINITE,NONFINITE,NONFINITE," << g_anchor_every_csv << "\n";
         return;
     }
 
     std::cout << fmt_sci(e.ref_l2_norm) << ",";
     if (!e.solution_finite) {
-        std::cout << "NONFINITE,NONFINITE,NONFINITE\n";
+        std::cout << "NONFINITE,NONFINITE,NONFINITE," << g_anchor_every_csv << "\n";
     } else {
-        std::cout << fmt_sci(e.l2_abs) << "," << fmt_sci(e.rel_l2) << "," << fmt_sci(e.max_abs) << "\n";
+        std::cout << fmt_sci(e.l2_abs) << "," << fmt_sci(e.rel_l2) << "," << fmt_sci(e.max_abs)
+                  << "," << g_anchor_every_csv << "\n";
     }
 }
 
 static void emit_csv_drift_nonfinite_reference_row(const char* route, int iter_number) {
     std::cout << "CSV_DRIFT," << route << "," << iter_number
-              << ",NONFINITE,NONFINITE,NONFINITE,NONFINITE\n";
+              << ",NONFINITE,NONFINITE,NONFINITE,NONFINITE," << g_anchor_every_csv << "\n";
 }
 
 // Fila de la ruta por lista (--checkpoint-iters). Token PROPIO, distinto de
@@ -5414,7 +5434,8 @@ static void emit_csv_energy_row(const char* route,
               << energy_csv_field(std::isfinite(energy.time_total_s), energy.time_total_s) << ","
               << energy_csv_field(std::isfinite(flops_total), flops_total / 1e9) << ","
               << energy_csv_field(per_iter_valid, energy_gpu_j_per_iter) << ","
-              << (gpu_route ? (energy.window_reliable ? "1" : "0") : "NaN") << "\n";
+              << (gpu_route ? (energy.window_reliable ? "1" : "0") : "NaN") << ","
+              << g_anchor_every_csv << "\n";
 }
 
 // opt entra entero (y no como cuatro escalares mas) porque las cuatro columnas
@@ -5482,6 +5503,13 @@ static void emit_csv_summary_row(const Options& opt,
               << "," << ((std::strncmp(route, "WMMA", 4) == 0)
                              ? execution_mode_label(opt.execution_mode)
                              : execution_mode_label(ExecutionMode::Normal))
+              // anchor_every: ULTIMA columna, por el mismo motivo que
+              // execution_mode -- se agrega al final para no correr ningun
+              // indice existente. Sale de g_anchor_every_csv (no de
+              // opt.anchor_every directamente) para que las TRES lineas CSV_*
+              // que la llevan lean la misma fuente: es un valor de invocacion,
+              // ver el comentario de esa variable.
+              << "," << g_anchor_every_csv
               << "\n";
 }
 
@@ -6837,6 +6865,11 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
 int main(int argc, char** argv) {
     const Options opt = parse_args(argc, argv);
+    // ANCLA FP64 (Fase 4): se fija UNA sola vez, aqui, antes de que se emita
+    // cualquier fila CSV_*. Ver el comentario de g_anchor_every_csv sobre por
+    // que en Stencil esta columna es de invocacion y no de ruta (a diferencia
+    // de GEMM/Convolucion).
+    g_anchor_every_csv = opt.anchor_every;
     print_gpu_info();
     // La comprobacion ocurre despues de cudaGetDeviceProperties (dentro de
     // print_gpu_info), antes de iniciar cualquier benchmark.

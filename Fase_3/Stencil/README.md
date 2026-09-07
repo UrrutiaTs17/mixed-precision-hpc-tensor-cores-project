@@ -295,6 +295,21 @@ sigue siendo válida — reproducida y ampliada aquí:
   cada ruta contra el snapshot FP64 de esa iteración exacta. `NONFINITE` en
   vez de un número cuando la referencia o la ruta ya divergieron — nunca un
   cero o un NaN silencioso.
+  **Qué compara exactamente, que no es obvio**: `d_out_fp32`, el acumulador
+  FP32 *antes* del redondeo de almacenamiento (es el "ancla de no-regresión"
+  del kernel). Lo que realmente se propaga entre iteraciones es el buffer `T`
+  de 16 bits, y ese error vive en las columnas `rel_l2_prop`/`rel_linf_prop`
+  de `CSV_SUMMARY`. La distinción importa al comparar contra GEMM/Convolución:
+  el `rel_l2` de `CSV_DRIFT` de aquellos kernels mide el buffer cuantizado,
+  o sea el análogo de `rel_l2_prop` de aquí, **no** de este `rel_l2`. Es
+  también la razón por la que el gate K=1 del ancla usa criterios distintos
+  por kernel — ver `Fase_4/tools/README.md`.
+
+**`anchor_every`** es la última columna de `CSV_DRIFT`, `CSV_SUMMARY` y
+`CSV_ENERGY`. En este binario vale siempre `0` (Fase 3 no tiene ancla); existe
+para que el esquema sea idéntico al de `Fase_4/Stencil`, que sí la usa, porque
+`run_full_pipeline.sh` concatena los `results/` de las dos fases en el mismo
+análisis.
 - **`CSV_NORM`**: `||u^n||_2` y `||u^n||_inf` de la referencia FP64 en cada
   checkpoint — dan escala a `CSV_DRIFT`/`CSV_CKPT` (un `rel_l2` que crece no
   distingue "la ruta se degrada" de "la referencia se encoge", y bajo el

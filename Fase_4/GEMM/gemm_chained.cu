@@ -739,9 +739,15 @@ static void run_chained_route(const Options& opt, const T* d_a_tc, const double*
                               cudaMemcpyDeviceToHost));
         for (size_t i = 0; i < count; ++i) off_host[i] = static_cast<float>(tmp[i]);
         const ErrorMetrics err = compare_fp64_ref_vs_fp32(ref_host, off_host);
+        // anchor_every va al FINAL de la fila y vale 0 en la ruta "_none"
+        // SIEMPRE, incluso si esta corrida se lanzo con --anchor-every K>0:
+        // el ancla solo se aplica a la ruta con compensacion (parse_args exige
+        // --comp on para K>0), asi que esta ruta no la usa nunca. Es una
+        // columna POR FILA, no de la corrida -- ver la nota sobre esa
+        // diferencia con Stencil en Fase_4/tools/README.md.
         std::cout << "CSV_DRIFT," << format_label << "_none," << n << "," << iter << ","
                   << err.rel_l2 << "," << err.rel_linf << "," << (err.solution_finite ? 1 : 0)
-                  << "\n";
+                  << ",0\n";
       }
       if (opt.comp) {
         std::vector<T> tmp(count);
@@ -751,7 +757,7 @@ static void run_chained_route(const Options& opt, const T* d_a_tc, const double*
         const ErrorMetrics err = compare_fp64_ref_vs_fp32(ref_host, on_host);
         std::cout << "CSV_DRIFT," << format_label << "_comp," << n << "," << iter << ","
                   << err.rel_l2 << "," << err.rel_linf << "," << (err.solution_finite ? 1 : 0)
-                  << "\n";
+                  << "," << opt.anchor_every << "\n";
       }
 
       // Reanuda energia/tiempo DESPUES del D2H y la comparacion en host.
@@ -785,14 +791,15 @@ static void run_chained_route(const Options& opt, const T* d_a_tc, const double*
   std::cout << "CSV_SUMMARY," << format_label << "_none," << n << "," << opt.iters << ","
             << (total_s * 1000.0 / opt.iters) << "," << (total_s * 1000.0) << "," << gflops
             << "," << energy_field(power_buffer_capture_valid(power_buffer_off), energy_off_j)
-            << "," << (window_reliable_off ? 1 : 0) << "," << gpu_segments << "\n";
+            << "," << (window_reliable_off ? 1 : 0) << "," << gpu_segments << ",0\n";
   if (opt.comp) {
     const bool window_reliable_on = total_s >= kEnergyWindowReliableSeconds * gpu_segments;
     const double energy_on_j = power_buffer_energy_joules(power_buffer_on);
     std::cout << "CSV_SUMMARY," << format_label << "_comp," << n << "," << opt.iters << ","
               << (total_s * 1000.0 / opt.iters) << "," << (total_s * 1000.0) << "," << gflops
               << "," << energy_field(power_buffer_capture_valid(power_buffer_on), energy_on_j)
-              << "," << (window_reliable_on ? 1 : 0) << "," << gpu_segments << "\n";
+              << "," << (window_reliable_on ? 1 : 0) << "," << gpu_segments << ","
+              << opt.anchor_every << "\n";
   }
 
   power_buffer_destroy(power_buffer_off);

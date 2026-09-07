@@ -5,9 +5,38 @@ import os
 import re
 
 
+# Post-proceso de CSV_* de stencil_tensor_activation.cu. Este archivo es
+# IDENTICO en Fase_3/tools/ y Fase_4/tools/ (igual que extract_csv_chained.py):
+# los dos binarios de Stencil emiten el mismo esquema de columnas, y mantener
+# dos variantes divergentes solo invitaba a que una se quedara atras.
+#
+# anchor_every (ancla FP64) es una COLUMNA REAL de CSV_DRIFT, CSV_SUMMARY y
+# CSV_ENERGY: el binario la escribe como ULTIMO campo de cada una de esas tres
+# lineas. En Fase 4 sale de g_anchor_every_csv (ver
+# Fase_4/Stencil/stencil_tensor_activation.cu); en Fase 3, que no tiene ancla,
+# es un 0 literal -- misma columna, mismo esquema, contenido correcto en ambas.
+#
+# En Stencil es contexto de INVOCACION COMPLETA, no de ruta: todas las filas de
+# una corrida comparten el mismo valor, incluidas las rutas de referencia
+# (gpu_fp64, cpu_fp64) que nunca ejecutan el ancla. Es correcto -- el ancla es
+# un parametro de la corrida. En GEMM/Convolucion, en cambio, varia POR FILA
+# dentro de la misma corrida ("_none"=0, "_comp"=K): ver el comentario de
+# extract_csv_chained.py. Son dos semanticas distintas bajo el mismo nombre de
+# columna, y ninguna herramienta aguas abajo debe asumir la otra.
+#
+# RESPALDO PARA LOGS VIEJOS: los logs anteriores a la columna traen un campo
+# menos. Para esos se sigue reconstruyendo desde la linea de configuracion
+# "Ancla FP64 (anchor-every) : K" que el binario imprime una vez por
+# invocacion (ANCHOR_RE, mas abajo).
+#
+# La columna va al FINAL de cada header (no donde "logicamente" iria junto a
+# kahan): insertarla en medio correria los indices posicionales que
+# SUMMARY_VALUE_FIELDS/SUMMARY_FIELD_COUNT ya usan para mapear parts[] de la
+# linea CSV_SUMMARY.
 DRIFT_HEADER = [
     "job_id", "kernel", "nx", "ny", "iters", "kahan", "route",
     "iter", "ref_l2", "abs_l2", "rel_l2", "max_abs",
+    "anchor_every",
 ]
 
 SUMMARY_HEADER = [
@@ -18,9 +47,13 @@ SUMMARY_HEADER = [
     "first_nonfinite", "store_rel_norm", "store_rel_max_guarded",
     "store_excluded_count", "store_eval_iter", "energy_gpu_j", "energy_cpu_j",
     "energy_total_j", "edp_j_s", "joules_per_gflop", "onset_checkpoint",
+    "anchor_every",
 ]
 
-SUMMARY_VALUE_FIELDS = SUMMARY_HEADER[7:-1]
+# -2, no -1: excluye tanto onset_checkpoint (se llena aparte via
+# handle_onset) como el nuevo anchor_every (se llena aparte via identity(),
+# desde el contexto -- ninguno de los dos viene posicionalmente en parts[]).
+SUMMARY_VALUE_FIELDS = SUMMARY_HEADER[7:-2]
 
 HORIZON_HEADER = [
     "job_id", "kernel", "nx", "ny", "iters", "kahan", "format",
@@ -39,6 +72,7 @@ ENERGY_HEADER = [
     "energy_gpu_j", "energy_cpu_j", "energy_total_j", "edp_j_s",
     "joules_per_gflop", "time_total_s", "flops_total_billions",
     "energy_gpu_j_per_iter", "energy_window_reliable",
+    "anchor_every",
 ]
 
 RUN_RE = re.compile(
@@ -48,6 +82,34 @@ RUN_RE = re.compile(
 DIM_RE = re.compile(r"^Dimensiones \(nx, ny\)\s*:\s*(\d+),\s*(\d+)")
 ITERS_RE = re.compile(r"^Iteraciones\s*:\s*(\d+)")
 KAHAN_RE = re.compile(r"^Kahan \(residuo almacen\.\)\s*:\s*(off|on)")
+# "Ancla FP64 (anchor-every)  : 5 (activa)" / "... : 0 (deshabilitada)" --
+# impresa una vez por invocacion por el binario de Fase 4. Solo se usa como
+# RESPALDO para logs anteriores a que anchor_every fuera columna. Logs de
+# Fase 3 (que nunca imprimen esta linea) no hacen match y se quedan en "0",
+# que es la lectura correcta: sin ancla, no hubo ancla.
+ANCHOR_RE = re.compile(r"^Ancla FP64 \(anchor-every\)\s*:\s*(\d+)")
+
+# Indice (0-based, contando el token CSV_*) de la columna anchor_every en cada
+# linea que la lleva. Son los ULTIMOS campos de sus respectivas lineas:
+#   CSV_DRIFT  : token,route,iter,ref_l2,abs_l2,rel_l2,max_abs,anchor_every
+#   CSV_ENERGY : ...,energy_gpu_j_per_iter,energy_window_reliable,anchor_every
+#   CSV_SUMMARY: ...,reference_role,execution_mode,anchor_every
+DRIFT_ANCHOR_IDX = 7
+ENERGY_ANCHOR_IDX = 15
+SUMMARY_ANCHOR_IDX = 37
+
+
+def anchor_de_fila(parts, idx, context):
+    """anchor_every de la fila, con respaldo a la linea de configuracion.
+
+    Se llama SIEMPRE con `parts` sin rellenar: pad() taparia con "NaN" la
+    ausencia de la columna en un log viejo y el respaldo nunca se activaria.
+    """
+    if len(parts) > idx:
+        valor = clean(parts[idx])
+        if valor != "NaN":
+            return valor
+    return context.get("anchor_every", "0")
 
 
 def clean(value):
@@ -81,6 +143,7 @@ def identity(context, job_id, kernel, route_or_format_key, route_or_format):
         "ny": context.get("ny", "NaN"),
         "iters": context.get("iters", "NaN"),
         "kahan": context.get("kahan", "NaN"),
+        "anchor_every": context.get("anchor_every", "0"),
         route_or_format_key: route_or_format,
     }
 
@@ -91,6 +154,12 @@ def reset_run(context, summary_by_route):
     context["ny"] = "NaN"
     context["iters"] = "NaN"
     context["kahan"] = "NaN"
+    # NO se resetea aqui a "NaN": a diferencia de nx/ny/iters/kahan (que SI
+    # vienen en la linea "Corrida:"), anchor_every llega en una linea de
+    # configuracion SEPARADA, impresa antes de la primera "Corrida:" de cada
+    # invocacion -- resetearlo aqui lo borraria justo antes de que
+    # update_context_from_run_header lo vuelva a necesitar. Su default vive
+    # en identity() ("0"), no aqui.
 
 
 def ensure_summary_row(summary_rows, summary_by_route, context, job_id, kernel, route):
@@ -124,6 +193,11 @@ def update_context_from_run_header(line, context, summary_by_route):
     match = KAHAN_RE.match(line)
     if match:
         context["kahan"] = match.group(1)
+        return
+
+    match = ANCHOR_RE.match(line)
+    if match:
+        context["anchor_every"] = match.group(1)
 
 
 def handle_drift(parts, rows, summary_rows, summary_by_route, context, job_id, kernel):
@@ -138,6 +212,8 @@ def handle_drift(parts, rows, summary_rows, summary_by_route, context, job_id, k
         "abs_l2": clean(parts[4]),
         "rel_l2": clean(parts[5]),
         "max_abs": clean(parts[6]),
+        # La columna real de la fila gana sobre el contexto de identity().
+        "anchor_every": anchor_de_fila(parts, DRIFT_ANCHOR_IDX, context),
     })
     rows.append(row)
 
@@ -159,6 +235,10 @@ SUMMARY_LEGACY_DROPS = [(31, 12), (30, 11)]
 
 
 def handle_summary(parts, rows, summary_by_route, context, job_id, kernel):
+    # ANTES de cualquier recorte: pad() y los SUMMARY_LEGACY_DROPS mueven o
+    # tapan la ultima columna, que es justo anchor_every. Los logs heredados de
+    # 30/31 campos no la traen y caen solos al respaldo por contexto.
+    anchor = anchor_de_fila(parts, SUMMARY_ANCHOR_IDX, context)
     for legacy_count, drop_at in SUMMARY_LEGACY_DROPS:
         if len(parts) == legacy_count:
             parts = parts[:drop_at] + parts[drop_at + 1:]
@@ -170,6 +250,7 @@ def handle_summary(parts, rows, summary_by_route, context, job_id, kernel):
     context["kahan"] = clean(parts[5])
     row = ensure_summary_row(rows, summary_by_route, context, job_id, kernel, route)
     row.update(identity(context, job_id, kernel, "route", route))
+    row["anchor_every"] = anchor
     for field, value in zip(SUMMARY_VALUE_FIELDS, parts[6:SUMMARY_FIELD_COUNT]):
         row[field] = clean(value)
 
@@ -256,9 +337,11 @@ def apply_energy_window_filter(row, stats):
 
 
 def handle_energy(parts, rows, summary_rows, summary_by_route, context, job_id, kernel, stats):
+    anchor = anchor_de_fila(parts, ENERGY_ANCHOR_IDX, context)  # antes del pad()
     parts = pad(parts, 15)
     route = clean(parts[1])
     row = identity(context, job_id, kernel, "route", route)
+    row["anchor_every"] = anchor
     row["nx"] = clean(parts[2])
     row["ny"] = clean(parts[3])
     row["iters"] = clean(parts[4])
@@ -292,7 +375,7 @@ def handle_energy(parts, rows, summary_rows, summary_by_route, context, job_id, 
 
 
 def read_log(path, job_id, kernel):
-    context = {"nx": "NaN", "ny": "NaN", "iters": "NaN", "kahan": "NaN"}
+    context = {"nx": "NaN", "ny": "NaN", "iters": "NaN", "kahan": "NaN", "anchor_every": "0"}
     summary_by_route = {}
     drift_rows = []
     summary_rows = []

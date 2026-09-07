@@ -6,21 +6,29 @@ propio comentario de cabecera y Fase_3/GEMM/README.md / Fase_3/Convolution/
 README.md sobre por que no comparten script: columnas distintas, "n" vs "hw",
 sin CSV_ONSET/HORIZON/STORE/ENERGY). Cada fila de CSV_DRIFT/CSV_SUMMARY que
 emiten estos dos binarios ya trae "n"/"hw" e "iters" -- no hace falta
-reconstruir contexto desde una linea de cabecera aparte para esas columnas
-(a diferencia de Stencil, donde varias columnas de contexto NO viajan en cada
-fila CSV_*). La UNICA columna que si necesita contexto es anchor_every: no
-viaja en el CSV (ver "Que falta" en los README de Fase_4/GEMM y
-Fase_4/Convolution -- pendiente agregarla directamente al binario), asi que
-este script la reconstruye leyendo la linea de configuracion que main() de
-ambos binarios imprime al arrancar cada corrida:
+reconstruir contexto desde una linea de cabecera aparte (a diferencia de
+Stencil, donde varias columnas de contexto NO viajan en cada fila CSV_*).
+
+anchor_every: COLUMNA REAL, ya no reconstruida
+----------------------------------------------
+Desde que gemm_chained.cu/conv_chained.cu escriben anchor_every como ULTIMA
+columna de CSV_DRIFT y CSV_SUMMARY, este script la lee directo de la fila.
+Es una columna POR FILA, no de la corrida: la ruta "_none" reporta 0 y la
+"_comp" reporta el K real, porque ambas corren en la MISMA invocacion del
+binario (el ancla solo aplica a la ruta con compensacion; parse_args exige
+--comp on para K>0). Los binarios de Fase 3, que no tienen ancla, emiten 0 en
+las dos rutas -- mismo esquema de columnas, distinto contenido.
+
+RESPALDO PARA LOGS VIEJOS: los logs generados ANTES de que la columna
+existiera traen una columna menos. Para esos, el script sigue reconstruyendo
+anchor_every desde la linea de configuracion que main() imprime al arrancar
+cada corrida:
 
     N=1024 iters=20 comp=off checkpoint_every=0 anchor_every=5 (activa)
     HW=64 C=K=64 iters=20 comp=off checkpoint_every=0 anchor_every=5 (activa)
 
-anchor_every solo aplica a la ruta CON compensacion (el binario rechaza
---anchor-every>0 sin --comp on): las filas de ruta "_none" siempre se
-reportan con anchor_every=0, incluso si esa corrida se lanzo con
---anchor-every>0 para la ruta "_comp" en paralelo.
+Esa ruta de respaldo se mantiene a proposito: borrarla convertiria en
+inanalizable cualquier log anterior al cambio, y no cuesta nada conservarla.
 """
 import argparse
 import csv
@@ -92,24 +100,45 @@ def update_context_from_header(line, context):
             context["checkpoint_every"], context["anchor_every"] = match.groups()
 
 
-def anchor_every_for_route(context, suffix):
-    # El ancla solo corre sobre la ruta "comp" (el binario exige --comp on
-    # para --anchor-every>0) -- la ruta "none" nunca la usa, sin importar con
-    # que --anchor-every se haya lanzado la corrida.
+# Indice (0-based, contando el token CSV_*) de la columna anchor_every en cada
+# linea, y numero total de campos que trae una linea que SI la lleva.
+DRIFT_ANCHOR_IDX = 7
+DRIFT_FIELDS = 8
+SUMMARY_ANCHOR_IDX = 10
+SUMMARY_FIELDS = 11
+
+
+def anchor_every_de_fila(parts, idx, context, suffix):
+    """anchor_every de la fila, con respaldo para logs anteriores a la columna.
+
+    Camino normal: la fila trae la columna y se lee tal cual -- incluido el 0
+    de la ruta "_none", que el binario ya escribe explicitamente.
+
+    Respaldo (logs viejos, sin la columna): se reconstruye desde la linea de
+    configuracion, con la misma regla que usaba este script antes -- el ancla
+    solo corre sobre la ruta "comp", asi que "none" es 0 sin importar con que
+    --anchor-every se haya lanzado la corrida.
+    """
+    if len(parts) > idx:
+        valor = clean(parts[idx])
+        if valor != "NaN":
+            return valor
     return context["anchor_every"] if suffix == "comp" else "0"
 
 
 def handle_drift(parts, rows, context, job_id, kernel):
-    parts = pad(parts, 7)
+    crudas = parts  # sin rellenar: pad() taparia la ausencia de anchor_every
+    parts = pad(parts, DRIFT_FIELDS)
     route = clean(parts[1])
     fmt, suffix = route_format(route)
+    anchor = anchor_every_de_fila(crudas, DRIFT_ANCHOR_IDX, context, suffix)
     rows.append({
         "job_id": job_id,
         "kernel": kernel,
         "size": clean(parts[2]),
         "format": fmt,
         "comp": "on" if suffix == "comp" else "off",
-        "anchor_every": anchor_every_for_route(context, suffix),
+        "anchor_every": anchor,
         "route": route,
         "iter": clean(parts[3]),
         "rel_l2": clean(parts[4]),
@@ -119,16 +148,18 @@ def handle_drift(parts, rows, context, job_id, kernel):
 
 
 def handle_summary(parts, rows, context, job_id, kernel):
-    parts = pad(parts, 10)
+    crudas = parts  # ver la nota en handle_drift
+    parts = pad(parts, SUMMARY_FIELDS)
     route = clean(parts[1])
     fmt, suffix = route_format(route)
+    anchor = anchor_every_de_fila(crudas, SUMMARY_ANCHOR_IDX, context, suffix)
     rows.append({
         "job_id": job_id,
         "kernel": kernel,
         "size": clean(parts[2]),
         "format": fmt,
         "comp": "on" if suffix == "comp" else "off",
-        "anchor_every": anchor_every_for_route(context, suffix),
+        "anchor_every": anchor,
         "route": route,
         "iters": clean(parts[3]),
         "t_iter_ms": clean(parts[4]),
