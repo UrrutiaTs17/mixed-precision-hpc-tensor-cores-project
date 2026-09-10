@@ -68,6 +68,13 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "${REPO_ROOT}"
 mkdir -p logs
 
+# PASO 1 compila un binario de prueba (verificar_orden_operandos_*.py) y solo
+# sabe mirar $NVCC/PATH -- no conoce la ruta historica de PACCA. Se detecta
+# aqui, una vez, con el mismo mecanismo portable del resto del proyecto, y se
+# exporta para que ambos scripts de PASO 1 lo encuentren via $NVCC.
+source "${REPO_ROOT}/tools/detect_toolchain.sh"
+export NVCC="$(detect_nvcc)"
+
 FALLOS=0
 declare -a RESUMEN=()
 
@@ -95,9 +102,9 @@ nvidia-smi || true
 
 # --- PASO 1: orden de operandos ---------------------------------------------
 paso "PASO 1a - orden de operandos, GEMM (gpu_fp64_step)" \
-    python3 Fase_3/tools/verificar_orden_operandos_gemm.py --n 32
+    python3 Fase_3/tools/verificar_orden_operandos_gemm.py --n 32 --nvcc "${NVCC}"
 paso "PASO 1b - orden de operandos + im2col + padding, Convolucion" \
-    python3 Fase_3/tools/verificar_orden_operandos_conv.py --hw 64
+    python3 Fase_3/tools/verificar_orden_operandos_conv.py --hw 64 --nvcc "${NVCC}"
 
 # --- PASO 2: humo de los tres kernels ---------------------------------------
 # Se usan los .sbatch de FASE 4 (no los de Fase 3) porque son los unicos que

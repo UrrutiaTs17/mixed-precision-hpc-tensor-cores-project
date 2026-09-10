@@ -25,9 +25,21 @@
 
 set -euo pipefail
 
-cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
-if [[ ! -f stencil_baseline.cu && -f Stencil/stencil_baseline.cu ]]; then
-    cd Stencil
+# No forzar cd a SLURM_SUBMIT_DIR: cuando este script se invoca ANIDADO
+# (`bash` dentro de un job ya en marcha -- ver tools/validacion_preliminar.sbatch,
+# que hace `cd` al directorio correcto ANTES de llamar `bash <este script>`),
+# SLURM_SUBMIT_DIR es el del job PADRE (la raiz del repo), no el de este
+# kernel, y pisaria un pwd que el llamador ya dejo correcto. Se prueba pwd
+# primero; solo se cae a SLURM_SUBMIT_DIR cuando pwd no trae el fuente
+# (invocacion de primer nivel via `sbatch` desde la raiz del repo).
+if [[ ! -f stencil_baseline.cu ]]; then
+    if [[ -f Stencil/stencil_baseline.cu ]]; then
+        cd Stencil
+    elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/stencil_baseline.cu" ]]; then
+        cd "${SLURM_SUBMIT_DIR}"
+    elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/Stencil/stencil_baseline.cu" ]]; then
+        cd "${SLURM_SUBMIT_DIR}/Stencil"
+    fi
 fi
 
 # Directorio de salida para logs/artefactos generados por este script (no
