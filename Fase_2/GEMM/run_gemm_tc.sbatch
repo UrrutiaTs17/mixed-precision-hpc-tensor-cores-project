@@ -110,19 +110,20 @@ normalize_include_flags() {
 # to avoid getting the raw path passed to nvcc without -I.
 if [[ -n "${OPENBLAS_DIR:-}" ]]; then
     OPENBLAS_INC="-I${OPENBLAS_DIR}/include"
-    # -Wl,-rpath hornea la ruta en el binario: el modulo de Lmod en este
+    # -Xlinker -rpath -Xlinker hornea la ruta en el binario (nvcc del HPC SDK
+    # 23.1 de PACCA no acepta "-Wl,-rpath,...", ver commit efd220e): el modulo de Lmod en este
     # cluster no deja LD_LIBRARY_PATH confiable en todos los casos (ver
     # el comentario junto a "module load gnu12" mas arriba), y sin rpath
     # el binario compila pero falla en RUNTIME con
     # "libopenblas.so.0: cannot open shared object file".
-    OPENBLAS_LIBS="-L${OPENBLAS_DIR}/lib -Wl,-rpath,${OPENBLAS_DIR}/lib -lopenblas"
+    OPENBLAS_LIBS="-L${OPENBLAS_DIR}/lib -Xlinker -rpath -Xlinker ${OPENBLAS_DIR}/lib -lopenblas"
 elif [[ -z "${OPENBLAS_INC:-}" && -f "/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/include/cblas.h" ]]; then
     # Ruta historica de PACCA (mismo patron que detect_nvcc en
     # tools/detect_toolchain.sh): cubre el caso en que el modulo no
     # cargo (Lmod ausente o jerarquia distinta) pero el paquete OpenHPC
     # si esta instalado.
     OPENBLAS_INC="-I/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/include"
-    OPENBLAS_LIBS="${OPENBLAS_LIBS:--L/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/lib -Wl,-rpath,/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/lib -lopenblas}"
+    OPENBLAS_LIBS="${OPENBLAS_LIBS:--L/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/lib -Xlinker -rpath -Xlinker /opt/ohpc/pub/libs/gnu12/openblas/0.3.21/lib -lopenblas}"
 else
     OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
     OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
