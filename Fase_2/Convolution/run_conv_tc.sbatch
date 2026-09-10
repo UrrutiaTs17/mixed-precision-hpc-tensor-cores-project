@@ -66,6 +66,13 @@ mkdir -p "${OUTPUT_DIR}"
 
 # Carga de modulos: en PACCA no hay modulo "cuda"; nvcc/ncu se toman por ruta.
 if command -v module >/dev/null 2>&1; then
+    # En PACCA (OpenHPC/Lmod) "openblas" vive bajo la familia de
+    # compilador "gnu12" -- cargarlo sin eso primero falla en silencio
+    # (el "|| true" se traga el error de Lmod) y deja OPENBLAS_DIR sin
+    # definir, cayendo al fallback generico de abajo que no encuentra
+    # cblas.h en este sistema. module load es un no-op inofensivo si
+    # gnu12 ya esta activo o si el cluster no usa esta jerarquia.
+    module load gnu12 || true
     module load openblas || true
 fi
 
@@ -114,6 +121,13 @@ normalize_include_flags() {
 if [[ -n "${OPENBLAS_DIR:-}" ]]; then
     OPENBLAS_INC="-I${OPENBLAS_DIR}/include"
     OPENBLAS_LIBS="-L${OPENBLAS_DIR}/lib -lopenblas"
+elif [[ -z "${OPENBLAS_INC:-}" && -f "/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/include/cblas.h" ]]; then
+    # Ruta historica de PACCA (mismo patron que detect_nvcc en
+    # tools/detect_toolchain.sh): cubre el caso en que el modulo no
+    # cargo (Lmod ausente o jerarquia distinta) pero el paquete OpenHPC
+    # si esta instalado.
+    OPENBLAS_INC="-I/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/include"
+    OPENBLAS_LIBS="${OPENBLAS_LIBS:--L/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/lib -lopenblas}"
 else
     OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
     OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
