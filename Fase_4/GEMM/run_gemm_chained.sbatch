@@ -77,18 +77,27 @@ fi
 
 NVML_FLAGS=()
 NVML_LINK_FLAG="${NVML_LINK_FLAG:--lnvidia-ml}"
+# Deteccion por PRUEBA DE ENLACE REAL, no por heuristica de rutas/ldconfig:
+# en PACCA el driver deja libnvidia-ml.so.1 (versionado, en /usr/lib64) pero
+# NUNCA el symlink de desarrollo libnvidia-ml.so sin version -- haria falta
+# un paquete -devel que no esta instalado. "ldconfig -p" (puede no estar en
+# PATH dentro del entorno del job de SLURM) y el chequeo de ruta exacta de
+# abajo no detectaban ese caso, aunque "-lnvidia-ml" SI enlaza bien contra
+# el .so versionado (verificado a mano en paccaA100, el compute node real).
+# Sin este fix la campana entera queda con energy_gpu_j=NaN en TODAS las
+# filas, aunque nvidia-smi funcione perfecto en el mismo nodo.
+NVML_PROBE_BIN="$(mktemp -u)"
 if [[ "${DISABLE_NVML_TELEMETRY:-0}" != "1" ]] &&
    "${NVCC}" -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
-   (ldconfig -p 2>/dev/null | grep -Eq 'lib(nvidia-ml|nvml)\.so' ||
-    [[ -f /usr/lib64/libnvidia-ml.so || -f /usr/lib64/libnvml.so ||
-       -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so ||
-       -f /usr/lib/x86_64-linux-gnu/libnvml.so ]]); then
+   echo 'int main(){return 0;}' | "${NVCC}" -x cu - -o "${NVML_PROBE_BIN}" \
+       ${NVML_LINK_FLAG} -lpthread >/dev/null 2>&1; then
     NVML_FLAGS=(-DUSE_NVML_TELEMETRY "${NVML_LINK_FLAG}" -lpthread)
-    echo "NVML habilitado para telemetria GPU."
+    echo "NVML habilitado para telemetria GPU (verificado con enlace de prueba)."
 else
     NVML_FLAGS=(-lpthread)
     echo "NVML no disponible para el enlace; se usara el stub de telemetria GPU."
 fi
+rm -f "${NVML_PROBE_BIN}"
 
 # --- Prueba de humo ----------------------------------------------------------
 # SMOKE_TEST=1 recorta el barrido al punto mas chico de cada lista y a 3
