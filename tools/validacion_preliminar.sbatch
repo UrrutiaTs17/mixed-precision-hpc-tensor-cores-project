@@ -56,7 +56,15 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# SLURM copia este script a un directorio de spool del nodo y lo ejecuta
+# desde ahi -- BASH_SOURCE[0] apunta a esa copia, no al archivo real del
+# repo. SLURM_SUBMIT_DIR si apunta al directorio real de envio (root del
+# repo, ya que run_full_pipeline_pacca.sh hace `sbatch tools/....sbatch`
+# desde ahi), asi que es la fuente correcta cuando existe. Solo se cae al
+# truco de BASH_SOURCE para el modo sin SLURM (`bash archivo.sbatch`
+# directo, ver REQUIREMENTS.md), donde no hay spool y BASH_SOURCE si es
+# el archivo real.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "${REPO_ROOT}"
 mkdir -p logs
 

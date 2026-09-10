@@ -24,7 +24,12 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Ver la nota extensa en tools/validacion_preliminar.sbatch: SLURM copia
+# este script a un spool del nodo y ejecuta la copia, asi que BASH_SOURCE[0]
+# no sirve para ubicar el repo bajo SLURM. SLURM_SUBMIT_DIR si apunta al
+# directorio real de envio; BASH_SOURCE solo se usa como fallback fuera de
+# SLURM (`bash tools/postproceso.sbatch` directo).
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "${REPO_ROOT}"
 mkdir -p logs
 
