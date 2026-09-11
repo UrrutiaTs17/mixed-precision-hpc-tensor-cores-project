@@ -723,6 +723,10 @@ static void run_chained_route(const Options& opt, const T* d_a_tc, const double*
 
 int main(int argc, char** argv) {
   const Options opt = parse_args(argc, argv);
+  // Ver el comentario identico en Fase_4/GEMM/gemm_chained.cu: sin esta
+  // llamada, energy_gpu_j sale NaN en TODAS las filas sin importar que el
+  // .sbatch compile con -DUSE_NVML_TELEMETRY.
+  telemetry_nvml_initialize(0);
 
   std::cout << "N=" << opt.n << " iters=" << opt.iters << " comp=" << (opt.comp ? "on" : "off")
             << " checkpoint_every=" << opt.checkpoint_every << "\n";

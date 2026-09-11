@@ -904,6 +904,12 @@ static void run_chained_route(const Options& opt, cublasHandle_t cublas_handle,
 
 int main(int argc, char** argv) {
   const Options opt = parse_args(argc, argv);
+  // Sin esto, power_buffer_create() nunca ve telemetry_nvml_enabled()==true
+  // (esa funcion solo LEE la bandera, no la inicializa) y energy_gpu_j sale
+  // NaN en TODAS las filas pase lo que pase el .sbatch compile con
+  // -DUSE_NVML_TELEMETRY -- Stencil ya hace esta llamada en su main(), este
+  // archivo nunca la tuvo.
+  telemetry_nvml_initialize(0);
 
   std::cout << "N=" << opt.n << " iters=" << opt.iters << " comp=" << (opt.comp ? "on" : "off")
             << " checkpoint_every=" << opt.checkpoint_every
