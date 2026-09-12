@@ -109,10 +109,18 @@ REPL_CONV_TC_FORMAT="${REPL_CONV_TC_FORMAT:-both}"
 REPL_STENCIL_NX_LIST="${REPL_STENCIL_NX_LIST:-1024}"
 REPL_STENCIL_NY_LIST="${REPL_STENCIL_NY_LIST:-1024}"
 REPL_STENCIL_ITERS_LIST="${REPL_STENCIL_ITERS_LIST:-20 40}"
-REPL_STENCIL_ANCHOR_LIST="${REPL_STENCIL_ANCHOR_LIST:-0 1 5}"
 REPL_STENCIL_KAHAN_LIST="${REPL_STENCIL_KAHAN_LIST:-off on}"
 REPL_STENCIL_SPATIAL_COMP="${REPL_STENCIL_SPATIAL_COMP:-on}"
 REPL_STENCIL_TC_FORMAT="${REPL_STENCIL_TC_FORMAT:-both}"
+
+# El ancla FP64 (K>0 en ANCHOR_LIST) exige --spatial-comp on en el binario;
+# si esta pasada corre con SPATIAL_COMP=off (para ejercitar kahan_local/none)
+# hay que anular los anclajes o run_stencil_tc.sbatch rechaza el job entero.
+if [[ "${REPL_STENCIL_SPATIAL_COMP}" == "off" ]]; then
+    REPL_STENCIL_ANCHOR_LIST="${REPL_STENCIL_ANCHOR_LIST:-0}"
+else
+    REPL_STENCIL_ANCHOR_LIST="${REPL_STENCIL_ANCHOR_LIST:-0 1 5}"
+fi
 
 # --- Arma la lista de trabajos (kernel, indice de replica) y la baraja -----
 declare -a WORKLIST=()
