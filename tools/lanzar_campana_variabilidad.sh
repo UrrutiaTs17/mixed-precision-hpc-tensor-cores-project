@@ -113,6 +113,11 @@ REPL_STENCIL_KAHAN_LIST="${REPL_STENCIL_KAHAN_LIST:-off on}"
 REPL_STENCIL_SPATIAL_COMP="${REPL_STENCIL_SPATIAL_COMP:-on}"
 REPL_STENCIL_TC_FORMAT="${REPL_STENCIL_TC_FORMAT:-both}"
 REPL_STENCIL_CPU_FP64="${REPL_STENCIL_CPU_FP64:-on}"
+# RUN_KIND=energy fuerza CHECKPOINT_EVERY=0 (un solo tramo NVML) en vez del
+# default CHECKPOINT_EVERY=5 de run_stencil_tc.sbatch: con ITERS grandes, 5200+
+# tramos multiplican el minimo de ventana exigido (0.5s por tramo) muy por
+# encima del tiempo real de la corrida y energy_window_reliable nunca llega a 1.
+REPL_STENCIL_RUN_KIND="${REPL_STENCIL_RUN_KIND:-numeric}"
 
 # El ancla FP64 (K>0 en ANCHOR_LIST) exige --spatial-comp on en el binario;
 # si esta pasada corre con SPATIAL_COMP=off (para ejercitar kahan_local/none)
@@ -202,7 +207,8 @@ for item in "${WORKLIST[@]}"; do
                 "NX_LIST=${REPL_STENCIL_NX_LIST}" "NY_LIST=${REPL_STENCIL_NY_LIST}" \
                 "ITERS_LIST=${REPL_STENCIL_ITERS_LIST}" "ANCHOR_LIST=${REPL_STENCIL_ANCHOR_LIST}" \
                 "KAHAN_LIST=${REPL_STENCIL_KAHAN_LIST}" "SPATIAL_COMP=${REPL_STENCIL_SPATIAL_COMP}" \
-                "TC_FORMAT=${REPL_STENCIL_TC_FORMAT}" "CPU_FP64=${REPL_STENCIL_CPU_FP64}"
+                "TC_FORMAT=${REPL_STENCIL_TC_FORMAT}" "CPU_FP64=${REPL_STENCIL_CPU_FP64}" \
+                "RUN_KIND=${REPL_STENCIL_RUN_KIND}"
             ;;
     esac
 done
