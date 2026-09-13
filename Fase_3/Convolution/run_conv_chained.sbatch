@@ -158,6 +158,33 @@ NCU_MODE="${NCU_MODE:-quick}"
 NCU_SET="${NCU_SET:-full}"
 NCU_KERNEL_REGEX="${NCU_KERNEL_REGEX:-.*wmma_gemm_kernel.*}"
 
+# RUN_KIND=energy: el contador NVML se cuantiza POR TRAMO de checkpoint, no
+# sobre la suma total (ver common/power_sampling.h). Con CHECKPOINT_EVERY=5 e
+# ITERS grandes se acumulan cientos de tramos y la ventana minima exigida
+# (0.5 s/tramo) termina muy por encima del tiempo real de la corrida, dejando
+# energy_window_reliable en 0 siempre. RUN_KIND=energy fuerza un solo tramo
+# (CHECKPOINT_EVERY=0, el default del binario) y desactiva NCU (perfilar
+# invalida la energia). Mismo patron que Fase_4/Stencil/run_stencil_tc.sbatch.
+RUN_KIND="${RUN_KIND:-numeric}"
+case "${RUN_KIND}" in
+    energy)
+        if [[ "${CHECKPOINT_EVERY}" != "0" ]]; then
+            echo "AVISO: RUN_KIND=energy ignora CHECKPOINT_EVERY=${CHECKPOINT_EVERY} y lo fija en 0."
+        fi
+        CHECKPOINT_EVERY=0
+        if [[ "${RUN_NCU}" != "0" ]]; then
+            echo "AVISO: RUN_KIND=energy ignora RUN_NCU=${RUN_NCU}: perfilar invalida la energia."
+        fi
+        RUN_NCU=0
+        ;;
+    numeric)
+        ;;
+    *)
+        echo "ERROR: RUN_KIND debe ser 'energy' o 'numeric' (recibido: ${RUN_KIND})." >&2
+        exit 2
+        ;;
+esac
+
 echo "Nodo: $(hostname)"
 echo "Fecha: $(date)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-no definido}"

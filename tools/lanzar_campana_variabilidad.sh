@@ -93,6 +93,7 @@ REPL_GEMM_ITERS_LIST="${REPL_GEMM_ITERS_LIST:-20 40}"
 REPL_GEMM_ANCHOR_LIST="${REPL_GEMM_ANCHOR_LIST:-0 1 5}"
 REPL_GEMM_COMP_LIST="${REPL_GEMM_COMP_LIST:-off on}"
 REPL_GEMM_TC_FORMAT="${REPL_GEMM_TC_FORMAT:-both}"
+REPL_GEMM_RUN_KIND="${REPL_GEMM_RUN_KIND:-numeric}"
 
 # Convolucion: mismo criterio, HW=64 (el minimo del binario).
 REPL_CONV_HW_LIST="${REPL_CONV_HW_LIST:-64}"
@@ -100,6 +101,7 @@ REPL_CONV_ITERS_LIST="${REPL_CONV_ITERS_LIST:-20 40}"
 REPL_CONV_ANCHOR_LIST="${REPL_CONV_ANCHOR_LIST:-0 1 5}"
 REPL_CONV_COMP_LIST="${REPL_CONV_COMP_LIST:-off on}"
 REPL_CONV_TC_FORMAT="${REPL_CONV_TC_FORMAT:-both}"
+REPL_CONV_RUN_KIND="${REPL_CONV_RUN_KIND:-numeric}"
 
 # Stencil: NX=NY=1024 (muy por debajo del 4096-16384 del barrido principal --
 # ahi es donde vive el costo real). KAHAN_LIST/SPATIAL_COMP en su default
@@ -194,13 +196,13 @@ for item in "${WORKLIST[@]}"; do
             enviar_replica gemm "${rep}" Fase_4/GEMM run_gemm_chained.sbatch \
                 "N_LIST=${REPL_GEMM_N_LIST}" "ITERS_LIST=${REPL_GEMM_ITERS_LIST}" \
                 "ANCHOR_LIST=${REPL_GEMM_ANCHOR_LIST}" "COMP_LIST=${REPL_GEMM_COMP_LIST}" \
-                "TC_FORMAT=${REPL_GEMM_TC_FORMAT}"
+                "TC_FORMAT=${REPL_GEMM_TC_FORMAT}" "RUN_KIND=${REPL_GEMM_RUN_KIND}"
             ;;
         conv)
             enviar_replica conv "${rep}" Fase_4/Convolution run_conv_chained.sbatch \
                 "HW_LIST=${REPL_CONV_HW_LIST}" "ITERS_LIST=${REPL_CONV_ITERS_LIST}" \
                 "ANCHOR_LIST=${REPL_CONV_ANCHOR_LIST}" "COMP_LIST=${REPL_CONV_COMP_LIST}" \
-                "TC_FORMAT=${REPL_CONV_TC_FORMAT}"
+                "TC_FORMAT=${REPL_CONV_TC_FORMAT}" "RUN_KIND=${REPL_CONV_RUN_KIND}"
             ;;
         stencil)
             enviar_replica stencil "${rep}" Fase_4/Stencil run_stencil_tc.sbatch \
