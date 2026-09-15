@@ -41,8 +41,8 @@
 # Saltar fases (por si ya corriste algunas, o para iterar rapido):
 #   RUN_FASE1=0 RUN_FASE2=0 bash run_full_pipeline.sh
 #
-# Cada Fase 3/Fase 4 corre DOS VECES por kernel si se activa RUN_ENERGY_PASS=1
-# (opt-in, default 0):
+# Cada Fase 3/Fase 4 corre DOS VECES por kernel -- RUN_ENERGY_PASS=1 es el
+# default (PIPELINE_MODE=smoke lo desactiva solo, automaticamente):
 # la pasada normal y una pasada SOLO de energia (RUN_KIND=energy, ITERS_LIST
 # grande) -- sin esto, energy_window_reliable sale en 0 casi siempre (ver la
 # nota de cabecera junto a RUN_ENERGY_PASS mas abajo). Para desactivarla:
@@ -101,11 +101,15 @@ RUN_PARETO="${RUN_PARETO:-1}"
 # el MISMO results/ que la pasada numerica (job_id/PID nuevo, no se pisan) y
 # el post-proceso los toma a ambos como replicas del mismo tamano/formato.
 #
-# Default 0, OPT-IN: no tiene sentido que una corrida exploratoria (solo
-# exactitud, gates, smoke) dispare de oficio una segunda invocacion pesada
-# por kernel. Activar solo cuando el objetivo de la corrida incluye
-# energia/Frente de Pareto: RUN_ENERGY_PASS=1 bash run_full_pipeline.sh
-RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-0}"
+# Default 1: PIPELINE_MODE=full (el default) ES la campana completa, y esa
+# campana no queda terminada sin el eje de energia/Pareto -- no tiene
+# sentido pedirle a quien lanza `bash run_full_pipeline.sh` a secas que
+# ademas se acuerde de una variable mas. La proteccion contra un costo que
+# nadie pidio ya existe y es mas precisa: PIPELINE_MODE=smoke (o
+# SMOKE_TEST=1 directo) desactiva el pase de energia solo, automaticamente
+# -- ver run_phase_con_energia mas abajo. Para desactivarlo sin entrar en
+# modo humo: RUN_ENERGY_PASS=0 bash run_full_pipeline.sh
+RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-1}"
 ENERGY_ITERS_GEMM="${ENERGY_ITERS_GEMM:-24000}"
 ENERGY_ITERS_CONV="${ENERGY_ITERS_CONV:-37000}"
 ENERGY_ITERS_STENCIL="${ENERGY_ITERS_STENCIL:-4000}"

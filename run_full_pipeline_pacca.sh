@@ -35,7 +35,7 @@
 #
 #   * Los tres kernels van EN PARALELO entre si: no comparten nada.
 #   * Fase 4 de un kernel depende SOLO de su propia Fase 3.
-#   * Cada F3/F4 manda DOS jobs si RUN_ENERGY_PASS=1 (opt-in, default 0): la pasada
+#   * Cada F3/F4 manda DOS jobs -- RUN_ENERGY_PASS=1 es el default: la pasada
 #     normal (numerica, defaults del .sbatch) y una pasada SOLO de energia
 #     (RUN_KIND=energy, ITERS_LIST grande) -- ver la nota de esa variable mas
 #     abajo. Ambas dependen de lo mismo que dependeria una sola.
@@ -160,12 +160,16 @@ RUN_POST="${RUN_POST:-1}"
 #   8192 y 16384 pueden haber quedado con menos margen del que parece (923 y
 #   312 iters minimos con el minimo real, contra 900 y 250 lanzados) -- a
 #   revisar cuando esos jobs terminen, no se tocan mientras siguen en cola.
-# Default 0, OPT-IN: una corrida exploratoria (solo exactitud, gates,
-# smoke) no debe disparar de oficio una segunda invocacion pesada (miles de
-# iteraciones) por kernel sin que alguien lo haya pedido. Activarlo solo
-# cuando el objetivo de la corrida incluye energia/Frente de Pareto:
-#   RUN_ENERGY_PASS=1 bash run_full_pipeline_pacca.sh
-RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-0}"
+# Default 1: este script ES la campana completa (asi se describe en la
+# cabecera de arriba) -- no existe aqui un modo "solo exactitud" o "smoke"
+# que proteger, y la campana no queda realmente terminada sin el eje de
+# energia/Pareto. `bash run_full_pipeline_pacca.sh`, sin nada mas, ya manda
+# todo: F3/F4 normal + energia de los 3 kernels, y la campana de
+# variabilidad completa (GEMM/Conv en energia, Stencil en sus dos variantes
+# -- ver la nota de RUN_VARIABILIDAD mas abajo). Para desactivarlo (por
+# ejemplo, iterando rapido sobre un solo kernel con RUN_FASE1=0...):
+#   RUN_ENERGY_PASS=0 bash run_full_pipeline_pacca.sh
+RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-1}"
 ENERGY_ITERS_GEMM="${ENERGY_ITERS_GEMM:-24000}"
 ENERGY_ITERS_CONV="${ENERGY_ITERS_CONV:-37000}"
 ENERGY_ITERS_STENCIL="${ENERGY_ITERS_STENCIL:-4000}"
@@ -341,7 +345,7 @@ cadena_kernel "Stencil"     Fase_3/Stencil     run_stencil_tc.sbatch \
 # defaults (reproduce A/B/C), la segunda SOLO si RUN_ENERGY_PASS=1 (reproduce
 # D) -- RUN_GEMM=0/RUN_CONV=0 ahi para no repetir GEMM/Conv, que ya se
 # mandaron en la primera llamada.
-if [[ "${RUN_VARIABILIDAD}" == "1" ]]; then
+if [[ "${RUN_VARIABILIDAD}" == "1" && "${SMOKE_TEST:-0}" != "1" ]]; then
     echo
     echo "################################################################"
     echo "# Campana de variabilidad (replicas, ${VARIABILIDAD_REPLICAS}x)"
