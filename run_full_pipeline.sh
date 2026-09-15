@@ -209,11 +209,21 @@ fi
 # ITERS_LIST se exportan solo para la segunda llamada y se limpian despues,
 # para no dejarlos pegados en el resto del pipeline (p.ej. Fase 1/2, que no
 # entienden RUN_KIND).
+# ENERGY_ANCHOR_LIST: mismo K en los 3 kernels para que sean comparables
+# entre si (p.ej. una grafica de energia normalizada con una barra por K,
+# una serie por kernel). El default de cada .sbatch NO coincide entre
+# kernels -- GEMM/Conv traen "0 1 5 20", Stencil con SPATIAL_COMP=on trae
+# "0 1 8 32" -- asi que sin este override cada kernel barre un K distinto y
+# ninguna figura conjunta por K queda alineada. "0 1 5" fue la eleccion:
+# existe en el default de GEMM/Conv (se recorta el 20, que no aporta a la
+# comparacion) y NO existe en el de Stencil (hay que agregarlo a mano).
+ENERGY_ANCHOR_LIST="${ENERGY_ANCHOR_LIST:-0 1 5}"
+
 run_phase_con_energia() {
     local label="$1" dir="$2" script="$3" energy_iters="$4"
     run_phase "${label}" "${dir}" "${script}"
     if [[ "${RUN_ENERGY_PASS}" == "1" && "${SMOKE_TEST:-0}" != "1" ]]; then
-        RUN_KIND=energy ITERS_LIST="${energy_iters}" \
+        RUN_KIND=energy ITERS_LIST="${energy_iters}" ANCHOR_LIST="${ENERGY_ANCHOR_LIST}" \
             run_phase "${label} (energia)" "${dir}" "${script}"
     elif [[ "${RUN_ENERGY_PASS}" == "1" ]]; then
         # SMOKE_TEST=1 ya deja ITERS_LIST en 3 dentro del .sbatch -- si aqui
