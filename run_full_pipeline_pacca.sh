@@ -313,16 +313,67 @@ cadena_kernel "Stencil"     Fase_3/Stencil     run_stencil_tc.sbatch \
 # tamano chico y propio (NX=NY=1024 en Stencil, N=1024 en GEMM, HW=64 en
 # Conv), pensado para ser barato y repetirse muchas veces, no para reusar los
 # jobs grandes de arriba.
+#
+# OJO -- esto NO estaba cubierto hasta esta correccion: tools/lanzar_campana_
+# variabilidad.sh trae sus propios defaults (REPL_{GEMM,CONV,STENCIL}_RUN_KIND
+# = numeric, ITERS_LIST chico) que, sin overrides, REPRODUCEN el problema
+# original -- energy_window_reliable=0 en toda la campana de replicas, exacto
+# lo que costo diagnosticar y corregir esta sesion (jobs 7114-7129 en GEMM/
+# Conv, tanda D en Stencil). Una llamada bash tools/lanzar_campana_
+# variabilidad.sh "en seco" NO hereda la correccion -- hay que pasarle los
+# mismos overrides que se usaron para validar los datos que ya estan en
+# campana_final_20260912/, o un relanzamiento del pipeline completo vuelve a
+# dejar sin energia confiable justo la campana que el post-proceso (ANOVA,
+# Etapa 7) necesita con mas replicas.
+#
+# GEMM/Convolucion: la UNICA variante de variabilidad que se valido y se usa
+# en las figuras (F1/F5/F7/F8) es la de energia -- no existe una campana
+# "solo numerica" de GEMM/Conv separada que preservar, asi que se fuerza
+# RUN_KIND=energy con el ITERS_LIST validado, SIEMPRE que corre variabilidad
+# (no depende de RUN_ENERGY_PASS: son datos distintos, con un solo proposito).
+#
+# Stencil es distinto: la campana SI tiene dos variantes con proposito
+# distinto que conviven en campana_final_20260912/ -- tandas A/B/C (defaults,
+# RUN_KIND=numeric, checkpoints densos: de ahi sale el drift fino de F3/F4/F6)
+# y tanda D (RUN_KIND=energy, SPATIAL_COMP=off, ITERS_LIST grande: la UNICA
+# fuente de energia Tensor Core, aun incompleta -- ver jobs 7219-7221 en
+# cola). Por eso Stencil se manda en DOS llamadas: la primera con sus propios
+# defaults (reproduce A/B/C), la segunda SOLO si RUN_ENERGY_PASS=1 (reproduce
+# D) -- RUN_GEMM=0/RUN_CONV=0 ahi para no repetir GEMM/Conv, que ya se
+# mandaron en la primera llamada.
 if [[ "${RUN_VARIABILIDAD}" == "1" ]]; then
     echo
     echo "################################################################"
     echo "# Campana de variabilidad (replicas, ${VARIABILIDAD_REPLICAS}x)"
     echo "################################################################"
+    export REPL_GEMM_RUN_KIND="${REPL_GEMM_RUN_KIND:-energy}"
+    export REPL_GEMM_ITERS_LIST="${REPL_GEMM_ITERS_LIST:-19000 38000}"
+    export REPL_CONV_RUN_KIND="${REPL_CONV_RUN_KIND:-energy}"
+    export REPL_CONV_ITERS_LIST="${REPL_CONV_ITERS_LIST:-30000 60000}"
     if [[ "${DRY_RUN}" == "1" ]]; then
         DRY_RUN=1 REPLICAS="${VARIABILIDAD_REPLICAS}" bash tools/lanzar_campana_variabilidad.sh
     else
         REPLICAS="${VARIABILIDAD_REPLICAS}" bash tools/lanzar_campana_variabilidad.sh
     fi
+
+    if [[ "${RUN_ENERGY_PASS}" == "1" ]]; then
+        echo
+        echo "################################################################"
+        echo "# Campana de variabilidad -- Stencil, SOLO energia (tipo tanda D)"
+        echo "################################################################"
+        if [[ "${DRY_RUN}" == "1" ]]; then
+            DRY_RUN=1 RUN_GEMM=0 RUN_CONV=0 REPLICAS="${VARIABILIDAD_REPLICAS}" \
+                REPL_STENCIL_RUN_KIND=energy REPL_STENCIL_SPATIAL_COMP=off \
+                REPL_STENCIL_ITERS_LIST="26000 52000" \
+                bash tools/lanzar_campana_variabilidad.sh
+        else
+            RUN_GEMM=0 RUN_CONV=0 REPLICAS="${VARIABILIDAD_REPLICAS}" \
+                REPL_STENCIL_RUN_KIND=energy REPL_STENCIL_SPATIAL_COMP=off \
+                REPL_STENCIL_ITERS_LIST="26000 52000" \
+                bash tools/lanzar_campana_variabilidad.sh
+        fi
+    fi
+    unset REPL_GEMM_RUN_KIND REPL_GEMM_ITERS_LIST REPL_CONV_RUN_KIND REPL_CONV_ITERS_LIST
 fi
 
 # --- Post-proceso: depende de TODOS los jobs de campana ---------------------
