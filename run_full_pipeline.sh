@@ -41,6 +41,18 @@
 # Saltar fases (por si ya corriste algunas, o para iterar rapido):
 #   RUN_FASE1=0 RUN_FASE2=0 bash run_full_pipeline.sh
 #
+# Cada Fase 3/Fase 4 corre DOS VECES por kernel si se activa RUN_ENERGY_PASS=1
+# (opt-in, default 0):
+# la pasada normal y una pasada SOLO de energia (RUN_KIND=energy, ITERS_LIST
+# grande) -- sin esto, energy_window_reliable sale en 0 casi siempre (ver la
+# nota de cabecera junto a RUN_ENERGY_PASS mas abajo). Para desactivarla:
+#   RUN_ENERGY_PASS=0 bash run_full_pipeline.sh
+#
+# La campana de VARIABILIDAD (replicas para el ANOVA, Etapa 7) NO corre desde
+# aqui -- requiere SLURM por diseno (cada replica es un job independiente).
+# Usar run_full_pipeline_pacca.sh en un cluster, o tools/lanzar_campana_
+# variabilidad.sh directo.
+#
 # Parametrizar una fase especifica: exporta las mismas variables que acepta
 # su .sbatch ANTES de llamar a este script -- se propagan tal cual (este
 # script no las redeclara ni las intercepta):
@@ -67,6 +79,49 @@ RUN_FASE3="${RUN_FASE3:-1}"
 RUN_FASE4="${RUN_FASE4:-1}"
 RUN_STATS="${RUN_STATS:-1}"
 RUN_PARETO="${RUN_PARETO:-1}"
+
+# --- Pase de energia (RUN_KIND=energy), Fase 3/4 de los 3 kernels ------------
+# Mismo mecanismo y mismos defaults que run_full_pipeline_pacca.sh -- ver la
+# nota de cabecera de ese script para el porque completo, la verificacion con
+# datos reales (gpu_segments=2 en el 100% de las filas de GEMM/Conv, umbral
+# 1000 ms) y por que los ITERS_LIST se calcularon con el MINIMO t_iter_ms
+# observado (reloj de GPU en estado estable) y no con la mediana -- la
+# mediana subestima el caso real, el mismo error que dejo corta la tanda D
+# de Stencil. En resumen: una sola pasada con los ITERS_LIST default (20-80
+# en GEMM/Conv) SIEMPRE da energy_window_reliable=0 en casi todas las filas
+# (confirmado en produccion: jobs 6925/6926/6927/6928/6866/6890, 96-276 de
+# 96-276 filas GPU cada uno). Causa en dos capas: (1) CHECKPOINT_EVERY>0
+# fragmenta la ventana NVML en tramos -- RUN_KIND=energy fuerza
+# CHECKPOINT_EVERY=0 y RUN_NCU=0; (2) con CHECKPOINT_EVERY=0, TODAS las rutas
+# de GEMM/Conv (no solo _comp) igual cierran 2 tramos -- umbral real 1000 ms,
+# no 500. Los ITERS_LIST default no se acercan. La correccion es una SEGUNDA
+# pasada solo de energia, con ITERS_LIST grande (dimensionado con la ruta MAS
+# RAPIDA de cada barrido, que es la que manda porque todas las rutas de una
+# invocacion comparten --iters) y sin checkpoints intermedios; el job vive en
+# el MISMO results/ que la pasada numerica (job_id/PID nuevo, no se pisan) y
+# el post-proceso los toma a ambos como replicas del mismo tamano/formato.
+#
+# Default 0, OPT-IN: no tiene sentido que una corrida exploratoria (solo
+# exactitud, gates, smoke) dispare de oficio una segunda invocacion pesada
+# por kernel. Activar solo cuando el objetivo de la corrida incluye
+# energia/Frente de Pareto: RUN_ENERGY_PASS=1 bash run_full_pipeline.sh
+RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-0}"
+ENERGY_ITERS_GEMM="${ENERGY_ITERS_GEMM:-24000}"
+ENERGY_ITERS_CONV="${ENERGY_ITERS_CONV:-37000}"
+ENERGY_ITERS_STENCIL="${ENERGY_ITERS_STENCIL:-4000}"
+
+# La campana de VARIABILIDAD (replicas independientes para el ANOVA/Tukey,
+# Etapa 7 -- tools/lanzar_campana_variabilidad.sh) NO se puede correr desde
+# este script: por diseno, cada replica es un job de SLURM INDEPENDIENTE
+# (job_id propio, que es justo lo que hace a dos corridas "observaciones
+# independientes" para el ANOVA), y el propio lanzador exige `sbatch` y sale
+# con error si no lo encuentra. Este orquestador corre todo con `bash`, sin
+# SLURM -- no hay forma honesta de fingir job_ids independientes en un solo
+# proceso secuencial. En un cluster con SLURM, correr la campana de
+# variabilidad con:
+#   bash tools/lanzar_campana_variabilidad.sh
+# (o usar run_full_pipeline_pacca.sh, que ya la integra como parte del
+# pipeline completo).
 
 # PIPELINE_MODE=smoke|full (default full).
 #
@@ -144,18 +199,41 @@ else
     echo "RUN_FASE2=0 -- se omite Fase 2."
 fi
 
+# Corre una fase dos veces si RUN_ENERGY_PASS=1: la normal (defaults del
+# .sbatch, numerica) y una segunda SOLO con RUN_KIND=energy/ITERS_LIST
+# grande (ver la nota de cabecera sobre por que hace falta). RUN_KIND e
+# ITERS_LIST se exportan solo para la segunda llamada y se limpian despues,
+# para no dejarlos pegados en el resto del pipeline (p.ej. Fase 1/2, que no
+# entienden RUN_KIND).
+run_phase_con_energia() {
+    local label="$1" dir="$2" script="$3" energy_iters="$4"
+    run_phase "${label}" "${dir}" "${script}"
+    if [[ "${RUN_ENERGY_PASS}" == "1" && "${SMOKE_TEST:-0}" != "1" ]]; then
+        RUN_KIND=energy ITERS_LIST="${energy_iters}" \
+            run_phase "${label} (energia)" "${dir}" "${script}"
+    elif [[ "${RUN_ENERGY_PASS}" == "1" ]]; then
+        # SMOKE_TEST=1 ya deja ITERS_LIST en 3 dentro del .sbatch -- si aqui
+        # se exportara igual ENERGY_ITERS_* (miles de iters) lo pisaria y el
+        # "humo" dejaria de ser rapido. El pase de energia no aporta nada en
+        # modo humo (solo valida que compile y corra, no que la energia sea
+        # fiable), asi que se omite entero.
+        echo "PIPELINE_MODE=smoke -- se omite el pase de energia de ${label}" \
+             "(no tiene sentido con ITERS_LIST de humo)."
+    fi
+}
+
 if [[ "${RUN_FASE3}" == "1" ]]; then
-    run_phase "Fase 3 / Stencil (tc)"      Fase_3/Stencil     run_stencil_tc.sbatch
-    run_phase "Fase 3 / GEMM (chained)"    Fase_3/GEMM        run_gemm_chained.sbatch
-    run_phase "Fase 3 / Convolucion (chained)" Fase_3/Convolution run_conv_chained.sbatch
+    run_phase_con_energia "Fase 3 / Stencil (tc)"      Fase_3/Stencil     run_stencil_tc.sbatch "${ENERGY_ITERS_STENCIL}"
+    run_phase_con_energia "Fase 3 / GEMM (chained)"    Fase_3/GEMM        run_gemm_chained.sbatch "${ENERGY_ITERS_GEMM}"
+    run_phase_con_energia "Fase 3 / Convolucion (chained)" Fase_3/Convolution run_conv_chained.sbatch "${ENERGY_ITERS_CONV}"
 else
     echo "RUN_FASE3=0 -- se omite Fase 3."
 fi
 
 if [[ "${RUN_FASE4}" == "1" ]]; then
-    run_phase "Fase 4 / Stencil (ancla FP64)"      Fase_4/Stencil     run_stencil_tc.sbatch
-    run_phase "Fase 4 / GEMM (ancla FP64)"         Fase_4/GEMM        run_gemm_chained.sbatch
-    run_phase "Fase 4 / Convolucion (ancla FP64)"  Fase_4/Convolution run_conv_chained.sbatch
+    run_phase_con_energia "Fase 4 / Stencil (ancla FP64)"      Fase_4/Stencil     run_stencil_tc.sbatch "${ENERGY_ITERS_STENCIL}"
+    run_phase_con_energia "Fase 4 / GEMM (ancla FP64)"         Fase_4/GEMM        run_gemm_chained.sbatch "${ENERGY_ITERS_GEMM}"
+    run_phase_con_energia "Fase 4 / Convolucion (ancla FP64)"  Fase_4/Convolution run_conv_chained.sbatch "${ENERGY_ITERS_CONV}"
 else
     echo "RUN_FASE4=0 -- se omite Fase 4."
 fi
