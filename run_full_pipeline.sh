@@ -226,8 +226,44 @@ run_phase_con_energia() {
     fi
 }
 
+# Stencil, ADEMAS de lo de arriba: una TERCERA pasada, SPATIAL_COMP=off.
+#
+# QUE PROBLEMA CIERRA: con SPATIAL_COMP=on (el default de run_stencil_tc.sbatch,
+# el que usan las dos pasadas de run_phase_con_energia) el binario SOLO
+# produce las rutas WMMA_*_SP -- la ruta "sin compensacion" (WMMA_FP16/BF16,
+# sin sufijo _SP) NO EXISTE en esa corrida en absoluto, sin importar
+# ITERS_LIST ni RUN_KIND. Es un interruptor unico, no una lista como
+# COMP_LIST en GEMM/Conv (ver KAHAN_LIST, que ademas queda forzado a "off"
+# cuando SPATIAL_COMP=on). La UNICA forma de tener energia fiable de la ruta
+# sin compensar es una corrida aparte con SPATIAL_COMP=off -- sin esta
+# tercera pasada, "sin compensacion" queda permanentemente vacio en Stencil,
+# sin importar cuantas veces se relance lo de arriba.
+#
+# ITERS_LIST: la ruta sin compensar no se ha medido a escala de produccion
+# (4096-16384) en ningun job de esta sesion -- el unico dato real es a
+# NX=1024 (tanda D de variabilidad, ITERS_LIST="26000 52000"). Ahi tampoco
+# aplica ENERGY_ITERS_STENCIL (calculado sobre la ruta _SP, que hace MAS
+# trabajo por iteracion que la version sin comp. -- si la sin comp. es mas
+# rapida por iteracion, necesita MAS iteraciones para cruzar el mismo umbral
+# de 1000 ms, no menos). Sin una medicion propia, se aplica 1.5x sobre
+# ENERGY_ITERS_STENCIL como margen de seguridad explicito -- esto es una
+# ESTIMACION, no un numero verificado con t_iter_ms real como los demas
+# ENERGY_ITERS_*; si energy_window_reliable sale en 0 para WMMA_FP16/BF16
+# (sin _SP) despues de correr esto, subir ENERGY_ITERS_STENCIL_SIN_COMP a
+# mano y volver a correr solo esa pasada.
+ENERGY_ITERS_STENCIL_SIN_COMP="${ENERGY_ITERS_STENCIL_SIN_COMP:-$(( ENERGY_ITERS_STENCIL * 3 / 2 ))}"
+run_phase_stencil_sin_comp() {
+    local label="$1" dir="$2" script="$3"
+    if [[ "${RUN_ENERGY_PASS}" == "1" && "${SMOKE_TEST:-0}" != "1" ]]; then
+        RUN_KIND=energy SPATIAL_COMP=off ITERS_LIST="${ENERGY_ITERS_STENCIL_SIN_COMP}" \
+            ANCHOR_LIST=0 KAHAN_LIST="off on" \
+            run_phase "${label} (energia, sin compensacion)" "${dir}" "${script}"
+    fi
+}
+
 if [[ "${RUN_FASE3}" == "1" ]]; then
     run_phase_con_energia "Fase 3 / Stencil (tc)"      Fase_3/Stencil     run_stencil_tc.sbatch "${ENERGY_ITERS_STENCIL}"
+    run_phase_stencil_sin_comp "Fase 3 / Stencil (tc)" Fase_3/Stencil     run_stencil_tc.sbatch
     run_phase_con_energia "Fase 3 / GEMM (chained)"    Fase_3/GEMM        run_gemm_chained.sbatch "${ENERGY_ITERS_GEMM}"
     run_phase_con_energia "Fase 3 / Convolucion (chained)" Fase_3/Convolution run_conv_chained.sbatch "${ENERGY_ITERS_CONV}"
 else
@@ -236,6 +272,7 @@ fi
 
 if [[ "${RUN_FASE4}" == "1" ]]; then
     run_phase_con_energia "Fase 4 / Stencil (ancla FP64)"      Fase_4/Stencil     run_stencil_tc.sbatch "${ENERGY_ITERS_STENCIL}"
+    run_phase_stencil_sin_comp "Fase 4 / Stencil (ancla FP64)" Fase_4/Stencil     run_stencil_tc.sbatch
     run_phase_con_energia "Fase 4 / GEMM (ancla FP64)"         Fase_4/GEMM        run_gemm_chained.sbatch "${ENERGY_ITERS_GEMM}"
     run_phase_con_energia "Fase 4 / Convolucion (ancla FP64)"  Fase_4/Convolution run_conv_chained.sbatch "${ENERGY_ITERS_CONV}"
 else
