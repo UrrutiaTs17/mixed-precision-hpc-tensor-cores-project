@@ -44,7 +44,7 @@ LOGS_DIR="${LOGS_DIR:-logs}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 mkdir -p "${LOGS_DIR}" "${RESULTS_DIR}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
-RESULTS_LOG="${RESULTS_DIR}/run_${JOB_ID}.log"
+RESULTS_LOG="${LOGS_DIR}/run_${JOB_ID}.log"
 
 # stencil_tc usa mma.h / cuda_fp16.h / cuda_bf16.h y, si el cluster lo expone,
 # NVML para telemetria; OpenBLAS/cuDNN no aplican aqui.
@@ -93,8 +93,8 @@ NVML_LINK_FLAG="${NVML_LINK_FLAG:--lnvidia-ml}"
 # filas, aunque nvidia-smi funcione perfecto en el mismo nodo.
 NVML_PROBE_BIN="$(mktemp -u)"
 if [[ "${DISABLE_NVML_TELEMETRY:-0}" != "1" ]] &&
-   "${NVCC}" -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
-   echo 'int main(){return 0;}' | "${NVCC}" -x cu - -o "${NVML_PROBE_BIN}" \
+   "${NVCC}" --allow-unsupported-compiler -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
+   echo 'int main(){return 0;}' | "${NVCC}" --allow-unsupported-compiler -x cu - -o "${NVML_PROBE_BIN}" \
        ${NVML_LINK_FLAG} -lpthread >/dev/null 2>&1; then
     NVML_FLAGS=(-DUSE_NVML_TELEMETRY "${NVML_LINK_FLAG}" -lpthread)
     echo "NVML habilitado para telemetria GPU (verificado con enlace de prueba)."
@@ -167,7 +167,7 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 # ITERS=120 son 24 checkpoints = 51.5 GB. Cabe en --mem=128G, pero subir ITERS
 # o bajar CHECKPOINT_EVERY a este tamano no.
 NX_LIST="${NX_LIST:-${NX:-4096 8192 16384}}"
-NY_LIST="${NY_LIST:-${NY:-4096 8192 16384}}"
+NY_LIST="${NY_LIST:-${NY:-${NX_LIST}}}"
 # Formato(s) Tensor Core de las corridas de MEDICION (--tc del binario).
 TC_FORMAT="${TC_FORMAT:-both}"
 # Barrido de ITERACIONES: 10..120 caen dentro del horizonte de FP32/BF16/FP16
@@ -414,8 +414,11 @@ echo "Compilando stencil_tc (Fase_3/Stencil, incluye common/cuda_checks.cuh," \
      "common/metrics.cuh y common/power_sampling.h por ruta relativa)..."
 "${NVCC}" -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
-    -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
+    -Xcompiler "-O3 -funroll-loops -ffp-contract=off -fopenmp" \
     --allow-unsupported-compiler "${NVML_FLAGS[@]}"
+
+# La referencia CPU se paraleliza con OpenMP (ver stencil_tensor_activation.cu).
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"
 
 # Procedencia del binario/corrida: permite auditar de que commit/flags/hash
 # salio cada CSV, sin depender de que el usuario recuerde como se compilo.

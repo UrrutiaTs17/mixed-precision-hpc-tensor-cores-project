@@ -180,7 +180,10 @@ static bool telemetry_nvml_initialize(int device_id) {
   if (result == NVML_SUCCESS) {
     std::printf("NVML inicializado. Power Limit: %.2f W\n", power_limit / 1000.0);
   } else {
-    std::printf("NVML inicializado. Power Limit: NaN W\n");
+    // No supported/permisos: solo afecta este dato informativo, no la
+    // energia real (nvmlDeviceGetTotalEnergyConsumption, usada en el CSV).
+    std::printf("NVML inicializado. Power Limit: no disponible en este dispositivo (%s)\n",
+                nvmlErrorString(result));
   }
   return true;
 }

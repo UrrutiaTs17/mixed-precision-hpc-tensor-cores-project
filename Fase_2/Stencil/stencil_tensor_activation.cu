@@ -319,6 +319,8 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
                                      int ny,
                                      int iters) {
     auto apply = [&]() {
+        // Paralelo (OpenMP, todos los cores) -- ver la misma nota en Fase 1.
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < ny; ++y) {
             for (int x = 0; x < nx; ++x) {
                 if (x == 0 || y == 0 || x == nx - 1 || y == ny - 1) {
@@ -873,8 +875,8 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "=========== RESULTADOS STENCIL 2D FASE 2 ===========\n";
-    std::cout << "CPU FP32 serial - tiempo   : " << cpu.ms << " ms\n";
-    std::cout << "CPU FP32 serial - rend.    : " << cpu.gflops << " GFLOP/s ("
+    std::cout << "CPU FP32 OpenMP - tiempo   : " << cpu.ms << " ms\n";
+    std::cout << "CPU FP32 OpenMP - rend.    : " << cpu.gflops << " GFLOP/s ("
               << cpu.tflops << " TFLOP/s efectivos)\n";
     std::cout << "Error max abs vs FP64      : " << cpu_err.max_abs << "\n";
     std::cout << "Error relativo L2 vs FP64  : " << cpu_err.rel_l2 << "\n\n";

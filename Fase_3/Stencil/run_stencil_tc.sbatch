@@ -11,6 +11,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # No forzar cd a SLURM_SUBMIT_DIR: cuando este script se invoca ANIDADO
 # (`bash` dentro de un job ya en marcha -- ver tools/validacion_preliminar.sbatch,
 # que hace `cd` al directorio correcto ANTES de llamar `bash <este script>`),
@@ -27,6 +29,7 @@ if [[ ! -f stencil_tensor_activation.cu ]]; then
         cd "${SLURM_SUBMIT_DIR}/Stencil"
     fi
 fi
+cd "${SCRIPT_DIR}"
 
 # Directorios de salida, parametrizados: ningun script de post-proceso ni
 # ninguna ruta de log queda hardcodeada a "logs"/"results" salvo como default.
@@ -34,7 +37,7 @@ LOGS_DIR="${LOGS_DIR:-logs}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 mkdir -p "${LOGS_DIR}" "${RESULTS_DIR}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
-RESULTS_LOG="${RESULTS_DIR}/run_${JOB_ID}.log"
+RESULTS_LOG="${LOGS_DIR}/run_${JOB_ID}.log"
 
 # stencil_tc usa mma.h / cuda_fp16.h / cuda_bf16.h y, si el cluster lo expone,
 # NVML para telemetria; OpenBLAS/cuDNN no aplican aqui.
@@ -46,7 +49,8 @@ RESULTS_LOG="${RESULTS_DIR}/run_${JOB_ID}.log"
 # Corre igual bajo SLURM en PACCA o con `bash` directo en cualquier otra
 # maquina con el entorno conda de environment.yml activo -- ver el
 # comentario de cabecera de ese script.
-for _toolchain in "../../tools/detect_toolchain.sh" "./detect_toolchain.sh"; do
+for _toolchain in "${SCRIPT_DIR}/../../tools/detect_toolchain.sh" \
+                  "${SCRIPT_DIR}/detect_toolchain.sh"; do
     if [[ -f "${_toolchain}" ]]; then
         # shellcheck source=/dev/null
         source "${_toolchain}"
@@ -83,8 +87,8 @@ NVML_LINK_FLAG="${NVML_LINK_FLAG:--lnvidia-ml}"
 # filas, aunque nvidia-smi funcione perfecto en el mismo nodo.
 NVML_PROBE_BIN="$(mktemp -u)"
 if [[ "${DISABLE_NVML_TELEMETRY:-0}" != "1" ]] &&
-   "${NVCC}" -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
-   echo 'int main(){return 0;}' | "${NVCC}" -x cu - -o "${NVML_PROBE_BIN}" \
+   "${NVCC}" --allow-unsupported-compiler -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
+   echo 'int main(){return 0;}' | "${NVCC}" --allow-unsupported-compiler -x cu - -o "${NVML_PROBE_BIN}" \
        ${NVML_LINK_FLAG} -lpthread >/dev/null 2>&1; then
     NVML_FLAGS=(-DUSE_NVML_TELEMETRY "${NVML_LINK_FLAG}" -lpthread)
     echo "NVML habilitado para telemetria GPU (verificado con enlace de prueba)."
@@ -157,7 +161,7 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 # ITERS=120 son 24 checkpoints = 51.5 GB. Cabe en --mem=128G, pero subir ITERS
 # o bajar CHECKPOINT_EVERY a este tamano no.
 NX_LIST="${NX_LIST:-${NX:-4096 8192 16384}}"
-NY_LIST="${NY_LIST:-${NY:-4096 8192 16384}}"
+NY_LIST="${NY_LIST:-${NY:-${NX_LIST}}}"
 # Formato(s) Tensor Core de las corridas de MEDICION (--tc del binario).
 TC_FORMAT="${TC_FORMAT:-both}"
 # Barrido de ITERACIONES: 10..120 caen dentro del horizonte de FP32/BF16/FP16
@@ -312,7 +316,8 @@ CPU_FP64="${CPU_FP64:-on}"
 # sola vez en tools/common_ncu.sh (fuera de cualquier Fase_N) y se reutiliza
 # entre los .sbatch de todas las fases; este script corre desde
 # Fase_3/Stencil, de ahi "../../tools/common_ncu.sh" como ruta principal.
-for _common_ncu in "../../tools/common_ncu.sh" "./common_ncu.sh"; do
+for _common_ncu in "${SCRIPT_DIR}/../../tools/common_ncu.sh" \
+                   "${SCRIPT_DIR}/common_ncu.sh"; do
     if [[ -f "${_common_ncu}" ]]; then
         # shellcheck source=/dev/null
         source "${_common_ncu}"
@@ -367,8 +372,11 @@ echo "Compilando stencil_tc (Fase_3/Stencil, incluye common/cuda_checks.cuh," \
      "common/metrics.cuh y common/power_sampling.h por ruta relativa)..."
 "${NVCC}" -std=c++17 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
-    -Xcompiler "-O3 -funroll-loops -ffp-contract=off" \
+    -Xcompiler "-O3 -funroll-loops -ffp-contract=off -fopenmp" \
     --allow-unsupported-compiler "${NVML_FLAGS[@]}"
+
+# La referencia CPU se paraleliza con OpenMP (ver stencil_tensor_activation.cu).
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"
 
 # Procedencia del binario/corrida: permite auditar de que commit/flags/hash
 # salio cada CSV, sin depender de que el usuario recuerde como se compilo.
@@ -643,7 +651,8 @@ done
 # de todas formas disponible para post-procesar manualmente despues.
 EXTRACT_CSV_SCRIPT="${EXTRACT_CSV_SCRIPT:-}"
 if [[ -z "${EXTRACT_CSV_SCRIPT}" ]]; then
-    for _cand in "../tools/extract_csv.py" "tools/extract_csv.py" "../../tools/extract_csv.py"; do
+    for _cand in "${SCRIPT_DIR}/../../Fase_3/tools/extract_csv.py" \
+                 "${SCRIPT_DIR}/../tools/extract_csv.py"; do
         if [[ -f "${_cand}" ]]; then
             EXTRACT_CSV_SCRIPT="${_cand}"
             break

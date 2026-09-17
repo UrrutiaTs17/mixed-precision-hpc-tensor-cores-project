@@ -38,7 +38,23 @@ nvcc --version   # confirma que quedo en el PATH del entorno
   Sin este parche, **tanto** `Fase_2/GEMM` como `Fase_2/Convolution` fallan en compilación con `--cutlass`/`CUTLASS_DIR` configurado.
 
   **Verificado en GPU real** (RTX 4060 Laptop, `sm_89`, 2026-09-03): las 5 rutas de GEMM y las 5 de Convolución compilan y corren limpio con el parche de arriba. La ruta 5 de Convolución tenía además un bug propio (no de CUTLASS): `problem_size.output_size()` se asumía que devolvía un `cutlass::Tensor4DCoord` (la forma 4D de salida); en realidad devuelve `int64_t` (el conteo total de elementos N·P·Q·K). Ya corregido en `conv_tensor_activation.cu` — construye el `Tensor4DCoord` directamente desde los campos `N`/`P`/`Q`/`K` de `Conv2dProblemSize`. La ruta 5 de GEMM no tenía bugs propios, solo necesitaba el parche del typo de arriba.
-- **Nsight Compute** (`ncu`, perfilado opcional vía `RUN_NCU=1`) — el paquete conda no publica builds confiables para todas las plataformas, así que no está en `environment.yml`. Instálalo aparte (https://developer.nvidia.com/nsight-compute) si lo necesitas; si no está, `tools/detect_toolchain.sh` lo detecta y fuerza `RUN_NCU=0` con un aviso, sin romper la compilación ni la corrida.
+- **Nsight Compute** (`ncu`, perfilado opcional vía `RUN_NCU=1`) — no está en `environment.yml` porque el canal `nvidia` publica muchas versiones distintas y conda no puede fijar automáticamente la que coincide con tu driver. Instálalo aparte, en el entorno ya creado:
+  ```bash
+  conda search -c nvidia nsight-compute   # ver versiones disponibles
+  conda install -n prism_env -c nvidia nsight-compute=<version>
+  ```
+  Usa la versión más reciente que liste `conda search` (verificado con `2026.2.1.5` contra driver `610.57.04`, RTX 4060 Laptop `sm_89`) — una versión vieja (p. ej. `2021.2.0.15`, la que aparece primero en algunos listados) puede no reconocer una GPU/driver recientes. Si no está, `tools/detect_toolchain.sh` lo detecta y fuerza `RUN_NCU=0` con un aviso, sin romper la compilación ni la corrida.
+
+  **Permiso adicional, aparte de instalar el paquete**: el driver NVIDIA restringe los contadores de rendimiento de la GPU a root por defecto (mitigación de CVE-2018-6260). Verifica con:
+  ```bash
+  cat /proc/driver/nvidia/params | grep RmProfilingAdminOnly   # "1" = restringido
+  ```
+  Si devuelve `1`, `ncu` falla con `ERR_NVGPUCTRPERM` sin importar que el binario esté instalado y funcione. Para habilitarlo (requiere que ningún proceso este usando la GPU en ese momento, y `sudo`):
+  ```bash
+  echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee /etc/modprobe.d/nvidia-profiling.conf
+  sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia nvidia_uvm nvidia_modeset nvidia_drm
+  ```
+  Si `rmmod` falla por "module in use", cierra todo lo que use la GPU (compositor con aceleración, navegador, etc.) o reinicia la máquina.
 
 ## Alternativa: pip (solo el lado de Python)
 

@@ -101,15 +101,25 @@ RUN_PARETO="${RUN_PARETO:-1}"
 # el MISMO results/ que la pasada numerica (job_id/PID nuevo, no se pisan) y
 # el post-proceso los toma a ambos como replicas del mismo tamano/formato.
 #
-# Default 1: PIPELINE_MODE=full (el default) ES la campana completa, y esa
-# campana no queda terminada sin el eje de energia/Pareto -- no tiene
-# sentido pedirle a quien lanza `bash run_full_pipeline.sh` a secas que
-# ademas se acuerde de una variable mas. La proteccion contra un costo que
-# nadie pidio ya existe y es mas precisa: PIPELINE_MODE=smoke (o
-# SMOKE_TEST=1 directo) desactiva el pase de energia solo, automaticamente
-# -- ver run_phase_con_energia mas abajo. Para desactivarlo sin entrar en
-# modo humo: RUN_ENERGY_PASS=0 bash run_full_pipeline.sh
-RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-1}"
+# En PACCA/A100, la pasada energetica adicional era parte del default:
+# RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-1}"
+# ENERGY_ITERS_GEMM="${ENERGY_ITERS_GEMM:-24000}"
+# ENERGY_ITERS_CONV="${ENERGY_ITERS_CONV:-37000}"
+# ENERGY_ITERS_STENCIL="${ENERGY_ITERS_STENCIL:-4000}"
+#
+# En la RTX 4060 local esos valores no son portables: la referencia GPU_FP64
+# de GEMM N=8192 hizo que una sola corrida energetica superara un dia. Eso no
+# es un OOM ni un cuelgue; es una medicion sobredimensionada para otra GPU.
+# La ejecucion normal conserva TODO el dominio experimental (tamanos,
+# formatos, iteraciones, Fase 3 y Fase 4). Solo se desactiva por defecto la
+# segunda pasada energetica, que es un suplemento de medicion y no cambia la
+# exactitud ni el drift. Puede reactivarse manualmente cuando se desee.
+#
+# EN PACCA: no cambia nada de lo de arriba -- usar run_full_pipeline_pacca.sh
+# (no este script), que mantiene su propio default RUN_ENERGY_PASS=1 porque
+# alla los ENERGY_ITERS_* SI estan calibrados para el A100. Este default en 0
+# es solo para invocar run_full_pipeline.sh a secas en una maquina generica.
+RUN_ENERGY_PASS="${RUN_ENERGY_PASS:-0}"
 ENERGY_ITERS_GEMM="${ENERGY_ITERS_GEMM:-24000}"
 ENERGY_ITERS_CONV="${ENERGY_ITERS_CONV:-37000}"
 ENERGY_ITERS_STENCIL="${ENERGY_ITERS_STENCIL:-4000}"
@@ -163,28 +173,57 @@ STATS_OUTDIR="${STATS_OUTDIR:-${REPO_ROOT}/stats_out}"
 PARETO_OUTDIR="${PARETO_OUTDIR:-${REPO_ROOT}/pareto_out}"
 
 PIPELINE_LOG="${REPO_ROOT}/run_full_pipeline_$(date +%Y%m%d_%H%M%S).log"
+OOM_FAILURE_LOG="${REPO_ROOT}/oom_failures_$(basename "${PIPELINE_LOG#run_full_pipeline_}" .log).log"
 echo "Log completo de esta corrida: ${PIPELINE_LOG}"
+echo "Registro de fallos OOM: ${OOM_FAILURE_LOG}"
 
 # Todo el cuerpo del pipeline vive en esta funcion, para poder envolver UNA
 # sola vez toda la salida (stdout+stderr de las cuatro fases y del
 # post-proceso) con `tee` hacia PIPELINE_LOG -- ver la llamada a `main` al
 # final del archivo. `set -euo pipefail` ya esta activo desde arriba, asi
-# que un fallo en cualquier fase interrumpe main() y, via pipefail, tambien
-# el exit code de este script (no lo enmascara el `tee`).
+# que los fallos de cada fase se inspeccionan localmente: un OOM se registra y
+# permite continuar; cualquier otro fallo mantiene el comportamiento fail-fast.
 main() {
 
 # Corre un .sbatch de una carpeta como script de bash normal (sin SLURM) --
 # ver tools/detect_toolchain.sh, que cada .sbatch source-ea, sobre por que
-# esto es seguro fuera de un cluster. Si alguna fase falla, el pipeline
-# entero se detiene aqui (set -e) -- no tiene sentido seguir con Fase 3 si
-# Fase 1 no compilo, el toolchain esta roto para todas por igual.
+# esto es seguro fuera de un cluster. Los OOM son la unica excepcion: se
+# registran y el pipeline continua con la siguiente fase o pasada.
 run_phase() {
     local label="$1" dir="$2" script="$3"
+    local phase_output phase_rc oom_detected
     echo
     echo "################################################################"
     echo "# ${label}"
     echo "################################################################"
-    ( cd "${REPO_ROOT}/${dir}" && bash "${script}" )
+    phase_output="$(mktemp)"
+    phase_rc=0
+    if ( cd "${REPO_ROOT}/${dir}" && bash "${script}" ) 2>&1 | tee "${phase_output}"; then
+        phase_rc=0
+    else
+        phase_rc=$?
+    fi
+
+    oom_detected=0
+    if [[ "${phase_rc}" -eq 137 || "${phase_rc}" -eq 9 ]] ||
+    grep -Eqi 'out[ _-]?of[ _-]?memory|outofmemory|oom-kill|killed process|(^|[[:space:]])killed([[:space:]]|$)|cannot allocate memory|cuda(error| error).*(memory|alloc)|memory allocation failed|std::bad_alloc' "${phase_output}"; then
+        oom_detected=1
+    fi
+
+    if [[ "${oom_detected}" -eq 1 ]]; then
+        printf '%s\t%s\texit=%s\t%s/%s\n' \
+            "$(date --iso-8601=seconds)" "${label}" "${phase_rc}" "${dir}" "${script}" \
+            >> "${OOM_FAILURE_LOG}"
+        echo "OOM registrado para ${label} (exit=${phase_rc}); se continua con la siguiente etapa."
+        rm -f "${phase_output}"
+        return 0
+    fi
+
+    rm -f "${phase_output}"
+    if [[ "${phase_rc}" -ne 0 ]]; then
+        echo "ERROR: ${label} fallo con exit=${phase_rc}; no parece un OOM." >&2
+        return "${phase_rc}"
+    fi
 }
 
 if [[ "${RUN_FASE1}" == "1" ]]; then

@@ -65,6 +65,9 @@ output/
 results/
 stats_out/
 pareto_out/
+analysis_out/
+analysis_figures/
+oom_failures_*.log
 
 # Archivos del sistema
 .DS_Store

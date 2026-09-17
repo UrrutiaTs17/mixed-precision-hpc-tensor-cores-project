@@ -1583,6 +1583,11 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
     // y no deben contaminar la medicion (se reinicia antes del bucle medido).
     auto apply = [&](const std::vector<float>& src, std::vector<float>& dst,
                      int iter_number, int* first_nf) {
+        // Paralelo (OpenMP, todos los cores) -- ver la misma nota en Fase 1.
+        // El write de first_nf va detras de un critical con doble chequeo:
+        // todos los hilos escribirian el MISMO iter_number, pero un write sin
+        // sincronizar sigue siendo UB formalmente.
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < ny; ++y) {
             for (int x = 0; x < nx; ++x) {
                 if (x == 0 || y == 0 || x == nx - 1 || y == ny - 1) {
@@ -1598,7 +1603,12 @@ static Metrics benchmark_cpu_stencil(const std::vector<float>& in,
                 const float val = c_neigh * (up + down + left + right) + c_center * center;
                 dst[idx2d(x, y, nx)] = val;
                 if (first_nf != nullptr && *first_nf == INT_MAX && !std::isfinite(val)) {
-                    *first_nf = iter_number;
+                    #pragma omp critical(first_nf_update_fp32)
+                    {
+                        if (*first_nf == INT_MAX) {
+                            *first_nf = iter_number;
+                        }
+                    }
                 }
             }
         }
@@ -1680,6 +1690,8 @@ static Metrics benchmark_cpu_fp64_stencil(const std::vector<double>& in,
     // FP32 (esas iteraciones son descartables y no deben contaminar la medida).
     auto apply = [&](const std::vector<double>& src, std::vector<double>& dst,
                      int iter_number, int* first_nf) {
+        // Paralelo (OpenMP, todos los cores) -- ver la misma nota en Fase 1.
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < ny; ++y) {
             for (int x = 0; x < nx; ++x) {
                 if (x == 0 || y == 0 || x == nx - 1 || y == ny - 1) {
@@ -1695,7 +1707,12 @@ static Metrics benchmark_cpu_fp64_stencil(const std::vector<double>& in,
                 const double val = c_neigh * (up + down + left + right) + c_center * center;
                 dst[idx2d(x, y, nx)] = val;
                 if (first_nf != nullptr && *first_nf == INT_MAX && !std::isfinite(val)) {
-                    *first_nf = iter_number;
+                    #pragma omp critical(first_nf_update_fp64)
+                    {
+                        if (*first_nf == INT_MAX) {
+                            *first_nf = iter_number;
+                        }
+                    }
                 }
             }
         }
@@ -6433,9 +6450,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
     print_first_nonfinite("Primera iteracion no finita (ref FP64)     : ", first_nf_fp64_ref, opt.iters);
     print_fp64_reference_norms(y_ref, first_nf_fp64_ref);
     std::cout << "\n";
-    std::cout << "CPU FP32 serial - tiempo/iter (media) : " << cpu.ms << " ms\n";
-    std::cout << "CPU FP32 serial - tiempo total        : " << cpu.ms * opt.iters << " ms\n";
-    std::cout << "CPU FP32 serial - rend.    : " << cpu.gflops << " GFLOP/s ("
+    std::cout << "CPU FP32 OpenMP - tiempo/iter (media) : " << cpu.ms << " ms\n";
+    std::cout << "CPU FP32 OpenMP - tiempo total        : " << cpu.ms * opt.iters << " ms\n";
+    std::cout << "CPU FP32 OpenMP - rend.    : " << cpu.gflops << " GFLOP/s ("
               << cpu.tflops << " TFLOP/s efectivos)\n";
     print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ",
                         "Error rel Linf vs FP64     : ", cpu_err, first_nf_cpu);
@@ -6466,9 +6483,9 @@ static void run_benchmark(const Options& opt, const char* exe_name) {
         // pasada cronometrada se separo del ground truth y hay un bug. Lo que
         // esta fila aporta de verdad son t_iter_ms, gflops y la energia RAPL.
         const ErrorMetrics cpu_fp64_err = compare_fp64_ref_vs_fp64(y_ref, y_cpu_fp64);
-        std::cout << "CPU FP64 serial - tiempo/iter (media) : " << cpu_fp64.ms << " ms\n";
-        std::cout << "CPU FP64 serial - tiempo total        : " << cpu_fp64.ms * opt.iters << " ms\n";
-        std::cout << "CPU FP64 serial - rend.    : " << cpu_fp64.gflops << " GFLOP/s ("
+        std::cout << "CPU FP64 OpenMP - tiempo/iter (media) : " << cpu_fp64.ms << " ms\n";
+        std::cout << "CPU FP64 OpenMP - tiempo total        : " << cpu_fp64.ms * opt.iters << " ms\n";
+        std::cout << "CPU FP64 OpenMP - rend.    : " << cpu_fp64.gflops << " GFLOP/s ("
                   << cpu_fp64.tflops << " TFLOP/s efectivos)\n";
         std::cout << "Sobrecosto FP64 vs FP32 en CPU : " << cpu_fp64.ms / cpu.ms << "x\n";
         print_error_metrics("Error max abs vs FP64      : ", "Error relativo L2 vs FP64  : ",

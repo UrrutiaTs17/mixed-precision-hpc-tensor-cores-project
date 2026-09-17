@@ -238,6 +238,11 @@ template <typename T>
 StencilMetrics run_cpu_stencil(const std::vector<T>& in, std::vector<T>& out,
                         int nx, int ny, int iters) {
     auto apply_stencil = [&]() {
+        // Paralelo (OpenMP, todos los cores) -- el plan de tesis dimensiona el
+        // presupuesto de computo asumiendo los 32 nucleos del nodo en uso
+        // simultaneo; una referencia de CPU serial subestimaria su throughput
+        // real y sesgaria el "speedup GPU/CPU" reportado mas abajo.
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < ny; ++y) {
             for (int x = 0; x < nx; ++x) {
                 if (x == 0 || y == 0 || x == nx - 1 || y == ny - 1) {
@@ -378,8 +383,8 @@ void run_experiment(const Options& opt, const char* precision_name) {
 
     std::cout << std::fixed << std::setprecision(7);
     std::cout << "---------------- RESULTADOS ----------------\n";
-    std::cout << "CPU serial - tiempo medio : " << cpu.milliseconds << " ms\n";
-    std::cout << "CPU serial - rendimiento  : " << cpu.gflops << " GFLOP/s\n";
+    std::cout << "CPU OpenMP - tiempo medio : " << cpu.milliseconds << " ms\n";
+    std::cout << "CPU OpenMP - rendimiento  : " << cpu.gflops << " GFLOP/s\n";
     std::cout << "GPU CUDA   - tiempo medio : " << gpu.milliseconds << " ms\n";
     std::cout << "GPU CUDA   - tiempo total : " << gpu.total_ms << " ms en "
               << gpu.iters << " iteraciones\n";

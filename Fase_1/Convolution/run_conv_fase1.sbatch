@@ -117,12 +117,34 @@ elif [[ -z "${OPENBLAS_INC:-}" && -f "/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/i
     # si esta instalado.
     OPENBLAS_INC="-I/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/include"
     OPENBLAS_LIBS="${OPENBLAS_LIBS:--L/opt/ohpc/pub/libs/gnu12/openblas/0.3.21/lib -Xlinker -rpath -Xlinker /opt/ohpc/pub/libs/gnu12/openblas/0.3.21/lib -lopenblas}"
+elif [[ -z "${OPENBLAS_INC:-}" && -n "${CONDA_PREFIX:-}" && -f "${CONDA_PREFIX}/lib/libopenblas.so" ]]; then
+    # Entorno conda activo (environment.yml/prism_env): preferirlo sobre el
+    # fallback del sistema de abajo -- "-lopenblas" sin -L resuelve ahi al
+    # OpenBLAS del sistema operativo, que en Ubuntu/Fedora suele ser la build
+    # SERIAL (openblas_get_parallel()==0, un solo hilo siempre); el paquete
+    # conda-forge trae la build pthread detras del mismo symlink libopenblas.so
+    # y si usa todos los cores.
+    if [[ -f "${CONDA_PREFIX}/include/cblas.h" ]]; then
+        OPENBLAS_INC="-I${CONDA_PREFIX}/include"
+    else
+        # El paquete conda de este entorno solo trae el .so en runtime, sin
+        # cblas.h -- se toma prestado el header del sistema (misma API C de
+        # OpenBLAS, binariamente compatible) solo para el include.
+        OPENBLAS_INC="-I/usr/include/openblas"
+    fi
+    OPENBLAS_LIBS="-L${CONDA_PREFIX}/lib -Xlinker -rpath -Xlinker ${CONDA_PREFIX}/lib -lopenblas"
 else
     OPENBLAS_INC="$(normalize_include_flags "${OPENBLAS_INC:--I/usr/include/openblas}")"
     OPENBLAS_LIBS="${OPENBLAS_LIBS:--lopenblas}"
 fi
 
-CUDNN_ROOT="${CUDNN_ROOT:-/opt/ohpc/pub/Analytics/anaconda3/envs/hybrid-profiler/lib/python3.10/site-packages/nvidia/cudnn}"
+# Sin esto el numero de hilos de OpenBLAS en runtime queda a su autodeteccion
+# interna, que no siempre es "todos los cores" -- fijarlo explicito lo hace
+# reproducible entre corridas.
+OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"
+export OPENBLAS_NUM_THREADS
+
+CUDNN_ROOT="${CUDNN_ROOT:-$(detect_cudnn_root || true)}"
 
 if [[ -z "${CUDNN_INC:-}" && -f "${CUDNN_ROOT}/include/cudnn.h" ]]; then
     CUDNN_INC="-I${CUDNN_ROOT}/include"

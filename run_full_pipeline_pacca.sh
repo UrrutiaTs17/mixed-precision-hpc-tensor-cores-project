@@ -15,11 +15,13 @@
 # reserva, y si el job se cae en la hora 30 se pierde todo.
 #
 # Este script, en cambio, ENVIA cada fase como un job independiente con
-# `sbatch --parsable`, y las encadena con `--dependency=afterok:<job_id>`.
+# `sbatch --parsable`, y las encadena con `--dependency=afterany:<job_id>`.
+# Cada job dependiente usa tools/oom_guard.sh via BASH_ENV: continua si el
+# predecesor fue OOM y se bloquea si termino por otro error.
 # SLURM se encarga del resto: cada job pide solo el tiempo que necesita, la
 # cola los intercala con los de otros usuarios, y si uno falla los que dependen
-# de el no arrancan (afterok, no afterany) en vez de correr sobre datos que no
-# existen.
+# de el no arrancan si fue un error normal; un OOM queda registrado y permite
+# continuar con los datos parciales disponibles.
 #
 # GRAFO DE DEPENDENCIAS
 # ---------------------
@@ -45,7 +47,8 @@
 #     un fallo suyo -- por ejemplo, CUTLASS sin clonar, que es opcional --
 #     bloqueara una campana que no las necesita.
 #   * El post-proceso depende de TODOS los jobs de F3/F4 (normales + energia)
-#     a la vez (afterok:J1:J2:...) y NO pide GPU.
+#     a la vez (afterany:J1:J2:...); oom_guard.sh deja pasar OOM y bloquea
+#     otros errores. No pide GPU.
 #   * La campana de variabilidad es un grafo APARTE con su propio
 #     post-proceso: no comparte resultados con el post-proceso de arriba
 #     (nunca mezclar produccion con variabilidad en el mismo run_statistics.py
@@ -53,8 +56,8 @@
 #
 # La validacion preliminar (tools/validacion_preliminar.sbatch) va primero a
 # proposito: verifica orden de operandos, humo de los tres kernels y los gates
-# K=0/K=1 en minutos. Con afterok, si algo de eso falla NINGUNA campana llega a
-# arrancar -- que es exactamente el punto de tenerla.
+# K=0/K=1 en minutos. Si la validacion falla por OOM, oom_guard.sh permite que
+# la campana continue; si falla por otra causa, las dependencias se bloquean.
 #
 # USO
 # ---
@@ -84,6 +87,7 @@ RUN_FASE2="${RUN_FASE2:-1}"
 RUN_FASE3="${RUN_FASE3:-1}"
 RUN_FASE4="${RUN_FASE4:-1}"
 RUN_POST="${RUN_POST:-1}"
+OOM_FAILURE_LOG="${OOM_FAILURE_LOG:-${REPO_ROOT}/oom_failures_pacca_$(date +%Y%m%d_%H%M%S).log}"
 
 # --- Pase de energia (RUN_KIND=energy), Fase 3/4 de los 3 kernels ------------
 #
@@ -218,13 +222,21 @@ ULTIMO_JID=""
 # enviar <etiqueta> <directorio> <script> [dependencia]
 enviar() {
     local etiqueta="$1" dir="$2" script="$3" dep="${4:-}"
+    local export_values submit_dir submit_script phase_label
     # EXPORT_EXTRA se pega DENTRO del mismo --export=ALL,... (no como un
     # segundo --export): sbatch no documenta que "gana el ultimo" si se pasa
     # --export dos veces, asi que en vez de confiar en eso se arma un solo
     # flag. Es lo que usa el pase de energia para llevar RUN_KIND=energy e
     # ITERS_LIST al job sin tocar la firma de enviar() para todo lo demas.
-    local -a args=(--parsable "--export=ALL${EXPORT_EXTRA:+,${EXPORT_EXTRA}}")
-    [[ -n "${dep}" ]] && args+=(--dependency="afterok:${dep}")
+    export_values="ALL${EXPORT_EXTRA:+,${EXPORT_EXTRA}}"
+    submit_dir="${dir}"
+    submit_script="${script}"
+    if [[ -n "${dep}" ]]; then
+        phase_label="${etiqueta// /_}"
+        export_values+=",OOM_DEP_JOBS=${dep},OOM_FAILURE_LOG=${OOM_FAILURE_LOG},OOM_PHASE_LABEL=${phase_label},BASH_ENV=${REPO_ROOT}/tools/oom_guard.sh"
+    fi
+    local -a args=(--parsable "--export=${export_values}")
+    [[ -n "${dep}" ]] && args+=(--dependency="afterany:${dep}")
     # Sin comillas a proposito: EXTRA_SBATCH_ARGS puede traer varios flags NO
     # relacionados con --export (p.ej. --partition=X del post-proceso).
     # shellcheck disable=SC2206
@@ -235,10 +247,10 @@ enviar() {
         # dry-run se vea igual que el real.
         _DRY_ID=$(( _DRY_ID + 1 ))
         ULTIMO_JID="${_DRY_ID}"
-        echo "[DRY_RUN] (cd ${dir} && sbatch ${args[*]} ${script})  -> ${ULTIMO_JID}"
+        echo "[DRY_RUN] (cd ${submit_dir} && sbatch ${args[*]} ${submit_script})  -> ${ULTIMO_JID}"
     else
-        ULTIMO_JID="$(cd "${dir}" && sbatch "${args[@]}" "${script}")"
-        echo "Enviado ${etiqueta}: job ${ULTIMO_JID}${dep:+ (afterok:${dep})}"
+        ULTIMO_JID="$(cd "${submit_dir}" && sbatch "${args[@]}" "${submit_script}")"
+        echo "Enviado ${etiqueta}: job ${ULTIMO_JID}${dep:+ (afterany:${dep})}"
     fi
     RESUMEN+=("$(printf '%-10s %-34s dep=%s' "${ULTIMO_JID}" "${etiqueta}" "${dep:-ninguna}")")
 }
@@ -312,7 +324,7 @@ cadena_kernel "Stencil"     Fase_3/Stencil     run_stencil_tc.sbatch \
 # --- Campana de variabilidad: replicas para el ANOVA/Tukey ------------------
 # Orquestador aparte (envia sus propios jobs de SLURM y su propio
 # post-proceso encadenado) -- se corre con `bash`, no se integra en la cadena
-# enviar()/afterok de arriba porque maneja su propio grafo de dependencias
+# enviar()/afterany de arriba porque maneja su propio grafo de dependencias
 # internamente. No depende de la validacion preliminar ni de F3/F4: usa un
 # tamano chico y propio (NX=NY=1024 en Stencil, N=1024 en GEMM, HW=64 en
 # Conv), pensado para ser barato y repetirse muchas veces, no para reusar los
@@ -387,9 +399,9 @@ if [[ "${RUN_POST}" == "1" ]]; then
         echo "  se envia sin dependencias, sobre lo que ya haya en results/." >&2
         DEP_POST="${DEP_BASE}"
     else
-        # afterok con varios ids: "afterok:J1:J2:...". Si CUALQUIERA falla, el
-        # post-proceso no arranca -- correcto: un ANOVA sobre una campana
-        # incompleta es peor que no tener ANOVA, porque parece un resultado.
+        # afterany con varios ids: "afterany:J1:J2:...". oom_guard.sh clasifica
+        # cada job y deja pasar solo los fallos de memoria; otros errores
+        # mantienen bloqueado el post-proceso.
         DEP_POST="$(IFS=:; echo "${JOBS_CAMPANA[*]}")"
     fi
     # Se asigna y se limpia a mano en vez de con el prefijo `VAR=... enviar`:

@@ -49,7 +49,7 @@ LOGS_DIR="${LOGS_DIR:-logs}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 mkdir -p "${LOGS_DIR}" "${RESULTS_DIR}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
-RESULTS_LOG="${RESULTS_DIR}/run_${JOB_ID}.log"
+RESULTS_LOG="${LOGS_DIR}/run_${JOB_ID}.log"
 
 # --- Deteccion portable del toolchain (tools/detect_toolchain.sh) --------
 # Corre igual bajo SLURM en PACCA o con `bash` directo en cualquier otra
@@ -86,8 +86,8 @@ NVML_LINK_FLAG="${NVML_LINK_FLAG:--lnvidia-ml}"
 # filas, aunque nvidia-smi funcione perfecto en el mismo nodo.
 NVML_PROBE_BIN="$(mktemp -u)"
 if [[ "${DISABLE_NVML_TELEMETRY:-0}" != "1" ]] &&
-   "${NVCC}" -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
-   echo 'int main(){return 0;}' | "${NVCC}" -x cu - -o "${NVML_PROBE_BIN}" \
+   "${NVCC}" --allow-unsupported-compiler -E -x cu - 2>/dev/null <<< '#include <nvml.h>' >/dev/null &&
+   echo 'int main(){return 0;}' | "${NVCC}" --allow-unsupported-compiler -x cu - -o "${NVML_PROBE_BIN}" \
        ${NVML_LINK_FLAG} -lpthread >/dev/null 2>&1; then
     NVML_FLAGS=(-DUSE_NVML_TELEMETRY "${NVML_LINK_FLAG}" -lpthread)
     echo "NVML habilitado para telemetria GPU (verificado con enlace de prueba)."

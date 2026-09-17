@@ -10,12 +10,107 @@ Los dos extractores son ahora **idénticos** a los de `Fase_3/tools/` (antes `ex
 | `extract_csv_chained.py` | `gemm_chained.cu` y `conv_chained.cu` (Fase 3 y Fase 4) |
 | `gate3_ancla.py` | Validación automatizada del ancla (K=0/K=1), **los tres kernels** |
 | `gate4_medicion.py` | Que `t_iter_ms` y `energy_gpu_j` distingan una ruta de otra — **solo GEMM y Convolución** |
+| `generate_objective_csv.py` | Tablas derivadas para verificar objetivos, gráficas y tablas de resultados |
+| `generate_analysis_figures.py` | Figuras reproducibles desde `analysis_out/*.csv` |
 
 ```bash
 python3 extract_csv.py --input run_123.log --outdir results --job-id 123 --kernel stencil
 python3 extract_csv_chained.py --input run_456.log --outdir results --job-id 456 --kernel gemm
 python3 extract_csv_chained.py --input run_789.log --outdir results --job-id 789 --kernel conv
 ```
+
+## `generate_objective_csv.py` — tablas para verificar los objetivos
+
+Este script analiza los CSV generados por la última campaña sin modificar los
+datos crudos. Busca automáticamente `summary_*.csv` y `drift_*.csv` bajo
+`Fase_3/**/results` y `Fase_4/**/results`, además de los frentes y directrices
+de `pareto_out/`. La salida queda en `analysis_out/`:
+
+```bash
+conda activate prism_env
+python3 Fase_4/tools/generate_objective_csv.py --outdir analysis_out
+```
+
+| Salida | Uso para la evaluación |
+|---|---|
+| `objective_coverage.csv` | Tamaños, formatos, anclas y kernels realmente disponibles; permite detectar huecos de campaña. |
+| `objective_performance_energy.csv` | Tiempo, GFLOP/s, energía, confiabilidad NVML y origen del dato. |
+| `objective_accuracy_drift.csv` | Media/máximo de `rel_l2`/`rel_linf`, iteraciones observadas y finitud. |
+| `objective_anchor_effect.csv` | Comparación directa entre niveles de `anchor_every`. |
+| `objective_pareto_long.csv` | Configuraciones, métricas y pertenencia al frente de Pareto. |
+| `objective_guideline_long.csv` | Configuración recomendada para cada tolerancia de error. |
+| `objective_oom_events.csv` | Fases abortadas por OOM y código de salida. |
+
+Las filas con `energy_window_reliable=0` deben excluirse antes de concluir sobre
+energía o EDP. La ausencia de un kernel en `objective_coverage.csv` se marca
+como `missing`; no se convierte en ceros ni se interpreta como ausencia de
+error. Esto es especialmente importante cuando una malla grande de Stencil
+termina por OOM.
+
+### Caso Stencil con OOM o extracción incompleta
+
+Stencil puede haber ejecutado y emitido `CSV_SUMMARY`, `CSV_DRIFT`,
+`CSV_ENERGY` y otros registros en el log crudo, pero no aparecer en
+`analysis_out/`. La razón es que el extractor se ejecuta al final del
+`.sbatch`; si una malla grande termina por OOM antes de alcanzar ese bloque,
+el log permanece pero los CSV no se crean. Fase 2 también imprime métricas y
+reportes NCU, pero no forma parte del flujo CSV de Fase 3/4.
+
+Para recuperar los datos finitos de Fase 3 desde el log crudo de la campaña:
+
+```bash
+conda activate prism_env
+python3 Fase_3/tools/extract_csv.py \
+    --input Fase_3/Stencil/logs/run_manual.log \
+    --outdir Fase_3/Stencil/results \
+    --job-id manual \
+    --kernel stencil
+```
+
+El extractor conserva las filas disponibles antes del OOM; no convierte el
+OOM en ceros ni inventa filas de las mallas que no terminaron. Después de
+extraer, regenerar las tablas y figuras:
+
+```bash
+python3 Fase_4/tools/generate_objective_csv.py --outdir analysis_out
+python3 Fase_4/tools/generate_analysis_figures.py \
+    --indir analysis_out --outdir analysis_figures
+```
+
+Verificar siempre `analysis_out/objective_coverage.csv` y
+`analysis_out/objective_oom_events.csv`: `stencil=available` significa que
+hay CSV extraídos, mientras que `status=missing` significa que solo existe
+log crudo o que no hubo filas extraíbles. Un OOM documentado es un resultado
+de cobertura de campaña, no evidencia de precisión, rendimiento o energía en
+la configuración fallida.
+
+## `generate_analysis_figures.py` — figuras para el libro
+
+Consume exclusivamente los CSV de `analysis_out/` y escribe PNG en
+`analysis_figures/`. No modifica los datos ni las figuras de `pareto_out/`.
+
+```bash
+conda activate prism_env
+python3 Fase_4/tools/generate_analysis_figures.py \
+    --indir analysis_out --outdir analysis_figures
+```
+
+Genera, cuando existen datos para el kernel correspondiente:
+
+| Figura | Contenido |
+|---|---|
+| `performance_<kernel>.png` | GFLOP/s y tiempo por iteración frente al tamaño. |
+| `accuracy_<kernel>.png` | Error relativo L2 y L∞ máximo. |
+| `energy_edp_<kernel>.png` | Energía GPU y EDP; prioriza ventanas confiables. |
+| `anchor_effect_<kernel>.png` | Costo y rendimiento frente a `anchor_every`. |
+| `pareto_3d_<kernel>.png` | Tiempo, energía, error y frente Pareto. |
+| `coverage_by_kernel.png` | Cobertura de summaries y drift. |
+| `oom_events.png` | Eventos OOM por fase. |
+
+Las figuras energéticas usan `window_reliable` cuando está disponible; si no
+hay ninguna ventana confiable, se generan como diagnóstico y conservan el
+aviso metodológico en el título. La ausencia de datos no se transforma en
+cero: simplemente no se dibuja la figura afectada.
 
 ## `gate3_ancla.py` — las dos puertas del ancla, automatizadas
 

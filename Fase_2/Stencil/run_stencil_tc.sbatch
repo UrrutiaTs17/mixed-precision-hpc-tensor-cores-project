@@ -145,7 +145,11 @@ echo "Compilando stencil_tc..."
 # obsoleto y debe volver a correrse.
 "${NVCC}" -std=c++17 -O3 stencil_tensor_activation.cu -o stencil_tc \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
+    -Xcompiler -fopenmp \
     --allow-unsupported-compiler
+
+# La referencia CPU se paraleliza con OpenMP (ver stencil_tensor_activation.cu).
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"
 
 # Validacion SASS pre-perfilado: si el binario no contiene instrucciones HMMA,
 # las instanciaciones WMMA (FP16 y BF16 emiten ambas HMMA en Ampere) no

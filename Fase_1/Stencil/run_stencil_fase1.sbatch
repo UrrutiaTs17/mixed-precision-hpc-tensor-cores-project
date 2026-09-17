@@ -92,7 +92,13 @@ nvidia-smi || true
 echo "Compilando stencil_baseline..."
 "${NVCC}" -std=c++17 -O3 stencil_baseline.cu -o stencil_baseline \
     -gencode arch=compute_${CUDA_ARCH},code=sm_${CUDA_ARCH} \
+    -Xcompiler -fopenmp \
     --allow-unsupported-compiler
+
+# La referencia CPU se paraleliza con OpenMP (ver stencil_baseline.cu) -- sin
+# esto el numero de hilos queda a la config por defecto del sistema, que no
+# siempre es "todos los cores".
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"
 
 # SMOKE_TEST=1 corre un unico tamano pequeno para validar rapido que el
 # binario compila y ejecuta (por ejemplo tras cambiar de nodo/arquitectura),
