@@ -130,9 +130,56 @@ def write_coverage(summary: pd.DataFrame, drift: pd.DataFrame, pareto: pd.DataFr
     pd.DataFrame(rows).to_csv(out / "objective_coverage.csv", index=False)
 
 
+def collapse_fp64_reference(frame: pd.DataFrame) -> pd.DataFrame:
+    """Promedia las filas GPU_FP64 duplicadas de GEMM/Convolucion.
+
+    run_fp64_reference() (gemm_chained.cu/conv_chained.cu) corre UNA vez por
+    invocacion del binario, y el .sbatch invoca el binario una vez POR VALOR
+    de COMP_LIST (off, on) -- la trayectoria de referencia no depende de la
+    compensacion, asi que dentro de un mismo job_id queda medida y reportada
+    dos veces para el mismo (kernel, size, iters). No es doble conteo de
+    energia DENTRO de una medicion (power_buffer acumula cada segmento una
+    sola vez, ver common/power_sampling.h) -- es la corrida de referencia
+    completa la que se repite. pareto_front.py ya promedia esto via groupby
+    (".mean()"), pero este volcado crudo no agregaba nada y mostraba las dos
+    filas sueltas, facil de leer como si algo se midiera doble.
+    Nota: route_format() en extract_csv_chained.py parte "GPU_FP64" por el
+    ultimo "_" (fmt="GPU", suffix="FP64"), asi que ahi "comp" queda "off"
+    para las dos filas -- la columna que SI distingue de forma confiable la
+    ruta de referencia es "route" ("GPU_FP64" literal), no "format"/"comp".
+    """
+    if frame.empty or "route" not in frame:
+        return frame
+    is_ref = (frame["route"] == "GPU_FP64") & frame["kernel"].isin(["gemm", "conv"])
+    if not is_ref.any():
+        return frame
+    ref = frame[is_ref]
+    rest = frame[~is_ref]
+
+    keys = ["job_id", "kernel", "size", "iters"]
+    agg = {
+        "t_iter_ms": "mean", "t_total_ms": "mean", "gflops": "mean",
+        "energy_gpu_j": "mean", "gpu_segments": "mean",
+        "window_reliable": "min",  # conservador: confiable solo si TODAS las repeticiones lo fueron
+    }
+    agg = {k: v for k, v in agg.items() if k in ref}
+    collapsed = ref.groupby(keys, dropna=False, as_index=False).agg(agg)
+    for col in ("format", "comp", "anchor_every", "route"):
+        if col in ref:
+            collapsed[col] = ref.groupby(keys, dropna=False)[col].first().to_numpy()
+    if "source_csv" in ref:
+        collapsed["source_csv"] = (
+            ref.groupby(keys, dropna=False)["source_csv"]
+            .agg(lambda s: ";".join(sorted(set(s.astype(str)))))
+            .to_numpy()
+        )
+    return pd.concat([rest, collapsed], ignore_index=True)[frame.columns]
+
+
 def write_performance(summary: pd.DataFrame, out: Path) -> None:
     columns = ["job_id", "kernel", "size", "format", "comp", "anchor_every", "route", "iters", "t_iter_ms", "t_total_ms", "gflops", "energy_gpu_j", "window_reliable", "gpu_segments", "source_csv"]
     frame = summary[[c for c in columns if c in summary]].copy() if not summary.empty else pd.DataFrame(columns=columns)
+    frame = collapse_fp64_reference(frame)
     frame.to_csv(out / "objective_performance_energy.csv", index=False)
 
 
