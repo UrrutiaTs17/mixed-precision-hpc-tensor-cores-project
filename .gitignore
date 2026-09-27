@@ -42,6 +42,10 @@ dist/
 !**/README.md
 !REQUIREMENTS.md
 !docs/MANUAL.md
+# Pre-registro de campana (commit obligatorio antes de cualquier sbatch,
+# ver DECISIONS.md): excepcion puntual, no relaja la politica de arriba.
+!DECISIONS.md
+!MANIFIESTO.md
 
 # IDEs
 .vscode/
