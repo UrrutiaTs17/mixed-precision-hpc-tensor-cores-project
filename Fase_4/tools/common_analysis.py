@@ -152,15 +152,28 @@ def load_stencil_summary(paths: Iterable[str]) -> pd.DataFrame:
 
 
 def load_stencil_energy(paths: Iterable[str]) -> pd.DataFrame:
-    """Carga energy_stencil_*.csv y devuelve (job_id, route, energy_gpu_j_per_iter,
-    energy_window_reliable) para unir con load_stencil_summary()."""
+    """Carga energy_stencil_*.csv y devuelve (job_id, route, size, anchor_every,
+    iters, energy_gpu_j_per_iter, energy_window_reliable) para unir con
+    load_stencil_summary().
+
+    Antes solo llevaba (job_id, route): un mismo job_id barre varias mallas
+    NX Y varios anchor_every para la MISMA route (igual que el bug ya
+    corregido en load_chained_drift/merge_drift_into_chained para GEMM/Conv)
+    -- sin size/anchor_every/iters en la clave, el merge hacia fan-out y le
+    pegaba la energia de una malla/ancla a las demas filas que compartieran
+    job_id+route. energy_stencil_*.csv (CSV_ENERGY) SI trae nx/anchor_every/
+    iters por fila -- antes se descartaban al cargar."""
     frames = [pd.read_csv(p, dtype=str) for p in paths]
     if not frames:
-        return pd.DataFrame(columns=["job_id", "route", "energy_gpu_j_per_iter", "energy_window_reliable"])
+        return pd.DataFrame(columns=["job_id", "route", "size", "anchor_every", "iters",
+                                      "energy_gpu_j_per_iter", "energy_window_reliable"])
     raw = pd.concat(frames, ignore_index=True)
     out = pd.DataFrame()
     out["job_id"] = raw["job_id"]
     out["route"] = raw["route"]
+    out["size"] = pd.to_numeric(raw["nx"], errors="coerce")
+    out["anchor_every"] = pd.to_numeric(raw.get("anchor_every", 0), errors="coerce").fillna(0).astype(int)
+    out["iters"] = pd.to_numeric(raw["iters"], errors="coerce")
     out["energy_gpu_j_per_iter"] = pd.to_numeric(raw.get("energy_gpu_j_per_iter"), errors="coerce")
     out["energy_window_reliable"] = raw.get("energy_window_reliable")
     return out
@@ -199,44 +212,82 @@ def load_chained_summary(paths: Iterable[str], kernel: str) -> pd.DataFrame:
 
 
 def load_chained_drift(paths: Iterable[str], kernel: str) -> pd.DataFrame:
-    """Carga drift_{gemm,conv}_*.csv -- (job_id, route, size, iter, rel_l2,
-    rel_linf) para unir con load_chained_summary() por (job_id, route, size).
-    Se queda con la ULTIMA fila de drift por (job_id, route, size) -- el
-    error final de la corrida, comparable con el t_iter_ms/energia agregados
-    de todo el barrido de iteraciones que reporta el summary."""
+    """Carga drift_{gemm,conv}_*.csv -- (job_id, route, size, anchor_every,
+    iters, rel_l2, rel_linf) para unir con load_chained_summary().
+
+    NO colapsa por (job_id, route, size) tomando la ultima fila: dentro de
+    UNA sola corrida (un job_id) el barrido tipico incluye varios tamanos Y
+    varios niveles de anchor_every para la MISMA route ("FP16_comp" no trae
+    el K en el nombre, es una columna aparte) -- agrupar sin anchor_every
+    (y, con nuestra ejecucion dentro del holder compartiendo job_id entre
+    pasada normal y de energia, tambien sin iters) hacia que TODOS los
+    niveles de ancla y AMBAS pasadas recibieran el mismo rel_l2 "ganador"
+    (el de mayor iter entre TODO lo que compartiera job_id+route), en vez
+    del propio de cada config -- confirmado con datos reales de la campana
+    validada (job 6927): rel_l2 identico para K=0/1/5/20 a N=8192, con
+    t_iter_ms si distinto por K. En vez de eso, se conserva "iter" tal cual
+    (renombrado a "iters") y el merge exige tambien igualdad de iters -- el
+    binario siempre escribe un checkpoint en la ULTIMA iteracion (es_checkpoint
+    tiene el gatillo incondicional iter==opt.iters), asi que cada fila de
+    summary encuentra exactamente su propio checkpoint final, sin mezclarse
+    con otro tamano, otro K ni otra pasada (normal vs energia)."""
     frames = [pd.read_csv(p, dtype=str) for p in paths]
     if not frames:
-        return pd.DataFrame(columns=["job_id", "route", "size", "rel_l2", "rel_linf"])
+        return pd.DataFrame(columns=["job_id", "route", "size", "anchor_every", "iters", "rel_l2", "rel_linf"])
     raw = pd.concat(frames, ignore_index=True)
-    raw["iter"] = pd.to_numeric(raw["iter"], errors="coerce")
-    raw = raw.sort_values("iter").groupby(["job_id", "route", "size"], as_index=False).last()
     out = pd.DataFrame()
     out["job_id"] = raw["job_id"]
     out["route"] = raw["route"]
     out["size"] = pd.to_numeric(raw["size"], errors="coerce")
+    out["anchor_every"] = pd.to_numeric(raw.get("anchor_every", 0), errors="coerce").fillna(0).astype(int)
+    out["iters"] = pd.to_numeric(raw["iter"], errors="coerce")
     out["rel_l2"] = pd.to_numeric(raw["rel_l2"], errors="coerce")
     out["rel_linf"] = pd.to_numeric(raw["rel_linf"], errors="coerce")
+    # Si por lo que sea el binario escribiera mas de un checkpoint en la
+    # misma iteracion final (no deberia), se conserva uno solo por clave.
+    out = out.sort_values("iters").groupby(
+        ["job_id", "route", "size", "anchor_every", "iters"], as_index=False, dropna=False
+    ).last()
     return out
 
 
 def merge_energy_into_stencil(summary: pd.DataFrame, energy: pd.DataFrame) -> pd.DataFrame:
     if energy.empty:
         return summary
+    # Clave (job_id, route, size, anchor_every) -- SIN "iters" a proposito,
+    # a diferencia de merge_drift_into_chained (GEMM/Conv). Ahi error y
+    # energia salen de la MISMA invocacion (mismo iters); en Stencil son dos
+    # PASADAS DISTINTAS por diseno -- RUN_KIND=energy fuerza
+    # CHECKPOINT_EVERY=0, y checkpoint_due() (unico gatillo de
+    # record_checkpoint en Stencil, sin la clausula incondicional de ultima
+    # iteracion que si tiene es_checkpoint() en GEMM/Conv) nunca es cierto
+    # ahi -- el pase de energia de Stencil NO emite NINGUNA fila de drift,
+    # nunca, en ninguna ruta (confirmado con datos reales, ver la nota de
+    # cabecera del proyecto). Pedir "iters" igual aqui (como en el primer
+    # intento de este fix) dejaba el join vacio SIEMPRE: 0 filas con los 3
+    # ejes (t_iter_ms, energia, rel_l2) simultaneamente validos, y por tanto
+    # el frente de Pareto de Stencil salia vacio (0/300 configuraciones,
+    # confirmado tras correr postproceso.sbatch). Sin "iters", la energia
+    # confiable de la pasada de energia (una fila por config) se pega a
+    # TODAS las filas de la pasada numerica que compartan
+    # (route,size,anchor_every) sin importar a que iters se cronometraron
+    # -- razonable porque energy_gpu_j_per_iter es una TASA por iteracion,
+    # no depende de cuantas iteraciones corrio esa pasada en particular.
     merged = summary.drop(columns=["energy_gpu_j_per_iter", "energy_window_reliable"]).merge(
-        energy, on=["job_id", "route"], how="left")
+        energy.drop(columns=["iters"]), on=["job_id", "route", "size", "anchor_every"], how="left")
     return merged[NORMALIZED_COLUMNS]
 
 
 def merge_drift_into_chained(summary: pd.DataFrame, drift: pd.DataFrame) -> pd.DataFrame:
     if drift.empty:
         return summary
+    # Clave completa: job_id+route NO identifica una fila unica cuando la
+    # corrida barre varios tamanos y/o varios anchor_every (ver la nota en
+    # load_chained_drift) -- size, anchor_every e iters tienen que entrar
+    # todos al merge, si no, filas de configuraciones distintas se
+    # contaminan entre si (rel_l2 de un K o un tamano aplicado a otro).
     merged = summary.drop(columns=["rel_l2", "rel_linf"]).merge(
-        drift.drop(columns=["size"]).rename(columns={}),
-        on=["job_id", "route"], how="left")
-    # El merge de arriba no incluye "size" en las claves porque drift.size
-    # es redundante con summary.size (misma corrida) y a veces llega como
-    # string/num distinto tras el groupby -- se preserva la columna size
-    # ORIGINAL de summary, no la de drift.
+        drift, on=["job_id", "route", "size", "anchor_every", "iters"], how="left")
     return merged[NORMALIZED_COLUMNS]
 
 
