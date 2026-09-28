@@ -308,6 +308,49 @@ def build_stencil() -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # Replicas r1..r8 (F3)
 # ----------------------------------------------------------------------------
+def build_replicas_stencil() -> pd.DataFrame:
+    """Analogo a build_replicas() para Stencil (Paso F7 -- variabilidad).
+
+    No existia antes: build_replicas(gemm/conv) usa summary+drift de rutas
+    '*_comp'; Stencil no tiene un drift_stencil_*.csv con K (el summary YA
+    trae rel_l2/rel_l2_prop/first_nonfinite por fila, ver build_stencil()),
+    y sus candidatos de precision reducida son las rutas '*_SP' (compensacion
+    espacial), no '*_comp'. h=CONFIG["H_CHAINED"]=40 esta disponible en esta
+    campana de variabilidad (verificado contra los CSV crudos: iters in
+    {20,40}), igual que GEMM/Conv -- se reusa el mismo horizonte para poder
+    comparar los tres kernels en una misma figura (F7).
+    """
+    kernel = "stencil"
+    d_ = KERNEL_DIR[kernel]
+    s, _ = read_csvs(f"{F4}/{d_}/results/variabilidad/r*/summary_stencil_*.csv")
+    h = CONFIG["H_CHAINED"]
+    s = s[(s["iters"] == h) & s["route"].str.endswith("_SP")].copy()
+    s["rep"] = s["job_id"].str.extract(r"-r(\d+)$")[0].astype(int)
+    check(s["rep"].nunique() == 8, f"{kernel}: 8 replicas rN en variabilidad")
+    check(s.groupby(["rep", "route", "anchor_every"]).size().max() == 1, f"{kernel}: 1 medicion por (rN,ruta,K) a h={h} (n_raw=1)")
+    # error: rel_l2_prop (estado propagado en precision reducida, mismo criterio
+    # que build_stencil()); finito solo si first_nonfinite==-1 Y rel_l2_prop es
+    # numerico -- verificado contra los CSV crudos: WMMA_FP16_SP diverge antes
+    # de h=40 en las 8 replicas y los 3 K (first_nonfinite=29); WMMA_BF16_SP
+    # siempre finito.
+    s["finite"] = (s["first_nonfinite"] == -1) & np.isfinite(s["rel_l2_prop"])
+    fin_by_cfg = s.groupby(["route", "anchor_every"])["finite"].min().rename("finite").reset_index()
+    fin_keys = set(zip(fin_by_cfg.loc[fin_by_cfg["finite"], "route"], fin_by_cfg.loc[fin_by_cfg["finite"], "anchor_every"]))
+    only_finite = s[[(r, k) in fin_keys for r, k in zip(s["route"], s["anchor_every"])]]
+    nuniq = only_finite.groupby(["route", "anchor_every"])["rel_l2_prop"].nunique()
+    check((nuniq <= 1).all(), f"{kernel}: error determinista identico en las 8 replicas a h={h} (donde finito)")
+    out = s[["rep", "route", "anchor_every", "t_iter_ms", "iters", "rel_l2_prop"]].rename(columns={"rel_l2_prop": "rel_l2"})
+    out = out.merge(fin_by_cfg, on=["route", "anchor_every"], how="left")
+    out["format"] = out["route"].str.split("_").str[1]
+    out["kernel"] = kernel
+    out["size"] = s["nx"].iloc[0]
+    out.loc[~out["finite"], "rel_l2"] = np.nan
+    out["solution_finite"] = out["finite"].map({True: 1, False: 0})
+    out["exclusion_reason"] = np.where(out["finite"], "", "non_finite")
+    out["energy"] = np.nan   # r1..r8 sin ventanas fiables (igual que gemm/conv)
+    return out.drop(columns=["finite"])
+
+
 def build_replicas(kernel: str) -> pd.DataFrame:
     d_ = KERNEL_DIR[kernel]
     fn = "gemm" if kernel == "gemm" else "conv"
@@ -390,6 +433,7 @@ def main() -> None:
                  f"{len(nonfin)} FP16 no finitas en N={sorted(nonfin['size'].unique())}. F1 (figura congelada) no se modifica.")
 
     reps = {k: build_replicas(k) for k in ("gemm", "conv")}
+    reps["stencil"] = build_replicas_stencil()
     summarize(tables)
 
     # -------- Escritura

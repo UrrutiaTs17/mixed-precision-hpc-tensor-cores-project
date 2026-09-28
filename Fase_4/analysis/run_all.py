@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-for step in ("build_canonical.py", "fig3_anchor.py", "fig4_speedup.py", "fig5_edp.py", "fig6_pareto.py"):
+for step in ("build_canonical.py", "fig3_anchor.py", "fig4_speedup.py", "fig5_edp.py", "fig6_pareto.py",
+            "fig7_variability.py", "fig8_stencil_anchor.py"):
     print(f"\n=== {step} ===", flush=True)
     r = subprocess.run([sys.executable, str(HERE / step)])
     if r.returncode != 0:
