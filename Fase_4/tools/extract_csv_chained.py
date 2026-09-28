@@ -34,17 +34,23 @@ import argparse
 import csv
 import os
 import re
+import sys
 
 
 DRIFT_HEADER = [
     "job_id", "kernel", "size", "format", "comp", "anchor_every",
     "route", "iter", "rel_l2", "rel_linf", "solution_finite",
+    # Campana corregida (DECISIONS.md S4-S5): las dos primeras las emite el
+    # binario (Fase_4/*_chained.cu, tras anchor_every); si el log es anterior se
+    # DERIVAN de solution_finite. device/comp_scheme siempre se derivan.
+    "error_evaluable", "motivo_exclusion", "device", "comp_scheme",
 ]
 
 SUMMARY_HEADER = [
     "job_id", "kernel", "size", "format", "comp", "anchor_every", "route",
     "iters", "t_iter_ms", "t_total_ms", "gflops", "energy_gpu_j",
     "window_reliable", "gpu_segments",
+    "device", "gpu_valid", "comp_scheme",
 ]
 
 # GEMM: "N=1024 iters=20 comp=off checkpoint_every=0 anchor_every=5 (activa)"
@@ -57,12 +63,23 @@ CONV_HEADER_RE = re.compile(
 )
 
 
+NONFINITE_TOKENS = {"NONFINITE", "NA", "NAN", "-NAN", "+NAN", "NO_EVALUABLE",
+                    "INF", "+INF", "-INF"}
+
+
 def clean(value):
     value = value.strip()
     upper = value.upper()
-    if value == "" or upper in {"NONFINITE", "NA", "NAN", "NO_EVALUABLE", "INF", "+INF", "-INF"}:
+    if value == "" or upper in NONFINITE_TOKENS:
         return "NaN"
     return value
+
+
+def comp_scheme_de(suffix):
+    """GEMM/Conv solo tienen dos esquemas: "local" (ruta _comp, compensacion
+    local del residuo de almacenamiento) y "none" (todo lo demas, incluida la
+    referencia GPU_FP64)."""
+    return "local" if suffix == "comp" else "none"
 
 
 def pad(fields, expected):
@@ -104,8 +121,12 @@ def update_context_from_header(line, context):
 # linea, y numero total de campos que trae una linea que SI la lleva.
 DRIFT_ANCHOR_IDX = 7
 DRIFT_FIELDS = 8
+DRIFT_ERROR_EVALUABLE_IDX = 8
+DRIFT_MOTIVO_IDX = 9
+DRIFT_TOKENS_FULL = 10   # con error_evaluable y motivo_exclusion (binarios de campana)
 SUMMARY_ANCHOR_IDX = 10
 SUMMARY_FIELDS = 11
+SUMMARY_TOKENS_FULL = 11
 
 
 def anchor_every_de_fila(parts, idx, context, suffix):
@@ -126,12 +147,29 @@ def anchor_every_de_fila(parts, idx, context, suffix):
     return context["anchor_every"] if suffix == "comp" else "0"
 
 
-def handle_drift(parts, rows, context, job_id, kernel):
+def handle_drift(parts, rows, context, job_id, kernel, saneados):
     crudas = parts  # sin rellenar: pad() taparia la ausencia de anchor_every
     parts = pad(parts, DRIFT_FIELDS)
     route = clean(parts[1])
     fmt, suffix = route_format(route)
     anchor = anchor_every_de_fila(crudas, DRIFT_ANCHOR_IDX, context, suffix)
+    rel_l2, rel_linf = clean(parts[4]), clean(parts[5])
+    finite = clean(parts[6])
+
+    if len(crudas) > DRIFT_MOTIVO_IDX:
+        evaluable = clean(crudas[DRIFT_ERROR_EVALUABLE_IDX])
+        motivo = crudas[DRIFT_MOTIVO_IDX].strip() or "ok"
+    else:
+        # Log anterior a las columnas: se derivan de solution_finite.
+        evaluable = "1" if finite == "1" else "0"
+        motivo = "ok" if finite == "1" else "solution_non_finite"
+    # Un log viejo (metrics.cuh anterior al fix) trae un rel_l2 NUMERICO calculado
+    # solo sobre los puntos finitos aunque solution_finite=0: no es "error", es
+    # un valor parcial. Se anula (NaN) y se cuenta -- nunca 0.0 ni un parcial.
+    if evaluable == "0" and (rel_l2 != "NaN" or rel_linf != "NaN"):
+        rel_l2, rel_linf = "NaN", "NaN"
+        saneados[0] += 1
+
     rows.append({
         "job_id": job_id,
         "kernel": kernel,
@@ -141,9 +179,13 @@ def handle_drift(parts, rows, context, job_id, kernel):
         "anchor_every": anchor,
         "route": route,
         "iter": clean(parts[3]),
-        "rel_l2": clean(parts[4]),
-        "rel_linf": clean(parts[5]),
-        "solution_finite": clean(parts[6]),
+        "rel_l2": rel_l2,
+        "rel_linf": rel_linf,
+        "solution_finite": finite,
+        "error_evaluable": evaluable,
+        "motivo_exclusion": motivo,
+        "device": "gpu",
+        "comp_scheme": comp_scheme_de(suffix),
     })
 
 
@@ -168,6 +210,11 @@ def handle_summary(parts, rows, context, job_id, kernel):
         "energy_gpu_j": clean(parts[7]),
         "window_reliable": clean(parts[8]),
         "gpu_segments": clean(parts[9]),
+        "device": "gpu",
+        # gpu_valid: el binario imprime NaN en energy_gpu_j cuando la captura NVML
+        # de la ventana no fue valida (energy_field en gemm/conv_chained.cu).
+        "gpu_valid": "0" if clean(parts[7]) == "NaN" else "1",
+        "comp_scheme": comp_scheme_de(suffix),
     })
 
 
@@ -176,6 +223,8 @@ def read_log(path, job_id, kernel):
                "checkpoint_every": "NaN", "anchor_every": "0"}
     drift_rows = []
     summary_rows = []
+    saneados = [0]
+    tokens = {"CSV_DRIFT": {}, "CSV_SUMMARY": {}}
 
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for raw_line in handle:
@@ -185,12 +234,14 @@ def read_log(path, job_id, kernel):
             if not parts:
                 continue
             token = parts[0]
+            if token in tokens:
+                tokens[token][len(parts)] = tokens[token].get(len(parts), 0) + 1
             if token == "CSV_DRIFT":
-                handle_drift(parts, drift_rows, context, job_id, kernel)
+                handle_drift(parts, drift_rows, context, job_id, kernel, saneados)
             elif token == "CSV_SUMMARY":
                 handle_summary(parts, summary_rows, context, job_id, kernel)
 
-    return drift_rows, summary_rows
+    return drift_rows, summary_rows, tokens, saneados[0]
 
 
 def write_csv(path, header, rows):
@@ -208,10 +259,13 @@ def main():
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--kernel", required=True, choices=["gemm", "conv"])
+    parser.add_argument("--strict-schema", action="store_true",
+                        help="abortar si alguna linea CSV_* no trae el numero completo de campos "
+                             "(DRIFT_TOKENS_FULL/SUMMARY_TOKENS_FULL); para logs de la campana corregida")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
-    drift_rows, summary_rows = read_log(args.input, args.job_id, args.kernel)
+    drift_rows, summary_rows, tokens, saneados = read_log(args.input, args.job_id, args.kernel)
 
     outputs = [
         (os.path.join(args.outdir, "drift_%s_%s.csv" % (args.kernel, args.job_id)), DRIFT_HEADER, drift_rows),
@@ -220,6 +274,22 @@ def main():
     for path, header, rows in outputs:
         write_csv(path, header, rows)
         print("[extract_csv_chained] %s: %d filas" % (path, len(rows)))
+    if saneados:
+        print("[extract_csv_chained] %d filas de drift con solution_finite=0 traian un rel_l2 "
+              "numerico parcial (log anterior al fix de metrics.cuh): anulado a NaN." % saneados)
+
+    fallos = []
+    for token, completo in (("CSV_DRIFT", DRIFT_TOKENS_FULL), ("CSV_SUMMARY", SUMMARY_TOKENS_FULL)):
+        for n_tokens, n_lineas in sorted(tokens[token].items()):
+            print("[extract_csv_chained] esquema %s: %d lineas con %d campos%s"
+                  % (token, n_lineas, n_tokens, "" if n_tokens == completo else " (!= %d)" % completo))
+            if args.strict_schema and n_tokens != completo:
+                fallos.append("esquema %s: %d lineas con %d campos, se esperaban %d"
+                              % (token, n_lineas, n_tokens, completo))
+    for fallo in fallos:
+        print("[extract_csv_chained] FALLO: " + fallo, file=sys.stderr)
+    if fallos:
+        sys.exit(3)
 
 
 if __name__ == "__main__":
