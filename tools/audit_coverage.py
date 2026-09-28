@@ -57,6 +57,7 @@ A8_SIZES = [4096, 8192, 16384]
 A8_K = [0, 1, 8, 32]
 A8_ALPHA = 0.1875
 RELIABLE_MIN = 0.90
+NUMERIC_MAX_ITER = 80      # checkpoints del pase numerico de GEMM/Conv (20/40/80); los de energia son >= 500
 
 KERNEL_FILE = {"gemm": "gemm", "conv": "conv", "stencil": "stencil"}
 
@@ -210,6 +211,17 @@ def energy_rows(kernel, k):
     return r
 
 
+def _es_stress(data, kernel, cfg):
+    """True si la configuracion Stencil corrio con el operador 'stress' (amplificante)."""
+    if kernel != "stencil":
+        return False
+    s = data["stencil"]["S"]
+    if s is None or s.empty or "op_mode" not in s:
+        return False
+    sub = s[(s["route"] == cfg["route"]) & (s["size"] == cfg["size"]) & (s["K"] == cfg["K"])]
+    return bool((sub["op_mode"] == "stress").any())
+
+
 def error_points(kernel, k):
     """Puntos de error por (route,size,K,comp,iter): finito/evaluable/valor/motivo."""
     if kernel == "stencil":
@@ -284,8 +296,15 @@ def run_asserts(data, args):
                 continue
             etiqueta = "%s/%s/%s/K=%s/%s" % (kn, c["route"], c["size"], c["K"], c["comp_scheme"])
             en_energia = sub[sub["iter"].isin(e_it)] if not sub.empty else sub
-            if en_energia is not None and not en_energia.empty and (en_energia["motivo"] == "reference_non_finite").any():
-                exentas.append(etiqueta + "  [referencia FP64 desborda a los iters energeticos %s]" % sorted(e_it))
+            # Exencion fisica: en los operadores AMPLIFICANTES (GEMM c*H con factor sqrt(N),
+            # Convolucion x2, Stencil operador "stress") la referencia FP64 o la solucion de 16
+            # bits desbordan antes de los iters energeticos. En el difusivo alpha=3/16
+            # (contractivo) eso NO se exime: seria un fallo real.
+            amplificante = kn in ("gemm", "conv") or _es_stress(data, kn, c)
+            if amplificante and en_energia is not None and not en_energia.empty and \
+                    en_energia["motivo"].isin(["reference_non_finite", "solution_non_finite"]).any():
+                causa = "referencia FP64" if (en_energia["motivo"] == "reference_non_finite").any() else "solucion de 16 bits"
+                exentas.append(etiqueta + "  [%s desborda a los iters energeticos %s: operador amplificante]" % (causa, sorted(e_it)))
             elif sub.empty or not sub["ok"].any():
                 vacias.append(etiqueta + "  [sin error evaluable en ningun iters]")
             else:
@@ -295,19 +314,19 @@ def run_asserts(data, args):
     else:
         fallan = vacias if args.a2_policy == "explained" else vacias + exentas
         r.set("FAIL" if fallan else "PASS",
-              "%d configuraciones evaluadas; %d sin interseccion (%d exentas por desbordamiento de la referencia FP64, "
-              "politica=%s)" % (total, len(vacias) + len(exentas), len(exentas), args.a2_policy),
+              "%d configuraciones evaluadas; %d sin interseccion (%d exentas: desbordamiento de la referencia FP64 o de "
+              "la solucion de 16 bits en un operador amplificante; politica=%s)" % (total, len(vacias) + len(exentas), len(exentas), args.a2_policy),
               vacias + ["(exenta) " + x for x in exentas])
     results.append(r)
 
     # ---- A3 -------------------------------------------------------------
-    r = Res("A3", "GEMM N=8192: >= 1 ruta con solucion finita y error evaluable")
-    if "gemm" not in data or data["gemm"]["D"] is None or data["gemm"]["D"].empty or \
-            not (data["gemm"]["D"]["size"] == 8192).any():
-        r.set("N/A", "sin drift de GEMM N=8192 en estos resultados")
+    r = Res("A3", "GEMM N=8192: >= 1 ruta con solucion finita y error evaluable en el horizonte numerico (iter <= %d)" % NUMERIC_MAX_ITER)
+    d0 = data["gemm"]["D"] if "gemm" in data else None
+    if d0 is None or d0.empty or not ((d0["size"] == 8192) & (d0["iter"] <= NUMERIC_MAX_ITER)).any():
+        r.set("N/A", "sin drift numerico de GEMM N=8192 en estos resultados")
     else:
-        d = data["gemm"]["D"]
-        d = d[(d["size"] == 8192) & (~d["route"].isin(EXACT_REFERENCES)) & (d["ev"] == 1) & (d["sf"] == 1) & (d["rel"] > 0)]
+        d = d0[(d0["size"] == 8192) & (d0["iter"] <= NUMERIC_MAX_ITER)]
+        d = d[(~d["route"].isin(EXACT_REFERENCES)) & (d["ev"] == 1) & (d["sf"] == 1) & (d["rel"] > 0)]
         rutas = sorted(d["route"].unique())
         r.set("PASS" if rutas else "FAIL", "rutas finitas y evaluables en N=8192: %s" % (rutas or "ninguna"))
     results.append(r)

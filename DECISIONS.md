@@ -205,3 +205,32 @@ implementó lo decidido.
    aún: se valida en PACCA con `SMOKE_TEST=1`), extractores, `tools/audit_coverage.py`,
    `Fase_4/Stencil/run_stencil_tc.sbatch`. **Pendiente:** `run_gemm_chained.sbatch` y
    `run_conv_chained.sbatch` (modo estricto/ARCHIVE_DIR/auditoría), lanzador de la campaña.
+
+8. **Ampliación de K del ancla (2026-09-28, pre-registrada ANTES de lanzar estos jobs).** La
+   campaña original barre solo tres K no nulos por kernel (Stencil 1, 8, 32; GEMM/Conv 1, 5, 20),
+   pocos niveles para la regresión de K como variable ordinal (`log(K+1)`) y para la guía por
+   tolerancia. Ningún binario limita K más allá de `K >= 0` (el ancla exige `--comp on` en
+   GEMM/Conv y `--spatial-comp on` en Stencil). Costo medido en 7145 (t_iter relativo a K=0, BF16,
+   pase dedicado): GEMM 1.03–1.33×, Conv 0.86–1.03×, Stencil 3.0–3.3× (K=1), 1.7–1.8× (K=8), 1.6×
+   (K=32). Se añaden, sin retirar ni cambiar nada de lo anterior:
+   - **Stencil `alpha=3/16`** (grupo `kext`, `SPATIAL_COMP=on`, `CPU_FP64=off` porque la referencia
+     ya sale en el grupo `sp`): `K ∈ {2, 4, 16, 64, 128}`, mismas cinco pasadas (numérica corta,
+     numérica a la ventana S y L, energía S y L). Con `sp`, la escala completa queda
+     `{0, 1, 2, 4, 8, 16, 32, 64, 128}`. Un K mayor que los `iters` de la pasada no ancla nunca
+     (p. ej. 64 y 128 solo actúan en las ventanas de 1500/4000 y en `iters` ≥ 100): es esperado,
+     no un defecto.
+   - **GEMM y Convolución** (campaña completa de Fase 4 con el binario corregido, en un solo
+     barrido, sin duplicar K): `ANCHOR_LIST = {0, 1, 2, 5, 10, 20, 40}` (nuevos: 2, 10, 40).
+     Numérica `20 40 80` + energía dedicada por cola (GEMM: N=1024,2048 → 24000; N=4096,8192 →
+     500; Conv: HW=64,128 → 37000; HW=256,512 → 2500). El pase de energía de GEMM/Conv ya emite
+     el error final (checkpoint incondicional de la última iteración), así que no hacen falta
+     pasadas numéricas a la ventana como en Stencil.
+   - **Sin cambios** en A1–A8: A8 sigue exigiendo la matriz `{0, 1, 8, 32}` (las K nuevas son
+     aditivas). Los K nuevos de `kext` van en un checkout aparte (`~/campana_v2b`) para no alterar
+     el código que ejecutan los jobs 7716–7725 ya encolados.
+   - **Variabilidad (8 réplicas):** se hará con la escala ampliada (GEMM/Conv `{0,1,2,5,10,20}`,
+     Stencil `{0,1,2,4,8}` en su invocación spatial); se pre-registra aquí y se lanza después.
+   - **Gate:** `audit_coverage.py` amplía la exención física de A2 a GEMM/Conv y a Stencil
+     `stress` cuando lo que desborda a los iters energéticos es la referencia FP64 **o** la
+     solución de 16 bits (operadores amplificantes); en `alpha=3/16` (contractivo) no se exime.
+     A3 se evalúa solo en el horizonte numérico (`iter ≤ 80`).
