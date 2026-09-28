@@ -36,7 +36,8 @@ K_CHAINED_ALL="${K_CHAINED_ALL:-0 1 2 5 10 20 40}"
 ALPHA_CAMPANA="0.1875"
 
 TIER_S_NX="4096";        TIER_S_ITERS="4000"
-TIER_L_NX="8192 16384";  TIER_L_ITERS="1500"
+TIER_L_NX="${TIER_L_NX:-8192 16384}";  TIER_L_ITERS="1500"
+NX_CORTA="${NX_CORTA:-4096 8192 16384}"   # mallas del barrido numerico corto
 NUM_ITERS_CORTA="10 50 100 120"
 CKPT_CORTA="5"
 CKPT_VENTANA_S="500"
@@ -99,7 +100,7 @@ paso_stencil() {
     esac
     case "${p}" in
         num_corta) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
-            RUN_KIND=numeric "NX_LIST=4096 8192 16384" "ITERS_LIST=${NUM_ITERS_CORTA}" "CHECKPOINT_EVERY=${CKPT_CORTA}" ;;
+            RUN_KIND=numeric "NX_LIST=${NX_CORTA}" "ITERS_LIST=${NUM_ITERS_CORTA}" "CHECKPOINT_EVERY=${CKPT_CORTA}" ;;
         num_S) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
             RUN_KIND=numeric "NX_LIST=${TIER_S_NX}" "ITERS_LIST=${TIER_S_ITERS}" "CHECKPOINT_EVERY=${CKPT_VENTANA_S}" ;;
         num_L) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
