@@ -119,11 +119,15 @@ def marker_for(row) -> str:
 
 
 def plot_group(pts: pd.DataFrame, kernel: str, h: int, mode: str) -> None:
+    # Sin panel 3D: F9 (fig9_pareto2d_color.py) ya es la adecuacion 2D de
+    # portada; mantener aqui un 3D "de contexto" ademas de esa adecuacion era
+    # redundante (senalado por el usuario). F6 queda en 3 columnas (solo las
+    # proyecciones 2D con dominancia real).
     g = pts[(pts.kernel == kernel) & (pts.horizon == h)]
     sizes = sorted(g["size"].unique())
-    fig = plt.figure(figsize=(17, 3.6 * len(sizes) + 1))
-    gs = fig.add_gridspec(len(sizes), 4, width_ratios=[1, 1, 1, .8])
-    front_col, idx_col = f"on_front_{mode}", f"front_index_{mode}"
+    fig = plt.figure(figsize=(13.5, 3.6 * len(sizes) + 1))
+    gs = fig.add_gridspec(len(sizes), 3)
+    front_col = f"on_front_{mode}"
     lbl = op_label(load_canonical(kernel)) if kernel == "stencil" else None
     proj = [("T_ms", "E_J", "T por iteración [ms]", "E_GPU por iteración [J]"),
             ("T_ms", "rel_l2", "T por iteración [ms]", "error rel. L2 (h)"),
@@ -154,15 +158,7 @@ def plot_group(pts: pd.DataFrame, kernel: str, h: int, mode: str) -> None:
                 if len(ref):
                     tr = (cand["T_ms"].min() * .8, max(cand["T_ms"].max(), refs["T_ms"].max() if len(refs) else 0) * 1.25)
                     isocurves(ax, tr, ref["EDP_ref_Js"].iloc[0] * 1000.0)   # T en ms -> E = 1000*c/T_ms
-        ax3 = fig.add_subplot(gs[ri, 3], projection="3d")
-        for _, r in cand.iterrows():
-            ax3.scatter(np.log10(r["T_ms"]), np.log10(r["E_J"]), r["err_obj"], marker=K_MARKER[int(r.K_efectivo)], s=40,
-                        c=[[0.8, 0.47, 0.65] if r[idx_col] == 1 else [0.55 + 0.1 * min(r[idx_col], 4)] * 3], edgecolor=FORMAT_COLOR[r["format"]])
-            ax3.text(np.log10(r["T_ms"]), np.log10(r["E_J"]), r["err_obj"], str(int(r[idx_col])), fontsize=6)
-        ax3.view_init(elev=22, azim=-58)
-        ax3.set_xticklabels([]); ax3.set_yticklabels([]); ax3.set_zticklabels([])
-        ax3.set_title("3D (contexto): número = índice de frente", fontsize=7)
-    hd = [Line2D([0], [0], marker="o", ls="", mfc=FRONT_C, mec="k", label="frente 3D"),
+    hd = [Line2D([0], [0], marker="o", ls="", mfc=FRONT_C, mec="k", label="frente (T, E, error)"),
           Line2D([0], [0], marker="o", ls="", mfc=DOM_C, mec="k", label="dominado"),
           Line2D([0], [0], color=FORMAT_COLOR["FP16"], lw=3, label="borde FP16"), Line2D([0], [0], color=FORMAT_COLOR["BF16"], lw=3, label="borde BF16")]
     hd += [Line2D([0], [0], marker=K_MARKER[k], ls="", color="k", label=f"K={k}") for k in sorted(set(int(x) for x in cand["K_efectivo"]))]
@@ -182,7 +178,7 @@ def plot_group(pts: pd.DataFrame, kernel: str, h: int, mode: str) -> None:
         f"F6 ({KERNEL_LABEL[kernel]}, h={h}, modo {mode}). Dominancia sobre [T_iter, E_iter, log10 rel_l2] independiente por tamaño (nunca entre tamaños); "
         f"triples por tamaño: {n_tr}. T y E del pase dedicado (energy_reliable=1, GPU-only); error del pase numérico a h={h}"
         + (" (rel_l2_prop en WMMA)." if kernel == "stencil" else "."),
-        f"Exclusiones (motivo: n): {ex_txt}. Las tres proyecciones 2D usan exactamente los mismos puntos que el 3D (ángulo fijo, sin etiquetas de eje). "
+        f"Exclusiones (motivo: n): {ex_txt}. "
         + ("Modo B: las referencias GPU (GPU_FP64 = error exacto; GPU_FP32 Stencil = contexto) no cuentan como miembros; se marcan los candidatos que dominan." if mode == "B" else "Modo A: solo candidatos FP16/BF16."),
         (f"Operador: Stencil «{lbl}» (provisional hasta la campaña α=3/16); " if kernel == "stencil" else "Operador: "
          + ("GEMM A=c·H (Hadamard/Sylvester)." if kernel == "gemm" else "Conv no registrado en logs.") + " ")

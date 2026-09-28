@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
+from matplotlib.ticker import LogLocator, LogFormatterSciNotation
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import CONFIG, KERNEL_LABEL, SIZE_LABEL, TAB_DIR, foot, horizon, save_fig  # noqa: E402
@@ -65,7 +66,8 @@ def plot_kernel(pts: pd.DataFrame, kernel: str, vmin: float, vmax: float) -> Non
         front = cand[cand["on_front_A"]].sort_values("T_ms")
         if len(front) > 1:
             ax.plot(front["T_ms"], front["E_J"], ls="--", color="k", lw=1.2, zorder=2)
-        ax.set_title(f"{SIZE_LABEL[kernel]} = {size:,}".replace(",", " "), fontsize=10)
+        iters_e = CONFIG["DEDICATED_ITERS"][kernel][size]
+        ax.set_title(f"{SIZE_LABEL[kernel]} = {size:,}; T,E a {iters_e:,} iteraciones", fontsize=10)
         ax.set_xlabel("Tiempo por iteración (ms)")
         ax.set_ylabel("Energía GPU por iteración (J)")
     for j in range(len(sizes), nrows * ncols):
@@ -81,7 +83,16 @@ def plot_kernel(pts: pd.DataFrame, kernel: str, vmin: float, vmax: float) -> Non
     leg.get_title().set_fontsize(12)
     if sc is not None:
         cbar = fig.colorbar(sc, ax=axes, shrink=0.85, pad=0.02)
-        cbar.set_label("Error relativo L2 (escala log)")
+        cbar.set_label("Error relativo L2 (escala log)", fontsize=11)
+        # El rango de rel_l2 suele cubrir <1 decada -> el LogLocator por
+        # defecto casi no coloca marcas (a veces una sola, como en el render
+        # original de Colab). Se fuerzan marcas menores CON etiqueta para que
+        # la barra muestre gradiente real, no un bloque casi sin numeros.
+        cbar.ax.yaxis.set_major_locator(LogLocator(base=10, numticks=12))
+        cbar.ax.yaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(2, 10), numticks=12))
+        cbar.ax.yaxis.set_major_formatter(LogFormatterSciNotation())
+        cbar.ax.yaxis.set_minor_formatter(LogFormatterSciNotation(minor_thresholds=(np.inf, np.inf)))
+        cbar.ax.tick_params(which="both", labelsize=8)
     cap = [
         f"F9. {KERNEL_LABEL[kernel]}, h={h}, producción (job 7145). Color = rel_l2 (LogNorm); forma = formato×compensación; "
         "estrella = GPU_FP64 (referencia, no compite por definición). Línea punteada = frente no dominado en (T, E, error) "
