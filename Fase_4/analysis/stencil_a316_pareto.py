@@ -3,18 +3,26 @@
 
 Con `stress` (7145) no existe ventana donde T, E y error sean validos a la vez
 (todas las precisiones desbordan antes del pase de energia). Con el operador
-difusivo nada desborda, asi que T, E y error salen de la MISMA corrida del pase
-de energia (en_S: 4096 x 4000 it; en_L: 8192 x 1500 it) -- no hace falta unir
-pases distintos.
+difusivo nada desborda.
 
-Entrada: CONFIG["STENCIL_A316_ROOT"]/{spk,off}_{en_S,en_L}/{summary,energy}_stencil_*.csv
+Ejes (misma regla que Convolucion: el error a un horizonte COMUN para todos los
+candidatos; T y E como tasas por iteracion de una ventana de energia fiable):
+  - error: rel_l2 (rel_l2_prop en WMMA) al horizonte estandar H(size)
+    (4096: 4000 it; 8192: 1500 it), de cualquier pasada que llegue a H
+    (en_*, num_*: es determinista, se verifica que coincidan);
+  - T, E: de la pasada de energia con energy_window_reliable=1. Las rutas WMMA
+    abren un tramo NVML extra (exigen >= 1.0 s de ventana): a 4096 x 4000 it,
+    K=0 dura ~0.84 s y no es fiable, por eso existen en_Slargo (8000 it) y
+    en_Llargo (3000 it). Si hay varias ventanas fiables, se usa la mas larga.
+
+Entrada: CONFIG["STENCIL_A316_ROOT"]/<paso>/{summary,energy}_stencil_*.csv
+         (se ignora spk_num_corta: log contaminado; usar spk_num_corta_limpio)
 Salida:  tables/SA316_points.csv, tables/SA316_exclusions.csv,
          figures/SA316_pareto_TE.png (vista F9) y SA316_pareto_proyecciones.png
 
 Candidatos: rutas WMMA (FP16/BF16) de GPU, con su comp_scheme real
-(spatial | none | kahan_local) y su K. Error = rel_l2_prop (estado propagado),
-como en el resto del pipeline de Stencil. Referencias (GPU_FP64 exacta,
-GPU_FP32 contexto) nunca cuentan como miembros del frente.
+(spatial | none | kahan_local) y su K. Referencias (GPU_FP64 exacta, GPU_FP32
+contexto) nunca cuentan como miembros del frente.
 """
 from __future__ import annotations
 
@@ -41,61 +49,78 @@ LABEL = {"spatial": "compensación espacial", "none": "sin compensación", "kaha
 KEYS = ["nx", "iters", "kahan", "route", "anchor_every"]
 
 
-def load_energy_passes() -> pd.DataFrame:
+def load_steps() -> pd.DataFrame:
     frames = []
-    for d in sorted(glob.glob(os.path.join(ROOT, "*_en_[SL]"))):
-        grupo = os.path.basename(d).split("_")[0]
-        s = pd.concat([pd.read_csv(p) for p in glob.glob(os.path.join(d, "summary_stencil_*.csv"))], ignore_index=True)
-        e = pd.concat([pd.read_csv(p) for p in glob.glob(os.path.join(d, "energy_stencil_*.csv"))], ignore_index=True)
+    for d in sorted(glob.glob(os.path.join(ROOT, "*_*"))):
+        paso = os.path.basename(d)
+        if not os.path.isdir(d) or paso == "spk_num_corta":
+            continue
+        sp = glob.glob(os.path.join(d, "summary_stencil_*.csv"))
+        ep = glob.glob(os.path.join(d, "energy_stencil_*.csv"))
+        if not sp or not ep:
+            continue
+        s = pd.concat([pd.read_csv(p) for p in sp], ignore_index=True)
+        e = pd.concat([pd.read_csv(p) for p in ep], ignore_index=True)
         assert not s.duplicated(KEYS).any() and not e.duplicated(KEYS).any(), f"{d}: filas repetidas por {KEYS}"
         ecols = ["energy_gpu_j", "energy_gpu_j_per_iter", "energy_window_reliable", "time_total_s"]
         m = s.drop(columns=[c for c in ecols if c in s.columns]).merge(
             e[KEYS + ecols], on=KEYS, how="left", validate="one_to_one")
-        m["grupo"], m["paso"] = grupo, os.path.basename(d)
+        m["paso"] = paso
+        m["es_energia"] = "_en_" in f"_{paso.split('_', 1)[1]}"
         frames.append(m)
     if not frames:
-        raise FileNotFoundError(f"sin pases de energia en {ROOT}/*_en_[SL]")
+        raise FileNotFoundError(f"sin pasos en {ROOT}")
     df = pd.concat(frames, ignore_index=True)
     assert set(df["op_mode"]) == {"diffusive"} and np.allclose(df["alpha"], 0.1875), "operador distinto de difusivo alpha=3/16"
-    df = df[df["nx"].isin(ITERS) & (df["iters"] == df["nx"].map(ITERS))].copy()
+    df = df[df["nx"].isin(ITERS) & (df["device"] == "gpu")].copy()
     df["size"] = df["nx"]
-    return df
-
-
-def classify(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = df[df["device"] == "gpu"].copy()
     df["is_candidate"] = df["route"].str.startswith("WMMA_")
     df["format"] = df["route"].str.extract(r"(FP16|BF16|FP32|FP64)")[0]
     df["compensation"] = np.where(df["is_candidate"], df["comp_scheme"], "none")
     df["K_efectivo"] = np.where(df["is_candidate"], df["anchor_every"], 0)
-    df["T_ms"] = df["time_total_s"] / df["iters"] * 1000.0
-    df["E_J"] = df["energy_gpu_j_per_iter"]
-    df["rel_l2"] = np.where(df["is_candidate"], df["rel_l2_prop"], df["rel_l2"])
+    df["err"] = np.where(df["is_candidate"], df["rel_l2_prop"], df["rel_l2"])
+    return df
+
+
+KEY = ["size", "route", "format", "compensation", "K_efectivo"]
+
+
+def classify(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # ---- error al horizonte estandar H(size), de cualquier pasada
+    h = df[df["iters"] == df["size"].map(ITERS)]
+    spread = h.groupby(KEY)["err"].agg(lambda x: np.nanmax(x) - np.nanmin(x) if x.notna().any() else 0.0)
+    rel = spread / h.groupby(KEY)["err"].median().abs().replace(0, np.nan)
+    assert (rel.fillna(0) < 1e-6).all(), f"error no determinista entre pasadas:\n{rel[rel >= 1e-6]}"
+    err = h.groupby(KEY).agg(rel_l2=("err", "median"), first_nonfinite=("first_nonfinite", "max"),
+                             error_evaluable=("error_evaluable", "min"),
+                             err_src=("paso", lambda x: ",".join(sorted(set(x))))).reset_index()
+    # ---- T, E: ventana de energia fiable (la mas larga por configuracion)
+    en = df[df["es_energia"]].copy()
+    en["fiable"] = (en["energy_window_reliable"] == 1) & (en["energy_gpu_j"] > 0) & (en["gpu_valid"] == 1)
+    en["T_ms"] = en["time_total_s"] / en["iters"] * 1000.0
+    en["E_J"] = en["energy_gpu_j_per_iter"]
+    ok = en[en["fiable"]]
+    longest = ok.groupby(KEY)["iters"].transform("max")
+    ok = ok[ok["iters"] == longest]
+    te = ok.groupby(KEY).agg(T_ms=("T_ms", "median"), E_J=("E_J", "median"), n_raw=("T_ms", "size"),
+                             iters_energia=("iters", "first"),
+                             te_src=("paso", lambda x: ",".join(sorted(set(x))))).reset_index()
+    allk = pd.concat([err[KEY], en[KEY]]).drop_duplicates()
+    pts = allk.merge(err, on=KEY, how="left").merge(te, on=KEY, how="left")
     reasons = []
-    for _, r in df.iterrows():
+    for _, r in pts.iterrows():
         t = []
-        if r["route"] != "GPU_FP64" and (r["first_nonfinite"] != -1 or not np.isfinite(r["rel_l2"])):
-            t.append("non_finite")
-        if r.get("error_evaluable", 1) != 1 and r["route"] != "GPU_FP64":
-            t.append(f"error_no_evaluable({r.get('motivo_exclusion', '')})")
-        if r["energy_window_reliable"] != 1 or not (r["energy_gpu_j"] > 0):
-            t.append("energy_window_unreliable")
-        if r["gpu_valid"] != 1:
-            t.append("gpu_invalid")
+        if pd.isna(r["rel_l2"]) and r["route"] != "GPU_FP64":
+            t.append("sin_error_al_horizonte" if pd.isna(r["first_nonfinite"]) else "non_finite")
+        elif r["route"] != "GPU_FP64" and (r["first_nonfinite"] != -1 or r["error_evaluable"] != 1):
+            t.append("non_finite_o_no_evaluable")
+        if pd.isna(r["T_ms"]):
+            t.append("sin_ventana_energia_fiable")
         reasons.append(";".join(t))
-    df["exclusion_reason"] = reasons
-    # Referencias corren una vez por invocacion (cada K, cada pasada KAHAN, cada
-    # grupo): son pseudo-replicas de la MISMA configuracion -> mediana + n_raw.
-    ok = df[df["exclusion_reason"] == ""]
-    key = ["size", "route", "format", "compensation", "K_efectivo"]
-    cand = ok[ok.is_candidate]
-    dup = cand[cand.duplicated(key, keep=False)]
-    assert dup.empty, f"candidatos repetidos por {key}:\n{dup[key + ['paso']]}"
-    refs = ok[~ok.is_candidate].groupby(key).agg(
-        T_ms=("T_ms", "median"), E_J=("E_J", "median"), rel_l2=("rel_l2", "median"), n_raw=("T_ms", "size")).reset_index()
-    cand = cand[key + ["T_ms", "E_J", "rel_l2", "paso"]].assign(n_raw=1)
-    pts = pd.concat([cand.assign(is_ctx_reference=False), refs.assign(is_ctx_reference=True)], ignore_index=True)
-    excl = df[df["exclusion_reason"] != ""][["size", "paso", "route", "compensation", "K_efectivo", "exclusion_reason"]]
+    pts["exclusion_reason"] = reasons
+    pts["is_ctx_reference"] = ~pts["route"].str.startswith("WMMA_")
+    excl = pts[pts["exclusion_reason"] != ""].copy()
+    pts = pts[pts["exclusion_reason"] == ""].drop(columns="exclusion_reason")
     return pts, excl
 
 
@@ -105,6 +130,7 @@ def fronts(pts: pd.DataFrame) -> pd.DataFrame:
         g = g.copy()
         c = ~g.is_ctx_reference
         g["err_obj"] = np.where(g.route == "GPU_FP64", -np.inf, np.log10(g.rel_l2.where(g.rel_l2 > 0)))
+        g["rel_l2"] = g["rel_l2"].astype(float)
         g["on_front_A"] = False
         g.loc[c, "on_front_A"] = pareto_mask(g.loc[c, ["T_ms", "E_J", "err_obj"]].to_numpy(float))
         # dominado por una referencia (GPU_FP64 con error -inf, GPU_FP32 con su error medido)
@@ -210,11 +236,13 @@ def plot_projections(pts: pd.DataFrame) -> None:
 
 
 if __name__ == "__main__":
-    raw = load_energy_passes()
+    raw = load_steps()
     pts, excl = classify(raw)
     pts = fronts(pts)
     pts.to_csv(TAB_DIR / "SA316_points.csv", index=False)
     excl.to_csv(TAB_DIR / "SA316_exclusions.csv", index=False)
+    for r in excl.itertuples():
+        print(f"  excluida: nx={r.size} {r.route}/{r.compensation}/K={int(r.K_efectivo)} -> {r.exclusion_reason}")
     for size, g in pts.groupby("size"):
         c = g[~g.is_ctx_reference]
         f = c[c.on_front_A].sort_values("T_ms")
