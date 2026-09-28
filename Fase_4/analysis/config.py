@@ -49,6 +49,13 @@ CONFIG = {
     "BOOTSTRAP_N": 2000,
     "SEED": 20260919,
 
+    # Campana Stencil alpha=3/16 (holder 7757, 2026-09-28): directorio con un
+    # subdirectorio por paso ({spk,off}_{num_corta_limpio,num_S,num_L,en_S,en_L}).
+    # Solo 4096 y 8192 (16384 retirado por decision del responsable, MANIFIESTO.md).
+    "STENCIL_A316_ROOT": os.environ.get(
+        "PACCA_STENCIL_A316_ROOT", "/home/Willy/Documentos/Resultados_PACCA/campana_v2_a316/fase4_v2"),
+    "STENCIL_A316_ENERGY_ITERS": {4096: 4000, 8192: 1500},
+
     # Salida
     "DPI": 300,
     "STENCIL_OPERATOR_LABEL": "stress",       # etiqueta de titulo hasta que exista campana alpha=3/16
