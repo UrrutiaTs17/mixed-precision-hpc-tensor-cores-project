@@ -85,9 +85,15 @@ correr() {   # correr <dir> <script> <grupo> <nombre> <VAR=val ...>
 
 estado "=== Inicio de secuencia v2 dentro del holder ${JOBID} (PID driver=$$) ==="
 
-# Un paso de Stencil: paso_stencil <grupo> <num_corta|num_S|num_L|en_S|en_L>
+# Un paso de Stencil: paso_stencil <grupo> <num_corta|num_S|num_L|en_S|en_L|en_Slargo> [K,K,...]
+# El tercer argumento (opcional) restringe ANCHOR_LIST solo para ese paso.
+# en_Slargo: pasada de energia 4096 con ventana larga (TIER_S_ITERS_LARGO, 8000):
+# las rutas WMMA abren un tramo NVML extra y exigen >= 1.0 s de ventana; a
+# 4000 it K=0 dura ~0.84 s y queda energy_window_reliable=0. en_Llargo: idem
+# para el tier L (TIER_L_ITERS_LARGO, 3000). T y E por iteracion salen de la
+# ventana larga; el error se sigue leyendo al horizonte estandar (4000/1500).
 paso_stencil() {
-    local g="$1" p="$2"
+    local g="$1" p="$2" kover="${3:-}"
     local KDIR_RUN="${REPO_ROOT}/Fase_4/Stencil" KSCRIPT="run_stencil_tc.sbatch"
     local OPFLAGS=(OP_MODE=diffusive "ALPHA=${ALPHA_CAMPANA}" "CI_MODE=${CI_MODE}")
     local COMUN
@@ -98,6 +104,7 @@ paso_stencil() {
         kext) COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=${K_STENCIL_EXT}" CPU_FP64=off) ;;
         *)    estado "grupo desconocido: ${g}"; exit 2 ;;
     esac
+    [[ -n "${kover}" ]] && COMUN+=("ANCHOR_LIST=${kover//,/ }")   # env: la ultima asignacion gana
     case "${p}" in
         num_corta) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
             RUN_KIND=numeric "NX_LIST=${NX_CORTA}" "ITERS_LIST=${NUM_ITERS_CORTA}" "CHECKPOINT_EVERY=${CKPT_CORTA}" ;;
@@ -109,6 +116,10 @@ paso_stencil() {
             RUN_KIND=energy "NX_LIST=${TIER_S_NX}" "ITERS_LIST=${TIER_S_ITERS}" ;;
         en_L)  correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
             RUN_KIND=energy "NX_LIST=${TIER_L_NX}" "ITERS_LIST=${TIER_L_ITERS}" ;;
+        en_Slargo) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
+            RUN_KIND=energy "NX_LIST=${TIER_S_NX}" "ITERS_LIST=${TIER_S_ITERS_LARGO:-8000}" ;;
+        en_Llargo) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
+            RUN_KIND=energy "NX_LIST=${TIER_L_NX}" "ITERS_LIST=${TIER_L_ITERS_LARGO:-3000}" ;;
         *)     estado "paso desconocido: ${p}"; exit 2 ;;
     esac
 }
@@ -119,7 +130,8 @@ paso_stencil() {
 # Sin STEPS_RUN, el orden de siempre: cada grupo de GROUPS_RUN con sus 5 pasos.
 if [[ -n "${STEPS_RUN:-}" ]]; then
     for gp in ${STEPS_RUN}; do
-        paso_stencil "${gp%%:*}" "${gp#*:}"
+        IFS=: read -r _g _p _k <<< "${gp}"
+        paso_stencil "${_g}" "${_p}" "${_k}"
     done
     KERNELS_RUN="${KERNELS_RUN//stencil/}"
 fi
