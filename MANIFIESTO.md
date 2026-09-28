@@ -48,7 +48,8 @@ entonces, el esquema objetivo está descrito en `DECISIONS.md` §5.
 |---|---|---|---|---|
 | 2026-09-28 | Paso 4 — smoke (rama `campana-v2`, commit `931507a`, checkout limpio `~/campana_v2`) | 7710 (Stencil `sp`), 7711 (Stencil `off`, FALLO por diseño: ancla K>0 exige spatial), 7714 (Stencil `off`, rehecho con `ANCHOR_LIST=0`), 7712 (GEMM), 7713 (Conv), 7715 (GEMM N=2048 × 2200 it) | COMPLETED (7711 FAILED esperado) | Compila con `metrics.cuh` nuevo; esquema estricto 38/16/8 campos OK; `CPU_FP64` 1 vez por celda; `comp_scheme` efectivo = pedido; 7715: la referencia FP64 desborda a iter 2200 → `rel_l2=NaN`, `error_evaluable=0`, `motivo=reference_non_finite` (el binario viejo daba 0.0) |
 | 2026-09-28 | Paso 5.1/5.2 — Stencil α=3/16 (`CI_MODE=monomode`, p=168), commit `3bb0c0d`, `tools/lanzar_campana_fase4.sh`, salida `~/campana_v2_out/fase4_a316/` | grupo `sp`: 7716 num_corta, 7717 num_S, 7718 num_L, 7719 en_S, 7720 en_L; grupo `off`: 7721 num_corta, 7722 num_S, 7723 num_L, 7724 en_S, 7725 en_L (cadena `afterany`) | en cola | `CI_MODE=monomode` elegido por coherencia con la tesis ("condición inicial controlada", Fase 4) y con la memoria del proyecto (monomodo agregado para que el eje de error sea construible); ver `JOBS.tsv` |
-| *(pendiente)* | Paso 5.3 — variabilidad (8 réplicas) | — | — | — |
+| 2026-09-28 | Paso 5.2 (ext.) — ampliación de K (DECISIONS.md, errata 8), commit `c9d111f`, checkout `~/campana_v2b`, salida `~/campana_v2_out/fase4_kext/` | Stencil `kext` (K=2,4,16,64,128): 7726 num_corta, 7727 num_S, 7728 num_L, 7729 en_S, 7730 en_L; GEMM (K=0,1,2,5,10,20,40): 7731 num, 7732 en_A, 7733 en_B; Conv: 7734 num, 7735 en_A, 7736 en_B (cadena `afterany` tras 7725) | en cola | Ampliación pre-registrada antes de lanzar; ver `JOBS.tsv` |
+| *(pendiente)* | Paso 5.3 — variabilidad (8 réplicas) con la escala de K ampliada | — | — | — |
 
 ## Criterio de aceptación (recordatorio, ver también `DECISIONS.md`)
 
