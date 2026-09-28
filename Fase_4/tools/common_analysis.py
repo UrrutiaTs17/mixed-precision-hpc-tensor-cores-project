@@ -64,6 +64,19 @@ NORMALIZED_COLUMNS = [
 ]
 
 
+def _col_or_default(df: pd.DataFrame, col: str, default):
+    """`df[col]` si la columna existe, si no una Series del default con el
+    mismo indice. `DataFrame.get(col, default)` NO hace este broadcast: si
+    `col` falta, devuelve el `default` escalar tal cual (comportamiento de
+    `dict.get`, documentado en pandas) -- eso rompe cualquier `.fillna()`/
+    `.astype()` encadenado despues con un AttributeError poco claro. Bug real
+    detectado corriendo `run_statistics.py --self-test` en un entorno local
+    sin la columna `anchor_every` en los datos sinteticos de energia."""
+    if col in df.columns:
+        return df[col]
+    return pd.Series(default, index=df.index)
+
+
 def _derive_treatment_stencil(route: str, kahan: str) -> str:
     route_l = (route or "").strip().lower()
     if route_l in STENCIL_REFERENCE_ROUTES:
@@ -128,7 +141,7 @@ def load_stencil_summary(paths: Iterable[str]) -> pd.DataFrame:
     out["treatment"] = [
         _derive_treatment_stencil(r, k) for r, k in zip(raw["route"], raw["kahan"])
     ]
-    out["anchor_every"] = pd.to_numeric(raw.get("anchor_every", 0), errors="coerce").fillna(0).astype(int)
+    out["anchor_every"] = pd.to_numeric(_col_or_default(raw, "anchor_every", 0), errors="coerce").fillna(0).astype(int)
     # nx==ny en todas las campanas de este proyecto (mallas cuadradas) --
     # si algun dia deja de serlo, esto silenciosamente usa solo nx; falla
     # de forma visible en el smoke test (columna size no coincidiria con lo
@@ -172,7 +185,7 @@ def load_stencil_energy(paths: Iterable[str]) -> pd.DataFrame:
     out["job_id"] = raw["job_id"]
     out["route"] = raw["route"]
     out["size"] = pd.to_numeric(raw["nx"], errors="coerce")
-    out["anchor_every"] = pd.to_numeric(raw.get("anchor_every", 0), errors="coerce").fillna(0).astype(int)
+    out["anchor_every"] = pd.to_numeric(_col_or_default(raw, "anchor_every", 0), errors="coerce").fillna(0).astype(int)
     out["iters"] = pd.to_numeric(raw["iters"], errors="coerce")
     out["energy_gpu_j_per_iter"] = pd.to_numeric(raw.get("energy_gpu_j_per_iter"), errors="coerce")
     out["energy_window_reliable"] = raw.get("energy_window_reliable")
@@ -197,7 +210,7 @@ def load_chained_summary(paths: Iterable[str], kernel: str) -> pd.DataFrame:
     fmt_treat = [_derive_from_chained_route(r) for r in raw["route"]]
     out["format"] = [ft[0] for ft in fmt_treat]
     out["treatment"] = [ft[1] for ft in fmt_treat]
-    out["anchor_every"] = pd.to_numeric(raw.get("anchor_every", 0), errors="coerce").fillna(0).astype(int)
+    out["anchor_every"] = pd.to_numeric(_col_or_default(raw, "anchor_every", 0), errors="coerce").fillna(0).astype(int)
     out["size"] = pd.to_numeric(raw["size"], errors="coerce")
     out["iters"] = pd.to_numeric(raw["iters"], errors="coerce")
     out["route"] = raw["route"]
@@ -239,7 +252,7 @@ def load_chained_drift(paths: Iterable[str], kernel: str) -> pd.DataFrame:
     out["job_id"] = raw["job_id"]
     out["route"] = raw["route"]
     out["size"] = pd.to_numeric(raw["size"], errors="coerce")
-    out["anchor_every"] = pd.to_numeric(raw.get("anchor_every", 0), errors="coerce").fillna(0).astype(int)
+    out["anchor_every"] = pd.to_numeric(_col_or_default(raw, "anchor_every", 0), errors="coerce").fillna(0).astype(int)
     out["iters"] = pd.to_numeric(raw["iter"], errors="coerce")
     out["rel_l2"] = pd.to_numeric(raw["rel_l2"], errors="coerce")
     out["rel_linf"] = pd.to_numeric(raw["rel_linf"], errors="coerce")
