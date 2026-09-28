@@ -28,7 +28,8 @@
 #   gemm / conv  : campana completa con ANCHOR_LIST="0 1 2 5 10 20 40" en UN solo barrido
 #                  (numerica 20 40 80 + energia dedicada por cola; el pase de energia de
 #                  GEMM/Conv ya emite el error final, no hacen falta pasadas a la ventana).
-# Se elige con GROUPS_RUN (sp off kext) y KERNELS_RUN (stencil gemm conv). Con
+# spk = sp + kext fusionados en UN barrido (K = 0 1 2 4 8 16 32 64 128, CPU_FP64 una vez).
+# Se elige con GROUPS_RUN (sp off kext spk) y KERNELS_RUN (stencil gemm conv). Con
 # AFTER_JOB=<id> la cadena espera a ese job (afterany).
 #
 # Uso (desde la raiz del checkout de la campana en PACCA):
@@ -46,6 +47,7 @@ GROUPS_RUN="${GROUPS_RUN:-sp off}"
 KERNELS_RUN="${KERNELS_RUN:-stencil}"
 AFTER_JOB="${AFTER_JOB:-}"
 K_STENCIL_EXT="${K_STENCIL_EXT:-2 4 16 64 128}"
+K_STENCIL_FULL="${K_STENCIL_FULL:-0 1 2 4 8 16 32 64 128}"
 K_CHAINED_ALL="${K_CHAINED_ALL:-0 1 2 5 10 20 40}"
 ALPHA_CAMPANA="0.1875"   # 3/16
 
@@ -91,6 +93,7 @@ for kern in ${KERNELS_RUN}; do
         case "${g}" in
             sp)   COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=0 1 8 32" CPU_FP64=on) ;;
             off)  COMUN=(SPATIAL_COMP=off "KAHAN_LIST=off on" ANCHOR_LIST=0 CPU_FP64=off) ;;
+            spk)  COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=${K_STENCIL_FULL}" CPU_FP64=on) ;;   # sp + kext en un solo barrido
             kext) COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=${K_STENCIL_EXT}" CPU_FP64=off) ;;
             *)    echo "grupo desconocido: ${g}" >&2; exit 2 ;;
         esac

@@ -234,3 +234,13 @@ implementó lo decidido.
      `stress` cuando lo que desborda a los iters energéticos es la referencia FP64 **o** la
      solución de 16 bits (operadores amplificantes); en `alpha=3/16` (contractivo) no se exime.
      A3 se evalúa solo en el horizonte numérico (`iter ≤ 80`).
+
+9. **Relanzamiento con el ancla primero (2026-09-28).** Por instrucción del responsable se
+   cancelaron todos los jobs de la campaña (7716–7736; 7716 llevaba 26 min, el resto no había
+   empezado) y se relanzan con las ejecuciones del ancla primero. Sus salidas parciales quedaron
+   movidas (no borradas) a `~/campana_v2_out/cancelado_20260928/`. El nuevo orden es: Stencil
+   `alpha=3/16` en un único barrido spatial `spk` con `K ∈ {0, 1, 2, 4, 8, 16, 32, 64, 128}` y
+   `CPU_FP64=on` (una vez por celda: fusiona los grupos `sp` y `kext` de las secciones 6 y 8, sin
+   duplicar K=0 ni la referencia), luego GEMM y Convolución con `K ∈ {0, 1, 2, 5, 10, 20, 40}`, y al
+   final la invocación `off` (`none` y `kahan_local`, K=0). Es un superconjunto del diseño
+   pre-registrado (A8 exige `{0,1,8,32}`, incluido); no cambia ningún umbral ni el código.
