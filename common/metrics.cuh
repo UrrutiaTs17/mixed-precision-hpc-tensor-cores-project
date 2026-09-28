@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -84,6 +85,13 @@ struct ErrorMetrics {
   double rel_linf = 0.0;
   bool reference_finite = true;  // false si algun valor de la referencia no es finito
   bool solution_finite = true;   // false si algun valor de la solucion no es finito
+  // Derivados de las dos banderas anteriores (ver compare_sequences). Si
+  // error_evaluable es false, max_abs/rel_l2/l2_abs/rel_linf valen NaN -- NUNCA
+  // 0.0, que se lee como "error perfecto" -- y exclusion_reason dice por que
+  // ("reference_non_finite" | "solution_non_finite" | "reference_zero_norm"; "" si
+  // es evaluable).
+  bool error_evaluable = true;
+  const char* exclusion_reason = "";
 };
 
 namespace metrics_detail {
@@ -124,13 +132,41 @@ inline ErrorMetrics compare_sequences(const RefT* ref, const TestT* test, size_t
     out.max_abs = std::max(out.max_abs, std::abs(diff));
     sq_err += diff * diff;
   }
-  out.rel_l2 = (out.reference_finite && std::isfinite(sq_ref) && sq_ref > 0.0)
-                   ? std::sqrt(sq_err / sq_ref)
-                   : 0.0;
-  out.l2_abs = (out.reference_finite && std::isfinite(sq_err)) ? std::sqrt(sq_err) : 0.0;
-  out.ref_l2_norm = (out.reference_finite && std::isfinite(sq_ref)) ? std::sqrt(sq_ref) : 0.0;
-  out.ref_linf = (out.reference_finite && std::isfinite(ref_linf)) ? ref_linf : 0.0;
-  out.rel_linf = (out.reference_finite && out.ref_linf > 0.0) ? out.max_abs / out.ref_linf : 0.0;
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  out.error_evaluable = out.reference_finite && out.solution_finite;
+  if (!out.reference_finite) {
+    out.exclusion_reason = "reference_non_finite";
+  } else if (!out.solution_finite) {
+    out.exclusion_reason = "solution_non_finite";
+  } else if (!(sq_ref > 0.0)) {
+    // Referencia finita pero identicamente nula: el error relativo no esta
+    // definido (dividiria por cero).
+    out.error_evaluable = false;
+    out.exclusion_reason = "reference_zero_norm";
+  }
+
+  if (!out.reference_finite) {
+    // Sin referencia finita no hay norma de referencia ni error evaluable.
+    out.ref_l2_norm = kNaN;
+    out.ref_linf = kNaN;
+  } else {
+    // La norma de la REFERENCIA no depende de la solucion (ver nota arriba).
+    out.ref_l2_norm = std::isfinite(sq_ref) ? std::sqrt(sq_ref) : kNaN;
+    out.ref_linf = std::isfinite(ref_linf) ? ref_linf : kNaN;
+  }
+
+  if (!out.error_evaluable) {
+    out.max_abs = kNaN;
+    out.rel_l2 = kNaN;
+    out.l2_abs = kNaN;
+    out.rel_linf = kNaN;
+    return out;
+  }
+  out.l2_abs = std::isfinite(sq_err) ? std::sqrt(sq_err) : kNaN;
+  // sq_ref == 0 (referencia identicamente nula): el error relativo no esta
+  // definido, no es 0.
+  out.rel_l2 = (std::isfinite(sq_ref) && sq_ref > 0.0) ? std::sqrt(sq_err / sq_ref) : kNaN;
+  out.rel_linf = (out.ref_linf > 0.0) ? out.max_abs / out.ref_linf : kNaN;
   return out;
 }
 

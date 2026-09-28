@@ -871,7 +871,12 @@ static void run_chained_route(const Options& opt, cublasHandle_t cublas_handle,
         // FILA, no de la corrida -- ver Fase_4/tools/README.md.
         std::cout << "CSV_DRIFT," << format_label << sufijo << "," << hw << "," << iter << ","
                   << err.rel_l2 << "," << err.rel_linf << "," << (err.solution_finite ? 1 : 0)
-                  << "," << anchor_col << "\n";
+                  << "," << anchor_col
+                  // error_evaluable / motivo_exclusion: ver ErrorMetrics en
+                  // common/metrics.cuh. Van DESPUES de anchor_every para no
+                  // correr los indices que extract_csv_chained.py ya usa.
+                  << "," << (err.error_evaluable ? 1 : 0) << ","
+                  << (err.exclusion_reason[0] != '\0' ? err.exclusion_reason : "ok") << "\n";
         ++ckpt_idx;
 
         power_buffer_start_sampling(pb);
