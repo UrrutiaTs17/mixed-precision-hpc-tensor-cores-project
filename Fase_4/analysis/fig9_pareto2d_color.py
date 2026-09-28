@@ -87,7 +87,10 @@ def plot_kernel(pts: pd.DataFrame, kernel: str, vmin: float, vmax: float) -> Non
         "estrella = GPU_FP64 (referencia, no compite por definición). Línea punteada = frente no dominado en (T, E, error) "
         "(modo A: solo candidatos de precisión reducida) — mismos puntos y misma dominancia que F6 (tables/F6_points.csv), "
         "vista simplificada para cuerpo del texto; F6 trae la versión completa (3 proyecciones + 3D + bootstrap) para apéndice.",
-        "Solo pase de energía dedicado, energy_reliable=1, GPU-only; error del pase numérico al mismo horizonte.",
+        "Solo pase de energía dedicado, energy_reliable=1, GPU-only; error del pase numérico al mismo horizonte h "
+        "(no del pase de energía): a iters=24000 (N=1024/2048) hay 18 configuraciones con rel_l2=0 espurio (referencia "
+        "FP64 desbordada, defecto ya diagnosticado) — evaluar el error ahí pintaría esas filas como error nulo en vez "
+        "de excluirlas.",
     ]
     foot(fig, cap[0] + "\n" + cap[1])
     save_fig(fig, f"F9_pareto2d_{kernel}", cap)
@@ -95,8 +98,13 @@ def plot_kernel(pts: pd.DataFrame, kernel: str, vmin: float, vmax: float) -> Non
 
 if __name__ == "__main__":
     pts = pd.read_csv(TAB_DIR / "F6_points.csv")
-    finite = pts[~pts.is_ctx_reference & pts["rel_l2"].notna() & (pts["rel_l2"] > 0)]["rel_l2"]
-    vmin, vmax = finite.min(), finite.max()
+    # Escala de color POR KERNEL (no compartida): un vmin/vmax global entre
+    # gemm+conv+stencil aplanaba el contraste de cada panel contra el rango
+    # de error de los otros dos kernels (p.ej. el 2e-8 de Stencil K=1
+    # comprimia todo el rango de GEMM hacia el amarillo). Bug real, reportado
+    # por el usuario al comparar contra el render original de Colab.
     for kernel in ("gemm", "conv", "stencil"):
+        finite = pts[(pts.kernel == kernel) & ~pts.is_ctx_reference & pts["rel_l2"].notna() & (pts["rel_l2"] > 0)]["rel_l2"]
+        vmin, vmax = finite.min(), finite.max()
         plot_kernel(pts, kernel, vmin, vmax)
-    print(f"F9: rango de color rel_l2 compartido = [{vmin:.2e}, {vmax:.2e}]")
+        print(f"F9 {kernel}: rango de color rel_l2 = [{vmin:.2e}, {vmax:.2e}]")
