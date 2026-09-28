@@ -14,6 +14,9 @@
 #       > logs_holder_run/driver_v2_$(date +%Y%m%d_%H%M%S).log 2>&1 < /dev/null &
 #   disown
 #
+# Orden propio de pasos Stencil (solo esos pasos, en ese orden):
+#   STEPS_RUN="spk:en_S spk:en_L off:en_S off:en_L" ... (ver STEPS_RUN abajo)
+#
 # Para detener la SECUENCIA (no el holder): touch logs_holder_run/HOLDER_RUN_STOP
 #
 # Mismas variables que lanzar_campana_fase4.sh (CI_MODE, OUT_BASE, GROUPS_RUN,
@@ -81,29 +84,52 @@ correr() {   # correr <dir> <script> <grupo> <nombre> <VAR=val ...>
 
 estado "=== Inicio de secuencia v2 dentro del holder ${JOBID} (PID driver=$$) ==="
 
+# Un paso de Stencil: paso_stencil <grupo> <num_corta|num_S|num_L|en_S|en_L>
+paso_stencil() {
+    local g="$1" p="$2"
+    local KDIR_RUN="${REPO_ROOT}/Fase_4/Stencil" KSCRIPT="run_stencil_tc.sbatch"
+    local OPFLAGS=(OP_MODE=diffusive "ALPHA=${ALPHA_CAMPANA}" "CI_MODE=${CI_MODE}")
+    local COMUN
+    case "${g}" in
+        sp)   COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=0 1 8 32" CPU_FP64=on) ;;
+        off)  COMUN=(SPATIAL_COMP=off "KAHAN_LIST=off on" ANCHOR_LIST=0 CPU_FP64=off) ;;
+        spk)  COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=${K_STENCIL_FULL}" CPU_FP64=on) ;;
+        kext) COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=${K_STENCIL_EXT}" CPU_FP64=off) ;;
+        *)    estado "grupo desconocido: ${g}"; exit 2 ;;
+    esac
+    case "${p}" in
+        num_corta) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
+            RUN_KIND=numeric "NX_LIST=4096 8192 16384" "ITERS_LIST=${NUM_ITERS_CORTA}" "CHECKPOINT_EVERY=${CKPT_CORTA}" ;;
+        num_S) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
+            RUN_KIND=numeric "NX_LIST=${TIER_S_NX}" "ITERS_LIST=${TIER_S_ITERS}" "CHECKPOINT_EVERY=${CKPT_VENTANA_S}" ;;
+        num_L) correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
+            RUN_KIND=numeric "NX_LIST=${TIER_L_NX}" "ITERS_LIST=${TIER_L_ITERS}" "CHECKPOINT_EVERY=${CKPT_VENTANA_L}" ;;
+        en_S)  correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
+            RUN_KIND=energy "NX_LIST=${TIER_S_NX}" "ITERS_LIST=${TIER_S_ITERS}" ;;
+        en_L)  correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" "${p}" "${OPFLAGS[@]}" "${COMUN[@]}" \
+            RUN_KIND=energy "NX_LIST=${TIER_L_NX}" "ITERS_LIST=${TIER_L_ITERS}" ;;
+        *)     estado "paso desconocido: ${p}"; exit 2 ;;
+    esac
+}
+
+# STEPS_RUN (opcional, solo Stencil): lista ORDENADA "grupo:paso ...", p. ej.
+# "spk:en_S spk:en_L off:en_S" -- permite adelantar las pasadas de energia
+# (que ya dan T, E y error al mismo horizonte) antes que las numericas largas.
+# Sin STEPS_RUN, el orden de siempre: cada grupo de GROUPS_RUN con sus 5 pasos.
+if [[ -n "${STEPS_RUN:-}" ]]; then
+    for gp in ${STEPS_RUN}; do
+        paso_stencil "${gp%%:*}" "${gp#*:}"
+    done
+    KERNELS_RUN="${KERNELS_RUN//stencil/}"
+fi
+
 for kern in ${KERNELS_RUN}; do
   case "${kern}" in
   stencil)
-    KDIR_RUN="${REPO_ROOT}/Fase_4/Stencil"; KSCRIPT="run_stencil_tc.sbatch"
-    OPFLAGS=(OP_MODE=diffusive "ALPHA=${ALPHA_CAMPANA}" "CI_MODE=${CI_MODE}")
     for g in ${GROUPS_RUN}; do
-        case "${g}" in
-            sp)   COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=0 1 8 32" CPU_FP64=on) ;;
-            off)  COMUN=(SPATIAL_COMP=off "KAHAN_LIST=off on" ANCHOR_LIST=0 CPU_FP64=off) ;;
-            spk)  COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=${K_STENCIL_FULL}" CPU_FP64=on) ;;
-            kext) COMUN=(SPATIAL_COMP=on "ANCHOR_LIST=${K_STENCIL_EXT}" CPU_FP64=off) ;;
-            *)    estado "grupo desconocido: ${g}"; exit 2 ;;
-        esac
-        correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" num_corta "${OPFLAGS[@]}" "${COMUN[@]}" \
-            RUN_KIND=numeric "NX_LIST=4096 8192 16384" "ITERS_LIST=${NUM_ITERS_CORTA}" "CHECKPOINT_EVERY=${CKPT_CORTA}"
-        correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" num_S "${OPFLAGS[@]}" "${COMUN[@]}" \
-            RUN_KIND=numeric "NX_LIST=${TIER_S_NX}" "ITERS_LIST=${TIER_S_ITERS}" "CHECKPOINT_EVERY=${CKPT_VENTANA_S}"
-        correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" num_L "${OPFLAGS[@]}" "${COMUN[@]}" \
-            RUN_KIND=numeric "NX_LIST=${TIER_L_NX}" "ITERS_LIST=${TIER_L_ITERS}" "CHECKPOINT_EVERY=${CKPT_VENTANA_L}"
-        correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" en_S "${OPFLAGS[@]}" "${COMUN[@]}" \
-            RUN_KIND=energy "NX_LIST=${TIER_S_NX}" "ITERS_LIST=${TIER_S_ITERS}"
-        correr "${KDIR_RUN}" "${KSCRIPT}" "${g}" en_L "${OPFLAGS[@]}" "${COMUN[@]}" \
-            RUN_KIND=energy "NX_LIST=${TIER_L_NX}" "ITERS_LIST=${TIER_L_ITERS}"
+        for p in num_corta num_S num_L en_S en_L; do
+            paso_stencil "${g}" "${p}"
+        done
     done ;;
   gemm)
     KDIR_RUN="${REPO_ROOT}/Fase_4/GEMM"; KSCRIPT="run_gemm_chained.sbatch"
