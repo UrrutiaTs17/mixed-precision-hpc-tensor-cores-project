@@ -148,3 +148,60 @@ no se pudo verificar contra 7145.
 5. (Menor prioridad, si el tiempo lo permite) relanzamiento de exactitud
    Fase 1–3 — la auditoría del plan del proyecto ya encontró que Fase 1–3
    cumple en general.
+
+---
+
+## Errata y precisiones de implementación (2026-09-28, posteriores al pre-registro `1ae99cf`)
+
+Se añaden como sección aparte, sin reescribir lo pre-registrado. Ninguna cambia un
+umbral ni un parámetro físico; corrigen una medición mal planteada y fijan cómo se
+implementó lo decidido.
+
+1. **§7 (CPU_FP64) — corrección de la evidencia.** La medición de §7 contó `CPU_FP64` por
+   `(nx, iters, anchor_every)` y dio razón 1.0: ese conteo ya *escondía* el defecto, porque
+   `CPU_FP64` no depende de K. Contado por celda `(nx, ny, iters)`, que es la regla de §7,
+   `energy_stencil_7145.csv` tiene **52 invocaciones en 13 celdas, máximo 4 por celda**: la
+   referencia se relanza una vez por cada K de `ANCHOR_LIST` (0, 1, 8, 32). Es el mismo
+   defecto que el hallazgo previo ("90× en vez de 30×", razón 3 con los K de la variabilidad:
+   0, 1, 5). Reproducido con `extract_csv.py --max-cpu-fp64-per-cell 1` y con
+   `tools/audit_coverage.py` (sección "CPU_FP64"). Corrección en `run_stencil_tc.sbatch`:
+   con `CAMPANA_STRICT=1` (o `CPU_FP64_ONCE=1`) `--cpu-fp64` se pasa solo en la primera pasada
+   de `KAHAN_LIST` y de `ANCHOR_LIST`. Es un requisito *por invocación del script*: la
+   segunda invocación (`SPATIAL_COMP=on`, §6) debe lanzarse con `CPU_FP64=off`, porque la
+   referencia ya salió en la primera.
+2. **§5 (columnas) — dónde se emite cada una.** `error_evaluable` y `motivo_exclusion` los
+   emiten los binarios GEMM/Conv de Fase 4 (tras `anchor_every`, vía `common/metrics.cuh`).
+   En Stencil el binario ya imprime `NaN` para todo error no evaluable
+   (`fmt_csv_error_num`), no emite `0.0`: sus columnas se derivan de los tokens crudos
+   (`NONFINITE` en los 4 campos = referencia no finita; en los 3 de error = solución no
+   finita). `device`, `gpu_valid`, `comp_scheme` y `n_cpu_fp64_invocaciones` se derivan en los
+   extractores a partir de lo que el binario ya emite (sufijo `_SP` de la ruta, columna
+   `kahan`, `energy_window_reliable`), sin tocar `stencil_tensor_activation.cu`. Un log
+   anterior al fix con `solution_finite=0` y `rel_l2` numérico parcial se anula a `NaN` y se
+   cuenta (7145: 270 filas en GEMM, 684 en Conv).
+3. **§5 (`comp_scheme`) — GEMM y Convolución.** Solo tienen dos esquemas (`none`, `local`);
+   `kahan_local` y `spatial` son de Stencil. El assert A1 exige `{none, kahan_local, spatial}`
+   en Stencil y `{none, local}` en GEMM/Conv.
+4. **A2 y el desbordamiento de la referencia FP64.** Con operadores amplificantes (Convolución:
+   ×2 por iteración) la referencia FP64 desborda tras ~1000 iteraciones, muy antes de las
+   ventanas energéticas de §2 (2500–37000); ahí no existe error evaluable a los iters
+   energéticos *por la física del operador*, que esta campaña no cambia. `audit_coverage.py`
+   trae `--a2-policy explained` (default: esas configuraciones se listan como *exentas* con su
+   causa y no hacen fallar A2) y `--a2-policy strict` (fallan igual). Decisión de política
+   pendiente del responsable; el reporte imprime ambas cuentas. Para el operador difusivo
+   `alpha=3/16` (contractivo) el problema no existe.
+5. **A2/B para Stencil `alpha=3/16` — alineación de rejillas.** El pase energético
+   (`RUN_KIND=energy`, `CHECKPOINT_EVERY=0`) nunca emite filas de error en Stencil (estructural).
+   El error a los iters energéticos (4000/1500/1500) sale de una pasada numérica *a la misma
+   ventana* (`RUN_KIND=numeric`, `ITERS_LIST=<ventana>`, `CHECKPOINT_EVERY` grande), además de
+   la numérica corta (10 50 100 120). Sin esa pasada A2 y A8 no pueden pasar.
+6. **Gate por job vs. por campaña.** `audit_coverage.py --mode job` (al final de cada job) da
+   `N/A` a A2 en jobs solo-energía y a A8 (necesitan la unión de jobs); `--mode campaign`
+   (sobre la unión de todos los directorios) no admite ningún `N/A`. En job, A1 se evalúa contra
+   `--expect-schemes` (una invocación no puede traer los tres esquemas de Stencil).
+7. **Estado al escribir esto:** implementados y probados contra los logs de 7145
+   (re-extracción idéntica en las columnas comunes; el gate falla en A1, A2, A4, A8 como
+   se esperaba): `common/metrics.cuh`, `Fase_4/{GEMM,Convolution}/*_chained.cu` (sin compilar
+   aún: se valida en PACCA con `SMOKE_TEST=1`), extractores, `tools/audit_coverage.py`,
+   `Fase_4/Stencil/run_stencil_tc.sbatch`. **Pendiente:** `run_gemm_chained.sbatch` y
+   `run_conv_chained.sbatch` (modo estricto/ARCHIVE_DIR/auditoría), lanzador de la campaña.
