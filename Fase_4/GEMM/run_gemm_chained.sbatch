@@ -52,6 +52,34 @@ fi
 
 LOGS_DIR="${LOGS_DIR:-logs}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
+
+# --- Campana corregida (DECISIONS.md S1, S5-S8) --------------------------------
+# CAMPANA_STRICT=1: esquema CSV completo obligatorio (--strict-schema) y
+# audit_coverage.py al final del job (exit != 0 si un assert aplicable falla).
+# ARCHIVE_DIR: scratch LOCAL del nodo; una sola copia a FINAL_RESULTS_DIR al final
+# (trap EXIT, tambien si falla). Nunca a los results/ de la campana 7145.
+CAMPANA_STRICT="${CAMPANA_STRICT:-0}"
+if [[ -n "${ARCHIVE_DIR:-}" ]]; then
+    : "${FINAL_RESULTS_DIR:?ARCHIVE_DIR exige FINAL_RESULTS_DIR (destino unico de la copia final)}"
+    case "${FINAL_RESULTS_DIR%/}" in
+        results|*/results)
+            echo "ERROR: FINAL_RESULTS_DIR='${FINAL_RESULTS_DIR}' termina en results/: esa carpeta es" \
+                 "de la campana 7145 y no se sobrescribe. Use un directorio propio (results_v2_...)." >&2
+            exit 2 ;;
+    esac
+    FINAL_LOGS_DIR="${FINAL_LOGS_DIR:-${FINAL_RESULTS_DIR%/}/logs}"
+    LOGS_DIR="${ARCHIVE_DIR%/}/logs"
+    RESULTS_DIR="${ARCHIVE_DIR%/}/results"
+    _archivar_al_final() {
+        local rc=$?
+        mkdir -p "${FINAL_RESULTS_DIR}" "${FINAL_LOGS_DIR}"
+        cp -a "${RESULTS_DIR}/." "${FINAL_RESULTS_DIR}/" || true
+        cp -a "${LOGS_DIR}/." "${FINAL_LOGS_DIR}/" || true
+        echo "ARCHIVE_DIR: copia unica a ${FINAL_RESULTS_DIR} y ${FINAL_LOGS_DIR} (rc=${rc})"
+        exit "${rc}"
+    }
+    trap _archivar_al_final EXIT
+fi
 mkdir -p "${LOGS_DIR}" "${RESULTS_DIR}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
 RESULTS_LOG="${LOGS_DIR}/run_${JOB_ID}.log"
@@ -331,8 +359,26 @@ fi
 if [[ -n "${EXTRACT_CSV_SCRIPT}" ]]; then
     echo
     echo "Extrayendo CSVs desde ${RESULTS_LOG} (via ${EXTRACT_CSV_SCRIPT})..."
+    EXTRACT_ARGS=()
+    [[ "${CAMPANA_STRICT}" == "1" ]] && EXTRACT_ARGS+=(--strict-schema)
     python3 "${EXTRACT_CSV_SCRIPT}" \
-        --input "${RESULTS_LOG}" --outdir "${RESULTS_DIR}" --job-id "${JOB_ID}" --kernel gemm
+        --input "${RESULTS_LOG}" --outdir "${RESULTS_DIR}" --job-id "${JOB_ID}" --kernel gemm \
+        ${EXTRACT_ARGS[@]+"${EXTRACT_ARGS[@]}"}
+
+    # Gate de cobertura (tools/audit_coverage.py) AL FINAL de cada job de la campana
+    # corregida: exit != 0 si algun assert aplicable falla.
+    if [[ "${CAMPANA_STRICT}" == "1" ]]; then
+        AUDIT_SCRIPT=""
+        for _cand in "../../tools/audit_coverage.py" "tools/audit_coverage.py"; do
+            [[ -f "${_cand}" ]] && { AUDIT_SCRIPT="${_cand}"; break; }
+        done
+        if [[ -z "${AUDIT_SCRIPT}" ]]; then
+            echo "ERROR (CAMPANA_STRICT): no encontre tools/audit_coverage.py" >&2
+            exit 2
+        fi
+        python3 "${AUDIT_SCRIPT}" --results-dir "${RESULTS_DIR}" --kernels gemm --mode job \
+            --out "${RESULTS_DIR}/audit_report_${JOB_ID}.md"
+    fi
 else
     echo
     echo "AVISO: extract_csv_chained.py no encontrado (se probo ../tools/, tools/ y" \

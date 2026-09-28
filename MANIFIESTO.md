@@ -46,7 +46,7 @@ entonces, el esquema objetivo está descrito en `DECISIONS.md` §5.
 
 | Fecha | Paso del plan | Job(s) PACCA | Estado | Nota |
 |---|---|---|---|---|
-| *(pendiente)* | Paso 4 — smoke test | — | — | — |
+| 2026-09-28 | Paso 4 — smoke (rama `campana-v2`, commit `931507a`, checkout limpio `~/campana_v2`) | 7710 (Stencil `sp`), 7711 (Stencil `off`, FALLO por diseño: ancla K>0 exige spatial), 7714 (Stencil `off`, rehecho con `ANCHOR_LIST=0`), 7712 (GEMM), 7713 (Conv), 7715 (GEMM N=2048 × 2200 it) | COMPLETED (7711 FAILED esperado) | Compila con `metrics.cuh` nuevo; esquema estricto 38/16/8 campos OK; `CPU_FP64` 1 vez por celda; `comp_scheme` efectivo = pedido; 7715: la referencia FP64 desborda a iter 2200 → `rel_l2=NaN`, `error_evaluable=0`, `motivo=reference_non_finite` (el binario viejo daba 0.0) |
 | *(pendiente)* | Paso 5.1 — exploratorio horizonte α=3/16 | — | — | — |
 | *(pendiente)* | Paso 5.2 — energía/multiobjetivo | — | — | — |
 | *(pendiente)* | Paso 5.3 — variabilidad (8 réplicas) | — | — | — |
