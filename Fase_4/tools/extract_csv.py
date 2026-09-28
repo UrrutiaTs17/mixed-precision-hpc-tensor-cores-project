@@ -578,9 +578,11 @@ def verificar_campana(args, summary_rows, tokens_por_linea, n_cpu, comp_wmma):
                 fallos.append("esquema %s: %d lineas con %d campos, se esperaban %d"
                               % (token, n_lineas, n_tokens, completo))
 
-    if args.expect_comp_scheme and comp_wmma - {args.expect_comp_scheme}:
-        fallos.append("comp_scheme efectivo en las rutas WMMA = %s, se pidio %s"
-                      % (sorted(comp_wmma), args.expect_comp_scheme))
+    if args.expect_comp_scheme:
+        pedido = set(args.expect_comp_scheme.split(","))
+        if comp_wmma != pedido:
+            fallos.append("comp_scheme efectivo en las rutas WMMA = %s, se pidio %s"
+                          % (sorted(comp_wmma), sorted(pedido)))
 
     if args.expect_op_mode:
         vistos = {r["op_mode"] for r in summary_rows if r["op_mode"] != "NaN"}
@@ -614,8 +616,9 @@ def main():
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--kernel", required=True)
     # Chequeos de la campana corregida (todos opcionales; ver verificar_campana).
-    parser.add_argument("--expect-comp-scheme", choices=["none", "kahan_local", "spatial"],
-                        help="abortar si las rutas WMMA no emitieron este esquema de compensacion")
+    parser.add_argument("--expect-comp-scheme",
+                        help="esquema(s) de compensacion que deben emitir las rutas WMMA, coma-separados "
+                             "(none, kahan_local, spatial); abortar si el conjunto efectivo difiere")
     parser.add_argument("--expect-op-mode", choices=["stress", "diffusive"])
     parser.add_argument("--expect-alpha", type=float,
                         help="abortar si el alpha emitido por el binario difiere (p. ej. 0.1875)")

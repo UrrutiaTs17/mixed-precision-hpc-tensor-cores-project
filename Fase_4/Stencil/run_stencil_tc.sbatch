@@ -42,6 +42,39 @@ fi
 # ninguna ruta de log queda hardcodeada a "logs"/"results" salvo como default.
 LOGS_DIR="${LOGS_DIR:-logs}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
+
+# --- Campana corregida (DECISIONS.md S1, S5-S8) --------------------------------
+# CAMPANA_STRICT=1 activa los chequeos duros: abort si el alpha, el esquema de
+# compensacion o el numero de campos CSV emitidos no son los pedidos, CPU_FP64
+# una sola vez por celda (nx,ny,iters) y audit_coverage.py al final. Sin el flag
+# el script se comporta como antes (los logs historicos siguen extrayendose).
+CAMPANA_STRICT="${CAMPANA_STRICT:-0}"
+
+# ARCHIVE_DIR: scratch LOCAL del nodo. Durante la corrida todo (log crudo y CSV)
+# se escribe ahi, no en el NFS del repo; al final del job (trap EXIT, tambien si
+# falla) se hace UNA sola copia a FINAL_RESULTS_DIR/FINAL_LOGS_DIR. Nunca puede
+# apuntar a los results/ de la campana 7145.
+if [[ -n "${ARCHIVE_DIR:-}" ]]; then
+    : "${FINAL_RESULTS_DIR:?ARCHIVE_DIR exige FINAL_RESULTS_DIR (destino unico de la copia final)}"
+    case "${FINAL_RESULTS_DIR%/}" in
+        results|*/results)
+            echo "ERROR: FINAL_RESULTS_DIR='${FINAL_RESULTS_DIR}' termina en results/: esa carpeta es" \
+                 "de la campana 7145 y no se sobrescribe. Use un directorio propio (results_v2_...)." >&2
+            exit 2 ;;
+    esac
+    FINAL_LOGS_DIR="${FINAL_LOGS_DIR:-${FINAL_RESULTS_DIR%/}/logs}"
+    LOGS_DIR="${ARCHIVE_DIR%/}/logs"
+    RESULTS_DIR="${ARCHIVE_DIR%/}/results"
+    _archivar_al_final() {
+        local rc=$?
+        mkdir -p "${FINAL_RESULTS_DIR}" "${FINAL_LOGS_DIR}"
+        cp -a "${RESULTS_DIR}/." "${FINAL_RESULTS_DIR}/" || true
+        cp -a "${LOGS_DIR}/." "${FINAL_LOGS_DIR}/" || true
+        echo "ARCHIVE_DIR: copia unica a ${FINAL_RESULTS_DIR} y ${FINAL_LOGS_DIR} (rc=${rc})"
+        exit "${rc}"
+    }
+    trap _archivar_al_final EXIT
+fi
 mkdir -p "${LOGS_DIR}" "${RESULTS_DIR}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
 RESULTS_LOG="${LOGS_DIR}/run_${JOB_ID}.log"
@@ -248,6 +281,7 @@ ITERS_NCU="${ITERS_NCU:-100}"
 # OJO: con el default actual (SPATIAL_COMP=on, ver abajo) esta lista se fuerza
 # a "off" y el barrido factorial de Kahan NO corre en las mediciones. Para
 # recuperarlo hay que pedir explicitamente SPATIAL_COMP=off.
+_KAHAN_LIST_PEDIDO="${KAHAN_LIST:-}"   # lo que el llamador pidio ANTES del default
 KAHAN_LIST="${KAHAN_LIST:-off on}"
 
 # --- Politica de compensacion (none / kahan_local / spatial) ----------------
@@ -277,7 +311,27 @@ KAHAN_LIST="${KAHAN_LIST:-off on}"
 # politicas en la misma corrida (ver NCU_COMP_LIST).
 SPATIAL_COMP="${SPATIAL_COMP:-on}"
 if [[ "${SPATIAL_COMP}" == "on" ]]; then
+    if [[ "${CAMPANA_STRICT}" == "1" && -n "${_KAHAN_LIST_PEDIDO}" && "${_KAHAN_LIST_PEDIDO}" != "off" ]]; then
+        # Pre-registro (DECISIONS.md S6): SPATIAL_COMP=on NO debe pisar en silencio un
+        # KAHAN_LIST explicito. Kahan local y spatial son alternativos: se cubren con
+        # DOS invocaciones (SPATIAL_COMP=off KAHAN_LIST="off on", y SPATIAL_COMP=on).
+        echo "ERROR (CAMPANA_STRICT): SPATIAL_COMP=on forzaria KAHAN_LIST='${_KAHAN_LIST_PEDIDO}' -> 'off'." \
+             "Lance dos invocaciones: SPATIAL_COMP=off KAHAN_LIST=\"off on\"  y  SPATIAL_COMP=on." >&2
+        exit 2
+    fi
     KAHAN_LIST="off"
+fi
+
+# Esquema(s) de compensacion que ESTA invocacion debe emitir, para que el extractor
+# aborte si el binario emitio otro (DECISIONS.md S6). Kahan solo afecta a las rutas WMMA.
+if [[ "${SPATIAL_COMP}" == "on" ]]; then
+    EXPECT_COMP_SCHEME="spatial"
+else
+    EXPECT_COMP_SCHEME=""
+    for _k in ${KAHAN_LIST}; do
+        _s=none; [[ "${_k}" == "on" ]] && _s=kahan_local
+        [[ ",${EXPECT_COMP_SCHEME}," == *",${_s},"* ]] || EXPECT_COMP_SCHEME="${EXPECT_COMP_SCHEME:+${EXPECT_COMP_SCHEME},}${_s}"
+    done
 fi
 
 # --- ANCLA FP64 (Fase 4) -----------------------------------------------------
@@ -332,6 +386,16 @@ ALPHA="${ALPHA:-0.1875}"
 CI_MODE="${CI_MODE:-legacy}"
 CI_P="${CI_P:-168}"
 CI_AMPLITUDE="${CI_AMPLITUDE:-1.0}"
+
+if [[ "${CAMPANA_STRICT}" == "1" && "${OP_MODE}" == "diffusive" && "${ALPHA}" != "0.1875" ]]; then
+    echo "ERROR (CAMPANA_STRICT): la campana difusiva exige alpha=3/16=0.1875 (recibido ALPHA=${ALPHA})." >&2
+    exit 2
+fi
+if [[ "${CAMPANA_STRICT}" == "1" && "${RUN_NCU:-0}" != "0" && "${NCU_CAMPAIGN:-0}" != "1" ]]; then
+    echo "AVISO (CAMPANA_STRICT): RUN_NCU=${RUN_NCU} se fuerza a 0 en las pasadas de tiempo/energia" \
+         "(NCU va en campana aparte con NCU_MODE=quick; exporte NCU_CAMPAIGN=1 para esa campana)." >&2
+    RUN_NCU=0
+fi
 
 OP_ARGS=(--op-mode "${OP_MODE}" --ci-mode "${CI_MODE}")
 [[ "${OP_MODE}" == "diffusive" ]] && OP_ARGS+=(--alpha "${ALPHA}")
@@ -612,10 +676,20 @@ for run in "${RUNS[@]}"; do
         echo "============================================================"
         # --fp64-gpu se pasa SOLO aqui (corridas de medicion). Las invocaciones
         # de ncu usan --profile-only, que no ejecuta la ruta GPU_FP64.
+        # CPU_FP64 es la referencia de COSTO en doble precision: no depende de K ni de
+        # la politica de compensacion. Con CPU_FP64_ONCE=1 (default en
+        # CAMPANA_STRICT) se pide UNA sola vez por celda (nx,ny,iters): en la primera
+        # pasada de KAHAN_LIST y de ANCHOR_LIST, no una vez por K (DECISIONS.md S7).
+        # El ERROR contra FP64 de CPU se mide igual en todas las pasadas.
+        CPU_FP64_RUN="${CPU_FP64}"
+        if [[ "${CPU_FP64_ONCE:-${CAMPANA_STRICT}}" == "1" \
+              && ( "${ANCHOR}" != "${ANCHOR_FIRST}" || "${KAHAN}" != "${KAHAN_FIRST}" ) ]]; then
+            CPU_FP64_RUN="off"
+        fi
         ./stencil_tc --nx "${NX}" --ny "${NY}" --iters "${ITERS}" --tc "${TC}" \
             --checkpoint-every "${CHECKPOINT_EVERY}" --kahan "${KAHAN}" \
             --spatial-comp "${SPATIAL_COMP}" --fp64-gpu "${FP64_GPU}" \
-            --cpu-fp64 "${CPU_FP64}" --anchor-every "${ANCHOR}" "${OP_ARGS[@]}"
+            --cpu-fp64 "${CPU_FP64_RUN}" --anchor-every "${ANCHOR}" "${OP_ARGS[@]}"
 
         # El perfilado NCU (bloque de abajo) no depende de ANCHOR: mide el
         # kernel WMMA de pasos normales, que el ancla no modifica (ver
@@ -721,11 +795,17 @@ fi
 if [[ -n "${EXTRACT_CSV_SCRIPT}" ]]; then
     echo
     echo "Extrayendo CSVs desde ${RESULTS_LOG} (via ${EXTRACT_CSV_SCRIPT})..."
+    EXTRACT_ARGS=()
+    if [[ "${CAMPANA_STRICT}" == "1" ]]; then
+        EXTRACT_ARGS+=(--strict-schema --max-cpu-fp64-per-cell 1 --expect-op-mode "${OP_MODE}")
+        [[ -n "${EXPECT_COMP_SCHEME}" ]] && EXTRACT_ARGS+=(--expect-comp-scheme "${EXPECT_COMP_SCHEME}")
+        [[ "${OP_MODE}" == "diffusive" ]] && EXTRACT_ARGS+=(--expect-alpha "${ALPHA}")
+    fi
     python3 "${EXTRACT_CSV_SCRIPT}" \
         --input  "${RESULTS_LOG}" \
         --outdir "${RESULTS_DIR}" \
         --job-id "${JOB_ID}" \
-        --kernel stencil
+        --kernel stencil ${EXTRACT_ARGS[@]+"${EXTRACT_ARGS[@]}"}
 
     echo "CSVs generados:"
     for csv_path in \
@@ -737,6 +817,22 @@ if [[ -n "${EXTRACT_CSV_SCRIPT}" ]]; then
         rows=$(awk 'END { print (NR > 0 ? NR - 1 : 0) }' "${csv_path}" 2>/dev/null || echo 0)
         echo "  ${csv_path}: ${rows} filas"
     done
+
+    # Gate de cobertura (tools/audit_coverage.py): exit != 0 si algun assert aplicable
+    # falla. Se ejecuta AL FINAL de cada job de la campana corregida.
+    if [[ "${CAMPANA_STRICT}" == "1" ]]; then
+        AUDIT_SCRIPT=""
+        for _cand in "../../tools/audit_coverage.py" "tools/audit_coverage.py"; do
+            [[ -f "${_cand}" ]] && { AUDIT_SCRIPT="${_cand}"; break; }
+        done
+        if [[ -z "${AUDIT_SCRIPT}" ]]; then
+            echo "ERROR (CAMPANA_STRICT): no encontre tools/audit_coverage.py" >&2
+            exit 2
+        fi
+        python3 "${AUDIT_SCRIPT}" --results-dir "${RESULTS_DIR}" --kernels stencil \
+            --expect-schemes "${EXPECT_COMP_SCHEME}" --mode job \
+            --out "${RESULTS_DIR}/audit_report_${JOB_ID}.md"
+    fi
 else
     echo
     echo "AVISO: extract_csv.py no encontrado (se probo ../tools/, tools/ y" \

@@ -252,6 +252,8 @@ def run_asserts(data, args):
     for kn, k in data.items():
         have = set(flat_rows(kn, k)["comp_scheme"].dropna().unique())
         need = A1_REQUIRED[kn]
+        if kn == "stencil" and args.expect_schemes:
+            need = set(args.expect_schemes.split(","))   # job con una sola invocacion (DECISIONS.md S6)
         cuenta.append("%s: %s" % (kn, ", ".join("%s=%d" % (c, int((flat_rows(kn, k)["comp_scheme"] == c).sum())) for c in sorted(need))))
         for c in sorted(need - have):
             falta.append("%s sin filas con comp_scheme=%s" % (kn, c))
@@ -266,6 +268,8 @@ def run_asserts(data, args):
         er = energy_rows(kn, k)
         if er.empty:
             continue
+        if args.mode == "job" and ep.empty:
+            continue   # un job solo-energia no puede decidir A2: se evalua sobre la union (--mode campaign)
         er = er[(er["wr"] == 1) & (er["device"] == "gpu")]
         cfgs = er[~er["route"].isin(EXACT_REFERENCES)][["route", "size", "K", "comp_scheme"]].drop_duplicates()
         # configuraciones esperadas = las que tienen alguna medicion de tiempo/error (evita exigir lo no lanzado)
@@ -287,7 +291,7 @@ def run_asserts(data, args):
             else:
                 vacias.append(etiqueta + "  [error medido a iters %s pero energia fiable solo a %s]" % (sorted(err_it)[:4], sorted(e_it)))
     if total == 0:
-        r.set("N/A", "sin configuraciones con energia fiable")
+        r.set("N/A", "sin configuraciones con energia fiable y error medido en el mismo conjunto de resultados")
     else:
         fallan = vacias if args.a2_policy == "explained" else vacias + exentas
         r.set("FAIL" if fallan else "PASS",
@@ -388,6 +392,14 @@ def run_asserts(data, args):
     r = Res("A8", "matriz Stencil alpha=3/16 completa, sin celdas vacias")
     vacias = []
     dif = None
+    if args.mode == "job":
+        r.set("N/A", "la matriz completa se evalua sobre la union de todos los jobs (--mode campaign)")
+        results.append(r)
+        return results
+    if args.expect_schemes and "spatial" not in args.expect_schemes.split(","):
+        r.set("N/A", "este job no corre el esquema spatial (las rutas WMMA_*_SP de la matriz salen de la otra invocacion)")
+        results.append(r)
+        return results
     if "stencil" in data:
         s = data["stencil"]["S"]
         if s is not None and not s.empty:
@@ -507,6 +519,9 @@ def main():
                     help="explained: una configuracion sin interseccion cuya causa es que la referencia FP64 desborda "
                          "a los iters energeticos se reporta pero no falla; strict: falla igual")
     ap.add_argument("--reliable-min", type=float, default=RELIABLE_MIN)
+    ap.add_argument("--expect-schemes", default="",
+                    help="esquemas de compensacion de Stencil que ESTE job debe traer, coma-separados "
+                         "(p. ej. 'none,kahan_local' para la invocacion SPATIAL_COMP=off); vacio = los tres")
     args = ap.parse_args()
 
     data = {}
