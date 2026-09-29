@@ -38,6 +38,7 @@
 #   sbatch --export=ALL,CUDNN_ROOT=/otra/ruta run_conv_tc.sbatch
 #   sbatch --export=ALL,RUN_CUTLASS=0 run_conv_tc.sbatch
 #   sbatch --export=ALL,CUTLASS_DIR=/ruta/a/otro/cutlass/include run_conv_tc.sbatch
+#   sbatch --export=ALL,RUN_DOUBLE=1 run_conv_tc.sbatch
 
 set -euo pipefail
 
@@ -247,6 +248,10 @@ TC_FORMAT="${TC_FORMAT:-both}"
 # ausencia de CUTLASS con __has_include y compila igual las 4 rutas
 # restantes), pero cada corrida con --cutlass terminara en tiempo de
 # ejecucion con un mensaje de error explicando como habilitarlo.
+# RUN_DOUBLE=1: ademas de la corrida FP32/TC, ejecuta una vez por HW la
+# referencia FP64 (./conv_tc --double, rutas CPU FP64 y cuDNN FP64) con los
+# mismos flags. Por defecto 0: el comportamiento historico no cambia.
+RUN_DOUBLE="${RUN_DOUBLE:-0}"
 RUN_CUTLASS="${RUN_CUTLASS:-1}"
 CUTLASS_DIR="${CUTLASS_DIR:-$HOME/cutlass/include}"
 if [[ "${RUN_CUTLASS}" == "1" ]]; then
@@ -311,6 +316,7 @@ echo "TC_FORMAT=${TC_FORMAT}"
 echo "HW_LIST=${HW_LIST}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "RUN_CUTLASS=${RUN_CUTLASS}"
+echo "RUN_DOUBLE=${RUN_DOUBLE}"
 echo "CUTLASS_DIR=${CUTLASS_DIR}"
 
 nvidia-smi || true
@@ -385,6 +391,19 @@ for HW in ${HW_LIST}; do
         --iters "${ITERS}" \
         --tc-format "${TC_FORMAT}" \
         "${CUTLASS_RUN_FLAGS[@]}"
+    if [[ "${RUN_DOUBLE}" == "1" ]]; then
+        echo
+        echo "--- Referencia FP64 (--double): N=${N}, C=${C}, H=W=${HW}, K=${K}, R=${R}, S=${S}, ITERS=${ITERS} ---"
+        ./conv_tc --double \
+            --N "${N}" --C "${C}" --H "${HW}" --W "${HW}" \
+            --K "${K}" --R "${R}" --S "${S}" \
+            --pad_h "${PAD_H}" --pad_w "${PAD_W}" \
+            --stride_h "${STRIDE_H}" --stride_w "${STRIDE_W}" \
+            --dilation_h "${DILATION_H}" --dilation_w "${DILATION_W}" \
+            --iters "${ITERS}" \
+            --tc-format "${TC_FORMAT}" \
+            "${CUTLASS_RUN_FLAGS[@]}"
+    fi
 done
 
 if [[ "${RUN_NCU}" == "1" ]]; then
