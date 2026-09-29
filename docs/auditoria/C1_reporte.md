@@ -223,9 +223,72 @@ Consecuencias, **sin modificar** los umbrales de la sección 3:
 
 ## 4. Resultados de la re-ejecución
 
-Job **7785** encolado el 2026-09-28 tras el commit de pre-registro `d8172ac`.
+Job **7785** (`sbatch --export=ALL,C=1024,K=1024,H=256,W=256,TC_FORMAT=both,RUN_CUTLASS=0,ITERS=10,RUN_DOUBLE=1 run_conv_tc.sbatch`),
+COMPLETED, ExitCode 0:0, 2026-09-29 00:18:50 -> 00:25:22 EDT (6:36 min). Log
+`Fase_2/Convolution/logs/mixed_precision_conv_tc_7785.out`, sha256
+`a5360434`. Mismas reglas de procedencia que la sección 3: FP32/FP16/WMMA de
+la pasada de benchmark (líneas 69-112, antes de `Perfilando`), FP64 de la
+única invocación `--double` (líneas 141-149).
 
-_Pendiente: se completa cuando termine el job._
+### 4.1 Evaluación contra los umbrales
+
+| ID | Fila | Medición | Umbral | Resultado |
+| - | - | - | - | - |
+| U1 | FP64 | 164,094873 ms × 7,538021 TFLOP/s = 1,236951e12 | 1,23695e12 ± 0,1 % | **Pasa** (desviación 0,0000 %) |
+| U1 | FP32 escalar | 39,949927 ms × 30,962524 TFLOP/s = 1,236951e12 | ídem | Pasa (informativo; la fila falla por U2) |
+| U1 | TC FP16 | 5,846528 ms × 211,570117 TFLOP/s = 1,236951e12 | ídem | **Pasa** |
+| U1 | WMMA | 25,889587 ms × 47,777918 TFLOP/s = 1,236951e12 | ídem | **Pasa** |
+| U2 | FP32 escalar | 30,962524 TFLOP/s; L2 vs FP64 = 0,000001 | TFLOP/s ≤ 19,5 y L2 = 0,000000 | **Falla** (ambas condiciones) |
+| U3 | FP64 | 7,538021 TFLOP/s | ≤ 19,5 (aviso DMMA si > 9,7) | **Pasa**, sin indicio de DMMA |
+| U4 | WMMA FP16 | L2 = 0,000538; TC FP16 L2 = 0,000574; razón 0,937 | razón en [0,1 ; 10] | **Pasa** |
+| U5 | TC BF16 (no va a la tabla) | L2 = 0,002862 > L2 FP16 = 0,000574 | BF16 > FP16 | **Pasa** |
+
+**U2 falla, y no por TF32.** La línea `GPU cuDNN FP32 escalar : math type
+CUDNN_FMA_MATH (TF32 desactivado)` está presente en el log (línea 75): TF32
+está apagado. El job 7709 (Fase 1, mismo tamaño C=K=1024, H=W=256, corrido el
+2026-09-27) imprime explícitamente `cuDNN algoritmo elegido : 6` para FP32, y
+6 es `CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED` en la enumeración de
+cuDNN. El binario de Fase 2 (`conv_tensor_activation.cu`) no imprime el
+algoritmo elegido, pero su rendimiento (30,96 TFLOP/s) es consistente con el
+mismo algoritmo Winograd de 7709 (29,96 TFLOP/s), y muy distinto del FP32
+escalar verificado a C=K=64 en 6882/6884 (2-18 TFLOP/s, L2 = 0,000000).
+Winograd reduce el conteo real de multiplicaciones respecto al conteo directo
+que usa `conv_flops()`, así que su TFLOP/s "nominal" excede el pico escalar
+sin que haya Tensor Cores involucrados, y su error (transformada Winograd,
+no acumulación FP32 directa) es mayor que el de un GEMM directo. **El umbral
+U2 fue diseñado para detectar TF32, no Winograd; aquí detecta un fenómeno
+real pero distinto.** Esto excede lo que este reporte puede decidir por su
+cuenta (ver sección 3, regla "falla de infraestructura" vs "hallazgo
+numérico/de diseño": esto es lo segundo). Queda para los autores: (a) forzar
+`CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM` para un baseline FP32 escalar
+directo y comparable a las rutas TC, o (b) aceptar Winograd como línea base
+FP32 legítima y redefinir U2.
+
+### 4.2 Valores para `tab:conv-mixta` (de este job)
+
+| Fila | Tiempo (ms) | TFLOP/s | Speedup vs FP64 | Err. máx. abs. | L2 rel. |
+| - | - | - | - | - | - |
+| FP64 [Referencia] | 164,095 | 7,538 | --- | --- | --- |
+| FP32 escalar | **sin escribir** (falla U2) | | pendiente | | |
+| TC FP16 | 5,847 | 211,570 | 28,07× | 0,337585 | 0,000574 |
+| WMMA (relabel **FP16**, no BF16) | 25,890 | 47,778 | 6,34× | 0,270692 | 0,000538 |
+
+Cociente cuDNN TC / WMMA (párrafo posterior a la tabla): 25,889587 / 5,846528
+= 4,43× (antes 5,16×, con los tiempos de 4613).
+
+Nota de reproducibilidad: los errores de TC FP16 y WMMA son bit a bit
+idénticos a los del job 4613 (kernel determinista); solo cambiaron tiempo y
+TFLOP/s, consistente con el cambio de toolchain (nvcc 13.1 vs HPC SDK 23.1) y
+no con un cambio de comportamiento numérico.
+
+## 5. Estado final
+
+- FP64, TC FP16 y WMMA (relabel FP16): **resueltos**, con log de origen 7785.
+- FP32 escalar: **abierto**. No se escribe en la tabla; el comentario pasa a
+  `% [C1-PENDIENTE]` con el motivo de la sección 4.1.
+- Las propagaciones "43,23×" pasan a "28,07×" en los tres sitios. Las
+  propagaciones "18,57×" (dependen de FP32 escalar) quedan marcadas como
+  pendientes en los tres sitios, no se reemplazan por un número.
 
 ## Anexo A. Inventario completo por ruta (pasadas de benchmark)
 
