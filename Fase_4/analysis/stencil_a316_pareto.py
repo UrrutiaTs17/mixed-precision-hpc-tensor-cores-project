@@ -47,6 +47,7 @@ MARKER = {("FP16", "spatial"): "s", ("BF16", "spatial"): "^", ("FP16", "none"): 
           ("FP16", "kahan_local"): "P", ("BF16", "kahan_local"): "X"}
 LABEL = {"spatial": "compensación espacial", "none": "sin compensación", "kahan_local": "Kahan local"}
 KEYS = ["nx", "iters", "kahan", "route", "anchor_every"]
+K_OFFSET = {0: (10, -16), 1: (-34, -6), 2: (10, -4), 32: (14, 16), 64: (18, 4), 128: (14, -12)}
 
 
 def load_steps() -> pd.DataFrame:
@@ -157,8 +158,12 @@ def draw_candidates(ax, cand, x, y, norm, color_by_err=True):
             continue
         kw = dict(c=c["rel_l2"], norm=norm, cmap="viridis") if color_by_err else dict(color="#bbbbbb")
         sc = ax.scatter(c[x], c[y], marker=mk, s=80, edgecolor="k", linewidths=0.8, zorder=3, **kw)
+        if fmt != "BF16" or comp != "spatial":
+            continue   # FP16 y BF16 espaciales se superponen: una sola etiqueta por K
         for _, r in c.iterrows():
-            ax.annotate(f"K={int(r.K_efectivo)}", (r[x], r[y]), xytext=(5, 3), textcoords="offset points", fontsize=7)
+            dx, dy = K_OFFSET.get(int(r.K_efectivo), (8, 0))
+            ax.annotate(f"K={int(r.K_efectivo)}", (r[x], r[y]), xytext=(dx, dy), textcoords="offset points",
+                        fontsize=7, arrowprops=dict(arrowstyle="-", lw=0.4, color="#666666"))
     front = cand[cand["on_front_A"]].sort_values(x)
     if len(front) > 1:
         ax.plot(front[x], front[y], ls="--", color="k", lw=1.2, zorder=2)
@@ -171,22 +176,40 @@ def legend_handles(pts):
     present = set(zip(pts["format"], pts["compensation"])) & set(MARKER)
     h = [Line2D([0], [0], marker=mk, ls="", mfc="none", mec="k", ms=9, label=f"{k[0]} — {LABEL[k[1]]}")
          for k, mk in MARKER.items() if k in present]
-    h += [Line2D([0], [0], marker="*", ls="", mfc="#888888", mec="k", ms=14, label="GPU FP64 (referencia)"),
+    h += [Line2D([0], [0], marker="*", ls="", mfc="none", mec="#555555", ms=16, label="GPU FP64 (referencia)"),
           Line2D([0], [0], marker="h", ls="", mfc="#009E73", mec="k", ms=10, label="GPU FP32 (contexto)"),
           Line2D([0], [0], ls="--", color="k", label="Frente Pareto (T, E, error)")]
     return h
 
 
-def caption_common() -> str:
-    return ("Operador difusivo α=3/16, condición inicial monomodo (campaña 7757). T, E y error salen de la MISMA corrida del "
-            "pase de energía (4096²: 4000 it; 8192²: 1500 it; ventana de energía fiable, GPU). Error = rel_l2 del estado "
-            "propagado frente a FP64, al final de esa ventana: para entonces la solución de referencia ha decaído varios "
-            "órdenes de magnitud, de modo que errores relativos del orden de la unidad (sin ancla) indican que el residuo de "
-            "redondeo supera la solución remanente, no una divergencia (todo es finito). Frente = no dominado en (T, E, error) "
-            "solo entre candidatos de precisión reducida; las referencias no compiten.")
+def caption_common(pts: pd.DataFrame, excl: pd.DataFrame) -> str:
+    ven = ", ".join(f"{size}²: {sorted(set(int(v) for v in g.iters_energia.dropna()))} it"
+                    for size, g in pts.groupby("size"))
+    txt = ("Operador difusivo α=3/16, condición inicial monomodo (campaña 7757). Error = rel_l2 del estado propagado "
+           "frente a FP64 al horizonte común de cada malla (4096²: 4000 it; 8192²: 1500 it), igual para todos los "
+           "candidatos. T y E = tasas por iteración de la ventana de energía fiable más larga disponible (" + ven + "; "
+           "las rutas WMMA exigen ≥1 s de ventana NVML). A 4000 it (4096²) la solución de referencia ha decaído varios "
+           "órdenes de magnitud: errores relativos del orden de la unidad sin ancla indican que el residuo de redondeo "
+           "supera la solución remanente, no una divergencia (todo es finito). Frente = no dominado en (T, E, error) solo "
+           "entre candidatos de precisión reducida; GPU FP64/FP32 se muestran como referencia y no compiten.")
+    pend = pendientes(pts)
+    if pend:
+        txt += " PRELIMINAR: faltan candidatos (" + pend + "); el frente puede cambiar al incorporarlos."
+    return txt
 
 
-def plot_te(pts: pd.DataFrame) -> None:
+def pendientes(pts: pd.DataFrame) -> str:
+    """Esquemas de compensacion esperados sin ningun candidato admitido, por malla."""
+    faltan = []
+    for size in sorted(ITERS):
+        have = set(pts[(pts["size"] == size) & ~pts.is_ctx_reference]["compensation"])
+        miss = [LABEL[c] for c in ("spatial", "none", "kahan_local") if c not in have]
+        if miss:
+            faltan.append(f"{size}²: " + ", ".join(miss))
+    return "; ".join(faltan)
+
+
+def plot_te(pts: pd.DataFrame, excl: pd.DataFrame) -> None:
     sizes = sorted(pts["size"].unique())
     fig, axes = plt.subplots(1, len(sizes), figsize=(6.8 * len(sizes), 5.4), squeeze=False, constrained_layout=True)
     cand_all = pts[~pts.is_ctx_reference]
@@ -195,22 +218,24 @@ def plot_te(pts: pd.DataFrame) -> None:
     for ax, size in zip(axes[0], sizes):
         g = pts[pts["size"] == size]
         sc = draw_candidates(ax, g[~g.is_ctx_reference], "T_ms", "E_J", norm) or sc
-        for route, mk, col, ms in (("GPU_FP64", "*", "#888888", 220), ("GPU_FP32", "h", "#009E73", 120)):
-            r = g[g.route == route]
-            ax.scatter(r["T_ms"], r["E_J"], marker=mk, s=ms, color=col, edgecolor="k", lw=0.8, zorder=3)
-        ax.set_title(f"nx=ny = {size:,}; T, E y error a {ITERS[size]:,} iteraciones", fontsize=10)
+        r = g[g.route == "GPU_FP64"]
+        ax.scatter(r["T_ms"], r["E_J"], marker="*", s=420, facecolor="none", edgecolor="#555555", lw=1.2, zorder=4)
+        r = g[g.route == "GPU_FP32"]
+        ax.scatter(r["T_ms"], r["E_J"], marker="h", s=120, color="#009E73", edgecolor="k", lw=0.8, zorder=3)
+        ax.set_title(f"nx=ny = {size:,}; error a {ITERS[size]:,} iteraciones", fontsize=10)
         ax.set_xlabel("Tiempo por iteración (ms)")
         ax.set_ylabel("Energía GPU por iteración (J)")
     leg = fig.legend(handles=legend_handles(pts), ncol=4, fontsize=8, loc="outside upper center",
-                     title="Pareto tiempo–energía–error — Stencil, operador difusivo α=3/16")
+                     title="Pareto tiempo–energía–error — Stencil, operador difusivo α=3/16"
+                           + (" — PRELIMINAR" if pendientes(pts) else ""))
     leg.get_title().set_fontsize(12)
     if sc is not None:
         colorbar(fig, sc, axes)
-    foot(fig, caption_common())
-    save_fig(fig, "SA316_pareto_TE", [caption_common()])
+    foot(fig, caption_common(pts, excl))
+    save_fig(fig, "SA316_pareto_TE", [caption_common(pts, excl)])
 
 
-def plot_projections(pts: pd.DataFrame) -> None:
+def plot_projections(pts: pd.DataFrame, excl: pd.DataFrame) -> None:
     sizes = sorted(pts["size"].unique())
     fig, axes = plt.subplots(len(sizes), 2, figsize=(12.5, 4.6 * len(sizes)), squeeze=False, constrained_layout=True)
     cand_all = pts[~pts.is_ctx_reference]
@@ -230,9 +255,10 @@ def plot_projections(pts: pd.DataFrame) -> None:
             ax.set_ylabel("Error relativo L2 (estado propagado)")
             ax.set_title(f"nx=ny = {size:,} ({ITERS[size]:,} it)" + ("; línea gris = GPU FP64" if x == "T_ms" else ""), fontsize=10)
     fig.legend(handles=legend_handles(pts), ncol=4, fontsize=8, loc="outside upper center",
-               title="Proyecciones tiempo–error y energía–error — Stencil, α=3/16").get_title().set_fontsize(12)
-    foot(fig, caption_common())
-    save_fig(fig, "SA316_pareto_proyecciones", [caption_common()])
+               title="Proyecciones tiempo–error y energía–error — Stencil, α=3/16"
+               + (" — PRELIMINAR" if pendientes(pts) else "")).get_title().set_fontsize(12)
+    foot(fig, caption_common(pts, excl))
+    save_fig(fig, "SA316_pareto_proyecciones", [caption_common(pts, excl)])
 
 
 if __name__ == "__main__":
@@ -249,5 +275,5 @@ if __name__ == "__main__":
         print(f"nx={size}: {len(c)} candidatos, {len(f)} en el frente -> "
               + ", ".join(f"{r.format}/{r.compensation}/K={int(r.K_efectivo)}" for r in f.itertuples()))
     print(f"excluidas: {len(excl)}" + (" -> " + "; ".join(sorted(set(excl.exclusion_reason))) if len(excl) else ""))
-    plot_te(pts)
-    plot_projections(pts)
+    plot_te(pts, excl)
+    plot_projections(pts, excl)
