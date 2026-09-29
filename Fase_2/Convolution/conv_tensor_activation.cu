@@ -637,22 +637,21 @@ static Metrics benchmark_gpu_cudnn_float(const std::vector<float>& x,
 
     CudnnHandle handle;
 
-    // Seleccion automatica del mejor algoritmo disponible con los descriptores dados.
-    cudnnConvolutionFwdAlgoPerf_t perf_results[8];
-    int algo_count = 0;
-    CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm_v7(
-        handle.get(), xDesc, wDesc, convDesc, yDesc, 8, &algo_count, perf_results));
-
-    // Con CUDNN_FMA_MATH quedan descartados los algoritmos que solo existen en
-    // variante Tensor Core, y esos vuelven con status != SUCCESS: hay que tomar
-    // el primero ejecutable, no el primero de la lista.
-    cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
-    for (int ai = 0; ai < algo_count; ++ai) {
-        if (perf_results[ai].status == CUDNN_STATUS_SUCCESS) {
-            algo = perf_results[ai].algo;
-            break;
-        }
-    }
+    // Algoritmo forzado a IMPLICIT_GEMM (mismo que Fase 1, ver
+    // Fase_1/Convolution/cudnn_conv_balanced.cu). La heuristica de
+    // cudnnGetConvolutionForwardAlgorithm_v7 descartaba los algoritmos
+    // Tensor Core bajo CUDNN_FMA_MATH (vuelven con status != SUCCESS), pero
+    // NO descartaba WINOGRAD_NONFUSED, que sigue siendo FP32 escalar (sin
+    // Tensor Cores) pero hace menos multiplicaciones que el conteo directo
+    // de conv_flops(): su TFLOP/s "nominal" superaba el pico escalar de la
+    // A100 sin usar hardware tensorial (ver docs/auditoria/C1_reporte.md,
+    // hallazgo C1 sobre tab:conv-mixta -- job 7709 confirma "algoritmo
+    // elegido: 6" = WINOGRAD_NONFUSED, ~30 TFLOP/s con C=K=1024 y H=W=256).
+    // Esta ruta es la referencia "sin Tensor Cores" contra la que se miden
+    // los speedups de las rutas 3 y 4, y necesita hacer el mismo trabajo
+    // aritmetico que ellas (conteo directo, sin transformadas) para que el
+    // speedup sea comparable.
+    const cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
 
     // El workspace es memoria temporal en GPU que algunos algoritmos necesitan.
     size_t ws_bytes = 0;
