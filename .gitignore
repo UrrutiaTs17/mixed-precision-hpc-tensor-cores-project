@@ -88,3 +88,6 @@ cmake-build-*/
 # desde otro script; no es un artefacto del proyecto).
 __pycache__/
 *.pyc
+
+# Documento de tesis (clon propio de Overleaf, con su propio git; no se versiona aqui)
+tesis/
