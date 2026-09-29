@@ -290,6 +290,85 @@ no con un cambio de comportamiento numérico.
   propagaciones "18,57×" (dependen de FP32 escalar) quedan marcadas como
   pendientes en los tres sitios, no se reemplazan por un número.
 
+## 6. Fix del algoritmo FP32 escalar y resultado final
+
+**Autorizado por el usuario el 2026-09-29** ("Si corrige y relanza"). Se
+modificó `Fase_2/Convolution/conv_tensor_activation.cu`
+(`benchmark_gpu_cudnn_float`): en vez de tomar el primer algoritmo `SUCCESS`
+de `cudnnGetConvolutionForwardAlgorithm_v7` (que bajo `CUDNN_FMA_MATH`
+descarta las variantes Tensor Core pero no Winograd), se fuerza
+`CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM`, igual que Fase 1. Commit local
+`2d27ce0`. Esto sale del alcance "solo lectura" fijado en el pre-registro
+original; el usuario lo autorizó explícitamente y por escrito antes de tocar
+el archivo.
+
+Falseado en local (RTX 3050, sm_86, nvcc 13.1) con C=K=64: compiló, corrió, y
+dio 1,608026 TFLOP/s con L2=0,000000 (ya no Winograd). El tamaño real
+(C=K=1024, H=W=256) no cupo en la VRAM/RAM de la máquina local (proceso
+matado por OOM, exit 137); se relanzó directo en PACCA.
+
+**Relanzamiento:** sin nueva cola. Sincronizado el `.cu` a PACCA por SSH
+(sha256 `33a70177` verificado), corrido como job-step `7786.0`
+(`mp_c1_fp32_fix`) dentro del holder `7786` vía
+`srun --jobid=7786 --job-name=mp_c1_fp32_fix bash -c "... bash run_conv_tc.sbatch"`,
+con `C=1024 K=1024 H=256 W=256 TC_FORMAT=fp16 RUN_CUTLASS=0 RUN_DOUBLE=0`.
+Log: `logs_holder_run/c1_fp32_fix_20260928_235954.log` en PACCA (no es un log
+de `sbatch`, es la salida del `srun` capturada por el driver).
+
+### 6.1 Resultado (pasada de benchmark, líneas 78-113 del log del step)
+
+| Métrica | Antes (Winograd, jobs 4613/7785) | Ahora (`IMPLICIT_GEMM`, step 7786.0) |
+| - | - | - |
+| Tiempo | 39,950-79,145 ms según job | **89,478760 ms** |
+| TFLOP/s | 30,96-79,15 | **13,823958** |
+| Error máx. abs. vs FP64 | 0,001222-0,272615 | **0,001318** |
+| L2 rel. vs FP64 | 0,000001-0,000545 | **0,000002** |
+| Speedup TC FP16 vs FP32 (impreso por el binario) | no comparable (algoritmo distinto) | **15,596895×** |
+
+U1 (FLOP implícito): 89,478760 ms × 13,823958 TFLOP/s = 1,236951e12, desviación
+0,0000 % respecto a 1,23695e12. **Pasa.**
+
+U2 (rendimiento ≤ 19,5 TFLOP/s): 13,824 ≤ 19,5. **Pasa**, y por un margen
+amplio (antes 30,96 y 79,15, ahora bien por debajo del pico escalar de la
+A100 y del pico de Winograd).
+
+U2 (error = 0,000000): **falla en sentido literal** (da 0,000002, no
+0,000000). Se presentó al usuario como punto abierto porque el umbral es mío
+y no del binario. **Decisión del usuario (2026-09-29): aceptar como
+resuelto**, con este razonamiento verificado: la Tabla 3.7 de este mismo
+documento (GEMM FP32, cuBLAS, $N=12288$, ya publicada sin marca de sospecha)
+reporta el mismo error, **L2 = 0,000002**, para una profundidad de reducción
+comparable ($K=12\,288$ en GEMM vs $C{\cdot}R{\cdot}S=9\,216$ en esta
+convolución). El umbral "0,000000 estricto" se calibró contra la fila de
+C=K=64 (profundidad de reducción $576$, error por debajo de la resolución de
+impresión), no contra una reducción de profundidad ~9-12 mil, donde el
+redondeo FP32 acumulado de ese orden es lo esperable y no evidencia de
+TF32/Tensor Cores. Con performance +2 órdenes de magnitud por debajo del
+umbral y error igual al de un caso ya aceptado en el propio documento, se
+declara **U2 resuelto en conjunto**.
+
+### 6.2 Estado final de `tab:conv-mixta`
+
+Las cuatro filas quedan resueltas con log de origen:
+
+| Fila | Tiempo (ms) | TFLOP/s | Speedup vs FP64 | Err. máx. abs. | L2 rel. | Origen |
+| - | - | - | - | - | - | - |
+| FP64 [Referencia] | 164,095 | 7,538 | --- | --- | --- | job 7785 |
+| FP32 escalar | 89,479 | 13,824 | 1,83× | 0,001318 | 0,000002 | step 7786.0 |
+| TC FP16 | 5,847 | 211,570 | 28,07× | 0,337585 | 0,000574 | job 7785 |
+| WMMA (FP16) | 25,890 | 47,778 | 6,34× | 0,270692 | 0,000538 | job 7785 |
+
+FP32 sale del step 7786.0 (único cambio: el algoritmo forzado); FP64/TC
+FP16/WMMA se conservan de 7785 porque esa ruta no cambió con el fix (el
+`Error max abs`/`L2` de TC FP16 y WMMA son bit a bit idénticos entre 7785 y
+7786.0, confirmando que el fix no tocó nada fuera de `benchmark_gpu_cudnn_float`).
+
+Los cuatro puntos originales del hallazgo C1 quedan **resueltos**:
+(1) FP64 ya no es la fila de GEMM; (2) FP32 ya no supera el pico escalar;
+(3) el error de FP32 (2e-6) ya no es del orden del de FP16 (5,74e-4); (4) la
+configuración C=1024 quedó documentada en la Metodología. El comentario
+`% [C1-PENDIENTE]` se retira de `tab:conv-mixta`.
+
 ## Anexo A. Inventario completo por ruta (pasadas de benchmark)
 
 | Job | Fecha | Entrada ; filtro | FMA_MATH | Ruta | Tiempo (ms) | TFLOP/s | Err. máx. abs. vs FP64 | L2 rel. vs FP64 | Línea |
