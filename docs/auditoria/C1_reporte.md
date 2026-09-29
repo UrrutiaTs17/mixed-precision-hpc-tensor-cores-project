@@ -176,9 +176,56 @@ sbatch --export=ALL,C=1024,K=1024,H=256,W=256,TC_FORMAT=both,RUN_CUTLASS=0,ITERS
 - FP16 y WMMA de la nueva corrida reemplazan a los de 4613 aunque difieran
   poco, para que todos los cocientes provengan de una sola sesión.
 
+## 3.1 Adenda al inventario (antes del resultado de 7785; umbrales sin cambios)
+
+Revisión completa de `~/Documentos/Resultados_PACCA/` (carpetas `Fase_2/`,
+`ncu_fase2_20260913/`, `campana_final_20260912/`, `campana_holder_20260917/`,
+`superadas/`, `Fase_3/`, `Fase_4/` y el `Resultados_PACCA.zip`), buscando
+`RESULTADOS CONV 2D`, `C=1024`, `1, 1024, 256, 256`, `K=1024` y los valores de
+la tabla:
+
+- `Resultados_PACCA/Fase_2/` solo contiene `GEMM_logs/` (jobs 6596-6599). De
+  Convolución de Fase 2 solo hay dos reportes Nsight Compute
+  (`ncu_fase2_20260913/Fase_2/Convolution/logs/`, jobs 6882 y 6884, C=K=64).
+  **Ningún log de Fase 2 Convolución con C=K=1024 está en `Resultados_PACCA`.**
+  El respaldo es del 2026-08-30 y para entonces `Fase_2/Convolution/logs/`
+  ya no tenía los logs de agosto (su `INVENTARIO.md` no lista Convolución).
+- La carpeta de "Fase 2" que sí contiene los valores de la tabla es
+  `~/Documentos/Proyecto_de_Grado/Pruebas/Resultados_05_08_Fase_2/Fase_2/Convolution/mixed_precision_conv_tc_4613.out`
+  (sección 1), fuera de `Resultados_PACCA`.
+- `campana_holder_20260917/logs_holder_run/F1_Convolucion.log` es Fase 1 con
+  C=K=64 (FP32 y FP64); no aplica a C=1024.
+
+Evidencia nueva encontrada en PACCA (no está en `Resultados_PACCA`):
+
+| Job | Fecha (log) | Binario | Configuración | Ruta | Tiempo (ms) | TFLOP/s | Algoritmo cuDNN | Err. máx. / L2 vs CPU | Línea |
+| - | - | - | - | - | - | - | - | - | - |
+| 7709 | 2026-09-27 14:29 EDT | Fase 1 (`fase1_conv_baseline`, nvcc 13.1), con `CUDNN_FMA_MATH` | N=1, C=K=1024, H=W=256, R=S=3, ITERS=10 | cuDNN FP32 | 41.282355 | 29.963179 | 6 (WINOGRAD), ws 100 MiB | 0.000267 / 0.000001 | 61-65 |
+| 7709 | ídem | ídem | ídem | cuDNN FP64 | 164.147302 | 7.535613 | 1 (IMPLICIT_PRECOMP_GEMM) | 0.000000 / 0.000000 | 92-96 |
+
+`Fase_1/Convolution/logs/fase1_conv_baseline_7709.out` en PACCA, sha256 `75c99565`.
+
+Consecuencias, **sin modificar** los umbrales de la sección 3:
+
+1. 7709 es una medición cuDNN FP64 real con C=K=1024, H=W=256 (7,54 TFLOP/s,
+   por debajo de 9,7: sin indicio de DMMA). No cumple P0 (otro binario, otro
+   job), así que no reemplaza a 7785 como fuente de la tabla; queda como
+   corroboración independiente.
+2. **Riesgo previsible para U2.** Con `CUDNN_FMA_MATH`, la heurística de cuDNN
+   eligió Winograd para FP32. Winograd hace menos multiplicaciones que las que
+   cuenta `conv_flops`, así que su rendimiento "efectivo" (29,96 TFLOP/s) supera
+   el pico escalar de 19,5 sin usar Tensor Cores, y su error es mayor que el de
+   un GEMM directo (L2 `0.000001` frente a la CPU FP32). Si el binario de Fase 2
+   elige el mismo algoritmo en 7785, la fila FP32 **fallará U2 por construcción
+   del umbral**, no por TF32. En ese caso se aplica la regla ya fijada (la fila no
+   se escribe, `% [C1-PENDIENTE]`) y la decisión de redefinir U2 queda para los
+   autores.
+
 ## 4. Resultados de la re-ejecución
 
-_Pendiente: se completa tras el job._
+Job **7785** encolado el 2026-09-28 tras el commit de pre-registro `d8172ac`.
+
+_Pendiente: se completa cuando termine el job._
 
 ## Anexo A. Inventario completo por ruta (pasadas de benchmark)
 
