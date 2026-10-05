@@ -29,7 +29,7 @@
 # las cuatro fases):
 #   PIPELINE_MODE=smoke bash run_full_pipeline.sh
 #
-# Antes de una campana de verdad, la puerta previa de la Tarea 8 corre las
+# Antes de una campana de verdad, la validacion preliminar corre las
 # verificaciones baratas (orden de operandos, humo, gates K=0/K=1):
 #   bash tools/validacion_preliminar.sbatch
 #
@@ -145,9 +145,8 @@ ENERGY_ITERS_STENCIL="${ENERGY_ITERS_STENCIL:-4000}"
 #            ya lo estuviera usando en serio.
 #   smoke -> exporta SMOKE_TEST=1 y RUN_NCU=0 a TODAS las fases. Los ocho
 #            .sbatch que participan lo entienden (Fase 1 y 2 desde siempre;
-#            los encadenados de GEMM/Convolucion de Fase 3/4 lo aceptan desde
-#            la auditoria que agrego esta bandera, que hasta entonces era la
-#            unica asimetria: Stencil si lo tenia y ellos no).
+#            los encadenados de GEMM/Convolucion de Fase 3/4 lo aceptan tambien
+#            (Stencil ya lo tenia).
 #
 # Las variables se exportan solo si el usuario NO las fijo ya: `SMOKE_TEST=0
 # PIPELINE_MODE=smoke ...` deja ganar al valor explicito, no al modo.

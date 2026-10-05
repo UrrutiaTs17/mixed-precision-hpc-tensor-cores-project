@@ -644,8 +644,7 @@ static Metrics benchmark_gpu_cudnn_float(const std::vector<float>& x,
     // NO descartaba WINOGRAD_NONFUSED, que sigue siendo FP32 escalar (sin
     // Tensor Cores) pero hace menos multiplicaciones que el conteo directo
     // de conv_flops(): su TFLOP/s "nominal" superaba el pico escalar de la
-    // A100 sin usar hardware tensorial (ver docs/auditoria/C1_reporte.md,
-    // hallazgo C1 sobre tab:conv-mixta -- job 7709 confirma "algoritmo
+    // A100 sin usar hardware tensorial (job 7709 confirma "algoritmo
     // elegido: 6" = WINOGRAD_NONFUSED, ~30 TFLOP/s con C=K=1024 y H=W=256).
     // Esta ruta es la referencia "sin Tensor Cores" contra la que se miden
     // los speedups de las rutas 3 y 4, y necesita hacer el mismo trabajo

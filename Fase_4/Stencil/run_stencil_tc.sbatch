@@ -169,8 +169,7 @@ NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-1}"
 # --- Tamano de malla y barrido de iteraciones -------------------------------
 # NX/NY: SIN limite superior impuesto por este script -- el default (16384) es
 # el tamano historicamente calibrado (presupuesto de memoria, walltime), pero
-# nada impide correr a 512/1024/2048. AUDITORIA (ver Fase_3/Stencil/README.md,
-# "Hallazgos de la auditoria"): el histerico del proyecto nunca ejercito una
+# nada impide correr a 512/1024/2048. El histerico del proyecto nunca ejercito una
 # campana real en el rango 512^2-2048^2 pese a que el flag siempre lo permitio;
 # antes de generar datos en ese rango conviene revalidar al menos el horizonte
 # de overflow medido alli.
@@ -551,7 +550,7 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
 else
     # NX_LIST/NY_LIST/ITERS_LIST son configurables via variables de entorno;
     # ver el bloque "Tamano de malla y barrido de iteraciones" mas arriba
-    # (incluye el presupuesto de memoria y el hallazgo de auditoria sobre el
+    # (incluye el presupuesto de memoria y la advertencia sobre el
     # rango 512^2-2048^2 nunca ejercitado).
     #
     # NX_LIST y NY_LIST se recorren EMPAREJADAS elemento a elemento, NO como

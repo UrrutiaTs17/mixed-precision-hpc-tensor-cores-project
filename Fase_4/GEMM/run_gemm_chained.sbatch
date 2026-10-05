@@ -175,7 +175,7 @@ TARGET_LAMBDA="${TARGET_LAMBDA:-1.1}"
 # Ver el comentario de cabecera del archivo. Aviso temprano si se pide un K>0
 # sin que COMP_LIST incluya "on" en absoluto (si lo incluye, el bucle
 # principal ya se encarga de nunca combinar COMP=off con ANCHOR>0).
-# Escala de K de la campana (Tarea 5 del prompt de auditoria): 0 (control, sin
+# Escala de K de la campana: 0 (control, sin
 # ancla), 1 (gate de exactitud), 5 y 20 (los dos K intermedios que responden la
 # pregunta real: cuanto se recupera y a que costo). En SMOKE_TEST solo K=0 y
 # K=1, que son los dos que hay que validar antes de cualquier campana.

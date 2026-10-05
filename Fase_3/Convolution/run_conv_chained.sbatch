@@ -125,7 +125,7 @@ SMOKE_TEST="${SMOKE_TEST:-0}"
 #   hw=1024 -> 13.6 GB (2.9x de margen: es el TECHO bajo el criterio de 2x)
 #   hw=2048 -> 54.2 GB (imposible)
 #
-# Referencia cruzada pedida por la auditoria: a hw=256 el campo tiene
+# Referencia cruzada con GEMM: a hw=256 el campo tiene
 # 64*256^2 = 4.19M elementos, el mismo orden que GEMM a N=2048 (4.19M). Pero
 # conv gasta 202 B/elemento contra los 90 B/elemento de GEMM (2.2x, por el
 # im2col en double), asi que el equivalente de N=8192 (67.1M elementos, 6.0 GB)

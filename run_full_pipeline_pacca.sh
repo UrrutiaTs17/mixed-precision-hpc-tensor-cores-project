@@ -113,8 +113,7 @@ OOM_FAILURE_LOG="${OOM_FAILURE_LOG:-${REPO_ROOT}/oom_failures_pacca_$(date +%Y%m
 #      igual en la ULTIMA iteracion sin importar CHECKPOINT_EVERY -- umbral
 #      real 1000 ms para las 5 rutas, no 500. (Stencil es distinto: ahi solo
 #      las rutas WMMA_*_SP cierran 2 tramos: GPU_FP32/GPU_FP64 solo cierran
-#      via checkpoint_due(), sin el disparo incondicional -- 1 tramo, 500 ms.
-#      Confirmado igual con datos: ver B1 de la auditoria de Fase 4.)
+#      via checkpoint_due(), sin el disparo incondicional -- 1 tramo, 500 ms.)
 #
 # La correccion NO es cambiar el ITERS_LIST default de la pasada normal (esa
 # pasada existe para caracterizar tiempo/error a bajo costo, con muchos
@@ -259,7 +258,7 @@ enviar() {
 DEP_BASE=""
 if [[ "${SKIP_VALIDACION}" == "1" ]]; then
     echo "SKIP_VALIDACION=1 -- las campanas se envian SIN la puerta previa." >&2
-    echo "  (Tarea 8 de la auditoria: no hacerlo salvo que ya se haya corrido" >&2
+    echo "  (no hacerlo salvo que ya se haya corrido" >&2
     echo "   tools/validacion_preliminar.sbatch a mano y haya pasado.)" >&2
 else
     enviar "validacion preliminar" "." "tools/validacion_preliminar.sbatch"

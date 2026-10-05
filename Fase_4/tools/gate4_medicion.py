@@ -3,7 +3,7 @@
 
 QUE BUG VIGILA
 --------------
-Hasta la correccion de la "Tarea 9", gemm_chained.cu y conv_chained.cu media
+Hasta corregir la medicion, gemm_chained.cu y conv_chained.cu media
 las tres trayectorias de cada iteracion (referencia FP64 + WMMA sin
 compensacion + WMMA con compensacion) con UN SOLO cronometro que las envolvia
 a las tres, y publicaba ese mismo numero en las dos filas CSV_SUMMARY:

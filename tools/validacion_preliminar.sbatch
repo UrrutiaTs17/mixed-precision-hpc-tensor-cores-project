@@ -129,8 +129,8 @@ paso "PASO 2c - humo Stencil (Fase 4, SMOKE_TEST=1)"     humo Fase_4/Stencil    
 # Comprobacion de la columna anchor_every sobre los CSV que acaba de extraer el
 # paso anterior. En GEMM/Convolucion tiene que VARIAR POR RUTA dentro de la
 # misma corrida; en Stencil es constante por invocacion (ver la explicacion en
-# Fase_4/tools/README.md). Se comprueba lo primero, que es lo que la auditoria
-# pidio confirmar explicitamente.
+# Fase_4/tools/README.md). Se comprueba primero, porque es lo que hay que
+# confirmar explicitamente.
 comprobar_columna() {
     local kernel="$1" dir="$2"
     python3 - "${REPO_ROOT}/${dir}/${HUMO_DIR}" "${kernel}" <<'PYEOF'

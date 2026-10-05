@@ -107,8 +107,7 @@ rm -f "${NVML_PROBE_BIN}"
 # referencia CPU FP64 encadenada sea viable a ITERS grande; TC=both corre
 # FP16 y BF16 en la misma invocacion. SIN limite superior/inferior impuesto
 # por este script: al igual que en run_stencil_tc.sbatch, NX/NY/ITERS son
-# enteramente configurables por entorno. AUDITORIA (ver
-# Fase_3/Stencil/README.md, "Hallazgos de la auditoria"): el rango
+# enteramente configurables por entorno. El rango
 # 512^2-2048^2 nunca se ejercito historicamente para medir horizonte de
 # overflow -- si se usa aqui, conviene revisar tambien CHECKPOINT_EVERY y el
 # presupuesto de memoria de fp64_checkpoints (ver mas abajo), calibrados para
